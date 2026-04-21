@@ -1,0 +1,88 @@
+impl < __Context > :: bincode :: Decode < __Context > for WalEntry
+{
+    fn decode < __D : :: bincode :: de :: Decoder < Context = __Context > >
+    (decoder : & mut __D) ->core :: result :: Result < Self, :: bincode ::
+    error :: DecodeError >
+    {
+        let variant_index = < u32 as :: bincode :: Decode ::< __D :: Context
+        >>:: decode(decoder) ?; match variant_index
+        {
+            0u32 =>core :: result :: Result ::
+            Ok(Self ::Write
+            {
+                address : :: bincode :: Decode ::< __D :: Context >::
+                decode(decoder) ?, revision : :: bincode :: Decode ::< __D ::
+                Context >:: decode(decoder) ?, data : :: bincode :: Decode ::<
+                __D :: Context >:: decode(decoder) ?,
+            }), 1u32 =>core :: result :: Result ::
+            Ok(Self ::Tombstone
+            {
+                address : :: bincode :: Decode ::< __D :: Context >::
+                decode(decoder) ?, revision : :: bincode :: Decode ::< __D ::
+                Context >:: decode(decoder) ?,
+            }), 2u32 =>core :: result :: Result ::
+            Ok(Self ::BlockSealed
+            {
+                block_id : :: bincode :: Decode ::< __D :: Context >::
+                decode(decoder) ?, space : :: bincode :: Decode ::< __D ::
+                Context >:: decode(decoder) ?, snapshot : :: bincode :: Decode
+                ::< __D :: Context >:: decode(decoder) ?,
+            }), 3u32 =>core :: result :: Result ::
+            Ok(Self ::Checkpoint
+            {
+                revision : :: bincode :: Decode ::< __D :: Context >::
+                decode(decoder) ?,
+            }), variant =>core :: result :: Result ::
+            Err(:: bincode :: error :: DecodeError :: UnexpectedVariant
+            {
+                found : variant, type_name : "WalEntry", allowed : &:: bincode
+                :: error :: AllowedEnumVariants :: Range { min: 0, max: 3 }
+            })
+        }
+    }
+} impl < '__de, __Context > :: bincode :: BorrowDecode < '__de, __Context >
+for WalEntry
+{
+    fn borrow_decode < __D : :: bincode :: de :: BorrowDecoder < '__de,
+    Context = __Context > > (decoder : & mut __D) ->core :: result :: Result <
+    Self, :: bincode :: error :: DecodeError >
+    {
+        let variant_index = < u32 as :: bincode :: Decode ::< __D :: Context
+        >>:: decode(decoder) ?; match variant_index
+        {
+            0u32 =>core :: result :: Result ::
+            Ok(Self ::Write
+            {
+                address : :: bincode :: BorrowDecode ::< __D :: Context >::
+                borrow_decode(decoder) ?, revision : :: bincode ::
+                BorrowDecode ::< __D :: Context >:: borrow_decode(decoder) ?,
+                data : :: bincode :: BorrowDecode ::< __D :: Context >::
+                borrow_decode(decoder) ?,
+            }), 1u32 =>core :: result :: Result ::
+            Ok(Self ::Tombstone
+            {
+                address : :: bincode :: BorrowDecode ::< __D :: Context >::
+                borrow_decode(decoder) ?, revision : :: bincode ::
+                BorrowDecode ::< __D :: Context >:: borrow_decode(decoder) ?,
+            }), 2u32 =>core :: result :: Result ::
+            Ok(Self ::BlockSealed
+            {
+                block_id : :: bincode :: BorrowDecode ::< __D :: Context >::
+                borrow_decode(decoder) ?, space : :: bincode :: BorrowDecode
+                ::< __D :: Context >:: borrow_decode(decoder) ?, snapshot : ::
+                bincode :: BorrowDecode ::< __D :: Context >::
+                borrow_decode(decoder) ?,
+            }), 3u32 =>core :: result :: Result ::
+            Ok(Self ::Checkpoint
+            {
+                revision : :: bincode :: BorrowDecode ::< __D :: Context >::
+                borrow_decode(decoder) ?,
+            }), variant =>core :: result :: Result ::
+            Err(:: bincode :: error :: DecodeError :: UnexpectedVariant
+            {
+                found : variant, type_name : "WalEntry", allowed : &:: bincode
+                :: error :: AllowedEnumVariants :: Range { min: 0, max: 3 }
+            })
+        }
+    }
+}
