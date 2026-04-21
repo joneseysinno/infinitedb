@@ -8,6 +8,7 @@ license = "MIT"
 keywords = ["database", "spatial", "hypergraph", "engineering", "peano"]
 categories = ["database-implementations", "science"]
 repository = "https://github.com/joneseysinno/infinitedb.git"
+exclude = ["target/**"]
 
 [features]
 default = ["embedded"]
