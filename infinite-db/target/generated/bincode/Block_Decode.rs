@@ -1,1 +1,39 @@
-impl < __Context > :: bincode :: Decode < __Context > for Block {fn decode < __D : :: bincode :: de :: Decoder < Context = __Context > > (decoder : & mut __D)->core :: result :: Result < Self , :: bincode :: error :: DecodeError > {core :: result :: Result :: Ok (Self {id : :: bincode :: Decode :: decode (decoder)?, space : :: bincode :: Decode :: decode (decoder)?, records : :: bincode :: Decode :: decode (decoder)?, min_revision : :: bincode :: Decode :: decode (decoder)?, max_revision : :: bincode :: Decode :: decode (decoder)?, checksum : :: bincode :: Decode :: decode (decoder)?,})}}impl < '__de , __Context > :: bincode :: BorrowDecode < '__de , __Context > for Block {fn borrow_decode < __D : :: bincode :: de :: BorrowDecoder <'__de , Context = __Context > > (decoder : & mut __D)->core :: result :: Result < Self , :: bincode :: error :: DecodeError > {core :: result :: Result :: Ok (Self {id : :: bincode :: BorrowDecode ::<'_ , __Context >:: borrow_decode (decoder)?, space : :: bincode :: BorrowDecode ::<'_ , __Context >:: borrow_decode (decoder)?, records : :: bincode :: BorrowDecode ::<'_ , __Context >:: borrow_decode (decoder)?, min_revision : :: bincode :: BorrowDecode ::<'_ , __Context >:: borrow_decode (decoder)?, max_revision : :: bincode :: BorrowDecode ::<'_ , __Context >:: borrow_decode (decoder)?, checksum : :: bincode :: BorrowDecode ::<'_ , __Context >:: borrow_decode (decoder)?,})}}
+impl < __Context > :: bincode :: Decode < __Context > for Block
+{
+    fn decode < __D : :: bincode :: de :: Decoder < Context = __Context > >
+    (decoder : & mut __D) ->core :: result :: Result < Self, :: bincode ::
+    error :: DecodeError >
+    {
+        core :: result :: Result ::
+        Ok(Self
+        {
+            id : :: bincode :: Decode :: decode(decoder) ?, space : :: bincode
+            :: Decode :: decode(decoder) ?, records : :: bincode :: Decode ::
+            decode(decoder) ?, min_revision : :: bincode :: Decode ::
+            decode(decoder) ?, max_revision : :: bincode :: Decode ::
+            decode(decoder) ?, checksum : :: bincode :: Decode ::
+            decode(decoder) ?,
+        })
+    }
+} impl < '__de, __Context > :: bincode :: BorrowDecode < '__de, __Context >
+for Block
+{
+    fn borrow_decode < __D : :: bincode :: de :: BorrowDecoder < '__de,
+    Context = __Context > > (decoder : & mut __D) ->core :: result :: Result <
+    Self, :: bincode :: error :: DecodeError >
+    {
+        core :: result :: Result ::
+        Ok(Self
+        {
+            id : :: bincode :: BorrowDecode ::< '_, __Context >::
+            borrow_decode(decoder) ?, space : :: bincode :: BorrowDecode ::<
+            '_, __Context >:: borrow_decode(decoder) ?, records : :: bincode
+            :: BorrowDecode ::< '_, __Context >:: borrow_decode(decoder) ?,
+            min_revision : :: bincode :: BorrowDecode ::< '_, __Context >::
+            borrow_decode(decoder) ?, max_revision : :: bincode ::
+            BorrowDecode ::< '_, __Context >:: borrow_decode(decoder) ?,
+            checksum : :: bincode :: BorrowDecode ::< '_, __Context >::
+            borrow_decode(decoder) ?,
+        })
+    }
+}
