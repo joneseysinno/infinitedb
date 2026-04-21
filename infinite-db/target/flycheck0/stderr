@@ -1,0 +1,395 @@
+   0.100649300s  INFO prepare_target{force=false package_id=infinite-db v0.1.0 (D:\Rust\infinitedb\infinitedb\infinite-db) target="infinite_db"}: cargo::core::compiler::fingerprint: stale: missing "D:\\Rust\\infinitedb\\infinitedb\\infinite-db\\target\\debug\\.fingerprint\\blake3-957c8d200b901645\\dep-lib-blake3"
+   0.104459100s  INFO prepare_target{force=false package_id=infinite-db v0.1.0 (D:\Rust\infinitedb\infinitedb\infinite-db) target="infinite_db"}: cargo::core::compiler::fingerprint: fingerprint error for infinite-db v0.1.0 (D:\Rust\infinitedb\infinitedb\infinite-db)/Check { test: false }/TargetInner { name_inferred: true, ..: lib_target("infinite_db", ["lib"], "D:\\Rust\\infinitedb\\infinitedb\\infinite-db\\src\\lib.rs", Edition2024) }
+   0.104517000s  INFO prepare_target{force=false package_id=infinite-db v0.1.0 (D:\Rust\infinitedb\infinitedb\infinite-db) target="infinite_db"}: cargo::core::compiler::fingerprint:     err: failed to read `D:\Rust\infinitedb\infinitedb\infinite-db\target\debug\.fingerprint\infinite-db-65f55484a956cef8\lib-infinite_db`
+
+Caused by:
+    The system cannot find the file specified. (os error 2)
+
+Stack backtrace:
+   0: git_midx_writer_dump
+   1: git_midx_writer_dump
+   2: git_midx_writer_dump
+   3: git_midx_writer_dump
+   4: git_filter_source_repo
+   5: git_filter_source_repo
+   6: git_filter_source_repo
+   7: git_filter_source_repo
+   8: git_filter_source_repo
+   9: git_filter_source_repo
+  10: git_filter_source_repo
+  11: git_libgit2_prerelease
+  12: <unknown>
+  13: <unknown>
+  14: <unknown>
+  15: <unknown>
+  16: git_midx_writer_dump
+  17: git_filter_source_repo
+  18: git_midx_writer_dump
+  19: BaseThreadInitThunk
+  20: RtlUserThreadStart
+   0.120826700s  INFO prepare_target{force=false package_id=bincode v2.0.1 target="bincode"}: cargo::core::compiler::fingerprint: fingerprint error for bincode v2.0.1/Check { test: false }/TargetInner { ..: lib_target("bincode", ["lib"], "C:\\Users\\ajone\\.cargo\\registry\\src\\index.crates.io-1949cf8c6b5b557f\\bincode-2.0.1\\src\\lib.rs", Edition2021) }
+   0.120860900s  INFO prepare_target{force=false package_id=bincode v2.0.1 target="bincode"}: cargo::core::compiler::fingerprint:     err: failed to read `D:\Rust\infinitedb\infinitedb\infinite-db\target\debug\.fingerprint\bincode-6bbd5a03d237553b\lib-bincode`
+
+Caused by:
+    The system cannot find the file specified. (os error 2)
+
+Stack backtrace:
+   0: git_midx_writer_dump
+   1: git_midx_writer_dump
+   2: git_midx_writer_dump
+   3: git_midx_writer_dump
+   4: git_filter_source_repo
+   5: git_filter_source_repo
+   6: git_filter_source_repo
+   7: git_filter_source_repo
+   8: git_filter_source_repo
+   9: git_filter_source_repo
+  10: git_filter_source_repo
+  11: git_filter_source_repo
+  12: git_libgit2_prerelease
+  13: <unknown>
+  14: <unknown>
+  15: <unknown>
+  16: <unknown>
+  17: git_midx_writer_dump
+  18: git_filter_source_repo
+  19: git_midx_writer_dump
+  20: BaseThreadInitThunk
+  21: RtlUserThreadStart
+   0.122005500s  INFO prepare_target{force=false package_id=blake3 v1.8.4 target="blake3"}: cargo::core::compiler::fingerprint: fingerprint error for blake3 v1.8.4/Check { test: false }/TargetInner { ..: lib_target("blake3", ["lib"], "C:\\Users\\ajone\\.cargo\\registry\\src\\index.crates.io-1949cf8c6b5b557f\\blake3-1.8.4\\src\\lib.rs", Edition2024) }
+   0.122031700s  INFO prepare_target{force=false package_id=blake3 v1.8.4 target="blake3"}: cargo::core::compiler::fingerprint:     err: failed to read `D:\Rust\infinitedb\infinitedb\infinite-db\target\debug\.fingerprint\blake3-957c8d200b901645\lib-blake3`
+
+Caused by:
+    The system cannot find the file specified. (os error 2)
+
+Stack backtrace:
+   0: git_midx_writer_dump
+   1: git_midx_writer_dump
+   2: git_midx_writer_dump
+   3: git_midx_writer_dump
+   4: git_filter_source_repo
+   5: git_filter_source_repo
+   6: git_filter_source_repo
+   7: git_filter_source_repo
+   8: git_filter_source_repo
+   9: git_filter_source_repo
+  10: git_filter_source_repo
+  11: git_filter_source_repo
+  12: git_libgit2_prerelease
+  13: <unknown>
+  14: <unknown>
+  15: <unknown>
+  16: <unknown>
+  17: git_midx_writer_dump
+  18: git_filter_source_repo
+  19: git_midx_writer_dump
+  20: BaseThreadInitThunk
+  21: RtlUserThreadStart
+   0.126331800s  INFO prepare_target{force=false package_id=serde v1.0.228 target="serde"}: cargo::core::compiler::fingerprint: fingerprint error for serde v1.0.228/Check { test: false }/TargetInner { ..: lib_target("serde", ["lib"], "C:\\Users\\ajone\\.cargo\\registry\\src\\index.crates.io-1949cf8c6b5b557f\\serde-1.0.228\\src\\lib.rs", Edition2021) }
+   0.126360800s  INFO prepare_target{force=false package_id=serde v1.0.228 target="serde"}: cargo::core::compiler::fingerprint:     err: failed to read `D:\Rust\infinitedb\infinitedb\infinite-db\target\debug\.fingerprint\serde-9ffe07fd5e3e9608\lib-serde`
+
+Caused by:
+    The system cannot find the file specified. (os error 2)
+
+Stack backtrace:
+   0: git_midx_writer_dump
+   1: git_midx_writer_dump
+   2: git_midx_writer_dump
+   3: git_midx_writer_dump
+   4: git_filter_source_repo
+   5: git_filter_source_repo
+   6: git_filter_source_repo
+   7: git_filter_source_repo
+   8: git_filter_source_repo
+   9: git_filter_source_repo
+  10: git_filter_source_repo
+  11: git_filter_source_repo
+  12: git_libgit2_prerelease
+  13: <unknown>
+  14: <unknown>
+  15: <unknown>
+  16: <unknown>
+  17: git_midx_writer_dump
+  18: git_filter_source_repo
+  19: git_midx_writer_dump
+  20: BaseThreadInitThunk
+  21: RtlUserThreadStart
+   0.127715800s  INFO prepare_target{force=false package_id=serde_core v1.0.228 target="serde_core"}: cargo::core::compiler::fingerprint: fingerprint error for serde_core v1.0.228/Check { test: false }/TargetInner { ..: lib_target("serde_core", ["lib"], "C:\\Users\\ajone\\.cargo\\registry\\src\\index.crates.io-1949cf8c6b5b557f\\serde_core-1.0.228\\src\\lib.rs", Edition2021) }
+   0.127740000s  INFO prepare_target{force=false package_id=serde_core v1.0.228 target="serde_core"}: cargo::core::compiler::fingerprint:     err: failed to read `D:\Rust\infinitedb\infinitedb\infinite-db\target\debug\.fingerprint\serde_core-2028d3412432f3f9\lib-serde_core`
+
+Caused by:
+    The system cannot find the file specified. (os error 2)
+
+Stack backtrace:
+   0: git_midx_writer_dump
+   1: git_midx_writer_dump
+   2: git_midx_writer_dump
+   3: git_midx_writer_dump
+   4: git_filter_source_repo
+   5: git_filter_source_repo
+   6: git_filter_source_repo
+   7: git_filter_source_repo
+   8: git_filter_source_repo
+   9: git_filter_source_repo
+  10: git_filter_source_repo
+  11: git_filter_source_repo
+  12: git_filter_source_repo
+  13: git_libgit2_prerelease
+  14: <unknown>
+  15: <unknown>
+  16: <unknown>
+  17: <unknown>
+  18: git_midx_writer_dump
+  19: git_filter_source_repo
+  20: git_midx_writer_dump
+  21: BaseThreadInitThunk
+  22: RtlUserThreadStart
+   0.135538300s  INFO prepare_target{force=false package_id=infinite-db v0.1.0 (D:\Rust\infinitedb\infinitedb\infinite-db) target="infinite_db"}: cargo::core::compiler::fingerprint: fingerprint error for infinite-db v0.1.0 (D:\Rust\infinitedb\infinitedb\infinite-db)/Check { test: true }/TargetInner { name_inferred: true, ..: lib_target("infinite_db", ["lib"], "D:\\Rust\\infinitedb\\infinitedb\\infinite-db\\src\\lib.rs", Edition2024) }
+   0.135589400s  INFO prepare_target{force=false package_id=infinite-db v0.1.0 (D:\Rust\infinitedb\infinitedb\infinite-db) target="infinite_db"}: cargo::core::compiler::fingerprint:     err: failed to read `D:\Rust\infinitedb\infinitedb\infinite-db\target\debug\.fingerprint\infinite-db-4bf565a411e6d6c7\test-lib-infinite_db`
+
+Caused by:
+    The system cannot find the file specified. (os error 2)
+
+Stack backtrace:
+   0: git_midx_writer_dump
+   1: git_midx_writer_dump
+   2: git_midx_writer_dump
+   3: git_midx_writer_dump
+   4: git_filter_source_repo
+   5: git_filter_source_repo
+   6: git_filter_source_repo
+   7: git_filter_source_repo
+   8: git_filter_source_repo
+   9: git_filter_source_repo
+  10: git_filter_source_repo
+  11: git_libgit2_prerelease
+  12: <unknown>
+  13: <unknown>
+  14: <unknown>
+  15: <unknown>
+  16: git_midx_writer_dump
+  17: git_filter_source_repo
+  18: git_midx_writer_dump
+  19: BaseThreadInitThunk
+  20: RtlUserThreadStart
+   0.136176200s  INFO prepare_target{force=false package_id=tempfile v3.27.0 target="tempfile"}: cargo::core::compiler::fingerprint: fingerprint error for tempfile v3.27.0/Check { test: false }/TargetInner { ..: lib_target("tempfile", ["lib"], "C:\\Users\\ajone\\.cargo\\registry\\src\\index.crates.io-1949cf8c6b5b557f\\tempfile-3.27.0\\src\\lib.rs", Edition2021) }
+   0.136200500s  INFO prepare_target{force=false package_id=tempfile v3.27.0 target="tempfile"}: cargo::core::compiler::fingerprint:     err: failed to read `D:\Rust\infinitedb\infinitedb\infinite-db\target\debug\.fingerprint\tempfile-9de92913d1edbacc\lib-tempfile`
+
+Caused by:
+    The system cannot find the file specified. (os error 2)
+
+Stack backtrace:
+   0: git_midx_writer_dump
+   1: git_midx_writer_dump
+   2: git_midx_writer_dump
+   3: git_midx_writer_dump
+   4: git_filter_source_repo
+   5: git_filter_source_repo
+   6: git_filter_source_repo
+   7: git_filter_source_repo
+   8: git_filter_source_repo
+   9: git_filter_source_repo
+  10: git_filter_source_repo
+  11: git_filter_source_repo
+  12: git_libgit2_prerelease
+  13: <unknown>
+  14: <unknown>
+  15: <unknown>
+  16: <unknown>
+  17: git_midx_writer_dump
+  18: git_filter_source_repo
+  19: git_midx_writer_dump
+  20: BaseThreadInitThunk
+  21: RtlUserThreadStart
+   0.138372300s  INFO prepare_target{force=false package_id=windows-sys v0.61.2 target="windows_sys"}: cargo::core::compiler::fingerprint: fingerprint error for windows-sys v0.61.2/Check { test: false }/TargetInner { tested: false, doctest: false, ..: lib_target("windows_sys", ["lib"], "C:\\Users\\ajone\\.cargo\\registry\\src\\index.crates.io-1949cf8c6b5b557f\\windows-sys-0.61.2\\src\\lib.rs", Edition2021) }
+   0.138399300s  INFO prepare_target{force=false package_id=windows-sys v0.61.2 target="windows_sys"}: cargo::core::compiler::fingerprint:     err: failed to read `D:\Rust\infinitedb\infinitedb\infinite-db\target\debug\.fingerprint\windows-sys-9775244f2a159c6c\lib-windows_sys`
+
+Caused by:
+    The system cannot find the file specified. (os error 2)
+
+Stack backtrace:
+   0: git_midx_writer_dump
+   1: git_midx_writer_dump
+   2: git_midx_writer_dump
+   3: git_midx_writer_dump
+   4: git_filter_source_repo
+   5: git_filter_source_repo
+   6: git_filter_source_repo
+   7: git_filter_source_repo
+   8: git_filter_source_repo
+   9: git_filter_source_repo
+  10: git_filter_source_repo
+  11: git_filter_source_repo
+  12: git_filter_source_repo
+  13: git_libgit2_prerelease
+  14: <unknown>
+  15: <unknown>
+  16: <unknown>
+  17: <unknown>
+  18: git_midx_writer_dump
+  19: git_filter_source_repo
+  20: git_midx_writer_dump
+  21: BaseThreadInitThunk
+  22: RtlUserThreadStart
+   0.139123000s  INFO prepare_target{force=false package_id=tokio v1.52.1 target="tokio"}: cargo::core::compiler::fingerprint: fingerprint error for tokio v1.52.1/Check { test: false }/TargetInner { ..: lib_target("tokio", ["lib"], "C:\\Users\\ajone\\.cargo\\registry\\src\\index.crates.io-1949cf8c6b5b557f\\tokio-1.52.1\\src\\lib.rs", Edition2021) }
+   0.139147100s  INFO prepare_target{force=false package_id=tokio v1.52.1 target="tokio"}: cargo::core::compiler::fingerprint:     err: failed to read `D:\Rust\infinitedb\infinitedb\infinite-db\target\debug\.fingerprint\tokio-c0fba4fdbc391179\lib-tokio`
+
+Caused by:
+    The system cannot find the file specified. (os error 2)
+
+Stack backtrace:
+   0: git_midx_writer_dump
+   1: git_midx_writer_dump
+   2: git_midx_writer_dump
+   3: git_midx_writer_dump
+   4: git_filter_source_repo
+   5: git_filter_source_repo
+   6: git_filter_source_repo
+   7: git_filter_source_repo
+   8: git_filter_source_repo
+   9: git_filter_source_repo
+  10: git_filter_source_repo
+  11: git_filter_source_repo
+  12: git_libgit2_prerelease
+  13: <unknown>
+  14: <unknown>
+  15: <unknown>
+  16: <unknown>
+  17: git_midx_writer_dump
+  18: git_filter_source_repo
+  19: git_midx_writer_dump
+  20: BaseThreadInitThunk
+  21: RtlUserThreadStart
+   0.139798600s  INFO prepare_target{force=false package_id=bytes v1.11.1 target="bytes"}: cargo::core::compiler::fingerprint: fingerprint error for bytes v1.11.1/Check { test: false }/TargetInner { ..: lib_target("bytes", ["lib"], "C:\\Users\\ajone\\.cargo\\registry\\src\\index.crates.io-1949cf8c6b5b557f\\bytes-1.11.1\\src\\lib.rs", Edition2021) }
+   0.139823000s  INFO prepare_target{force=false package_id=bytes v1.11.1 target="bytes"}: cargo::core::compiler::fingerprint:     err: failed to read `D:\Rust\infinitedb\infinitedb\infinite-db\target\debug\.fingerprint\bytes-a6516099e6e49a1d\lib-bytes`
+
+Caused by:
+    The system cannot find the file specified. (os error 2)
+
+Stack backtrace:
+   0: git_midx_writer_dump
+   1: git_midx_writer_dump
+   2: git_midx_writer_dump
+   3: git_midx_writer_dump
+   4: git_filter_source_repo
+   5: git_filter_source_repo
+   6: git_filter_source_repo
+   7: git_filter_source_repo
+   8: git_filter_source_repo
+   9: git_filter_source_repo
+  10: git_filter_source_repo
+  11: git_filter_source_repo
+  12: git_filter_source_repo
+  13: git_libgit2_prerelease
+  14: <unknown>
+  15: <unknown>
+  16: <unknown>
+  17: <unknown>
+  18: git_midx_writer_dump
+  19: git_filter_source_repo
+  20: git_midx_writer_dump
+  21: BaseThreadInitThunk
+  22: RtlUserThreadStart
+   0.140216800s  INFO prepare_target{force=false package_id=mio v1.2.0 target="mio"}: cargo::core::compiler::fingerprint: fingerprint error for mio v1.2.0/Check { test: false }/TargetInner { ..: lib_target("mio", ["lib"], "C:\\Users\\ajone\\.cargo\\registry\\src\\index.crates.io-1949cf8c6b5b557f\\mio-1.2.0\\src\\lib.rs", Edition2021) }
+   0.140240100s  INFO prepare_target{force=false package_id=mio v1.2.0 target="mio"}: cargo::core::compiler::fingerprint:     err: failed to read `D:\Rust\infinitedb\infinitedb\infinite-db\target\debug\.fingerprint\mio-cbe9021790a7222d\lib-mio`
+
+Caused by:
+    The system cannot find the file specified. (os error 2)
+
+Stack backtrace:
+   0: git_midx_writer_dump
+   1: git_midx_writer_dump
+   2: git_midx_writer_dump
+   3: git_midx_writer_dump
+   4: git_filter_source_repo
+   5: git_filter_source_repo
+   6: git_filter_source_repo
+   7: git_filter_source_repo
+   8: git_filter_source_repo
+   9: git_filter_source_repo
+  10: git_filter_source_repo
+  11: git_filter_source_repo
+  12: git_filter_source_repo
+  13: git_libgit2_prerelease
+  14: <unknown>
+  15: <unknown>
+  16: <unknown>
+  17: <unknown>
+  18: git_midx_writer_dump
+  19: git_filter_source_repo
+  20: git_midx_writer_dump
+  21: BaseThreadInitThunk
+  22: RtlUserThreadStart
+   0.140715900s  INFO prepare_target{force=false package_id=parking_lot v0.12.5 target="parking_lot"}: cargo::core::compiler::fingerprint: fingerprint error for parking_lot v0.12.5/Check { test: false }/TargetInner { ..: lib_target("parking_lot", ["lib"], "C:\\Users\\ajone\\.cargo\\registry\\src\\index.crates.io-1949cf8c6b5b557f\\parking_lot-0.12.5\\src\\lib.rs", Edition2021) }
+   0.140740400s  INFO prepare_target{force=false package_id=parking_lot v0.12.5 target="parking_lot"}: cargo::core::compiler::fingerprint:     err: failed to read `D:\Rust\infinitedb\infinitedb\infinite-db\target\debug\.fingerprint\parking_lot-aea9ec478e97beb0\lib-parking_lot`
+
+Caused by:
+    The system cannot find the file specified. (os error 2)
+
+Stack backtrace:
+   0: git_midx_writer_dump
+   1: git_midx_writer_dump
+   2: git_midx_writer_dump
+   3: git_midx_writer_dump
+   4: git_filter_source_repo
+   5: git_filter_source_repo
+   6: git_filter_source_repo
+   7: git_filter_source_repo
+   8: git_filter_source_repo
+   9: git_filter_source_repo
+  10: git_filter_source_repo
+  11: git_filter_source_repo
+  12: git_filter_source_repo
+  13: git_libgit2_prerelease
+  14: <unknown>
+  15: <unknown>
+  16: <unknown>
+  17: <unknown>
+  18: git_midx_writer_dump
+  19: git_filter_source_repo
+  20: git_midx_writer_dump
+  21: BaseThreadInitThunk
+  22: RtlUserThreadStart
+   0.143249800s  INFO prepare_target{force=false package_id=socket2 v0.6.3 target="socket2"}: cargo::core::compiler::fingerprint: fingerprint error for socket2 v0.6.3/Check { test: false }/TargetInner { ..: lib_target("socket2", ["lib"], "C:\\Users\\ajone\\.cargo\\registry\\src\\index.crates.io-1949cf8c6b5b557f\\socket2-0.6.3\\src\\lib.rs", Edition2021) }
+   0.143277000s  INFO prepare_target{force=false package_id=socket2 v0.6.3 target="socket2"}: cargo::core::compiler::fingerprint:     err: failed to read `D:\Rust\infinitedb\infinitedb\infinite-db\target\debug\.fingerprint\socket2-4c0cc94bb0491860\lib-socket2`
+
+Caused by:
+    The system cannot find the file specified. (os error 2)
+
+Stack backtrace:
+   0: git_midx_writer_dump
+   1: git_midx_writer_dump
+   2: git_midx_writer_dump
+   3: git_midx_writer_dump
+   4: git_filter_source_repo
+   5: git_filter_source_repo
+   6: git_filter_source_repo
+   7: git_filter_source_repo
+   8: git_filter_source_repo
+   9: git_filter_source_repo
+  10: git_filter_source_repo
+  11: git_filter_source_repo
+  12: git_filter_source_repo
+  13: git_libgit2_prerelease
+  14: <unknown>
+  15: <unknown>
+  16: <unknown>
+  17: <unknown>
+  18: git_midx_writer_dump
+  19: git_filter_source_repo
+  20: git_midx_writer_dump
+  21: BaseThreadInitThunk
+  22: RtlUserThreadStart
+    Checking bytes v1.11.1
+    Checking windows-sys v0.61.2
+    Checking serde_core v1.0.228
+    Checking bincode v2.0.1
+    Checking parking_lot v0.12.5
+    Checking blake3 v1.8.4
+    Checking serde v1.0.228
+    Checking socket2 v0.6.3
+    Checking mio v1.2.0
+    Checking tempfile v3.27.0
+    Checking infinite-db v0.1.0 (D:\Rust\infinitedb\infinitedb\infinite-db)
+    Checking tokio v1.52.1
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 8.01s
