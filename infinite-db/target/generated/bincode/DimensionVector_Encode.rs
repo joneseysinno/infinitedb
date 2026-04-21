@@ -1,10 +1,1 @@
-impl :: bincode :: Encode for DimensionVector
-{
-    fn encode < __E : :: bincode :: enc :: Encoder >
-    (& self, encoder : & mut __E) ->core :: result :: Result < (), :: bincode
-    :: error :: EncodeError >
-    {
-        :: bincode :: Encode :: encode(&self.coords, encoder) ?; core ::
-        result :: Result :: Ok(())
-    }
-}
+impl :: bincode :: Encode for DimensionVector {fn encode < __E : :: bincode :: enc :: Encoder > (& self , encoder : & mut __E)->core :: result :: Result <(), :: bincode :: error :: EncodeError > {:: bincode :: Encode :: encode (& self . coords , encoder)?; core :: result :: Result :: Ok (())}}

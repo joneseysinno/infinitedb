@@ -7,7 +7,7 @@ description = "A spatial-graph database using n-dimensional curves and hyperedge
 license = "MIT"
 keywords = ["database", "spatial", "hypergraph", "engineering", "peano"]
 categories = ["database-implementations", "science"]
-repository = "https://github.com/joneseysinno/SES"
+repository = "https://github.com/joneseysinno/infinitedb.git"
 
 [features]
 default = ["embedded"]
