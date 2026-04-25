@@ -20,6 +20,7 @@ pub struct HlcTimestamp {
 }
 
 impl HlcTimestamp {
+    /// Zero-valued timestamp used for initialization.
     pub const ZERO: HlcTimestamp = HlcTimestamp { physical_ms: 0, logical: 0 };
 
     /// Pack into a u64 for storage: high 48 bits = physical, low 16 = logical.
@@ -48,6 +49,7 @@ pub struct HlcClock {
 }
 
 impl HlcClock {
+    /// Create a new clock starting at [`HlcTimestamp::ZERO`].
     pub fn new() -> Self {
         Self { last: HlcTimestamp::ZERO }
     }
@@ -95,6 +97,7 @@ impl HlcClock {
 }
 
 impl Default for HlcClock {
+    /// Create a new clock with zero timestamp.
     fn default() -> Self {
         Self::new()
     }

@@ -88,6 +88,7 @@ impl WalWriter {
         self.writer.get_ref().sync_all()
     }
 
+    /// Return the WAL file path currently used by this writer.
     pub fn path(&self) -> &PathBuf {
         &self.path
     }
@@ -103,6 +104,7 @@ pub struct WalReader {
 }
 
 impl WalReader {
+    /// Open an existing WAL file for sequential replay.
     pub fn open(path: PathBuf) -> io::Result<Self> {
         let file = File::open(path)?;
         Ok(Self { file })

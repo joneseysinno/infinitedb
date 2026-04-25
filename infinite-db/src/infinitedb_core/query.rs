@@ -11,6 +11,7 @@ pub struct SpatialRange {
 }
 
 impl SpatialRange {
+    /// Create an axis-aligned range with inclusive bounds.
     pub fn new(min: DimensionVector, max: DimensionVector) -> Self {
         assert_eq!(min.dims(), max.dims(), "Range bounds must have equal dimensions");
         Self { min, max }
@@ -33,6 +34,7 @@ pub struct Query {
 }
 
 impl Query {
+    /// Build a query pinned to a specific space and snapshot.
     pub fn new(space: SpaceId, snapshot: SnapshotId) -> Self {
         Self {
             space,
@@ -43,21 +45,25 @@ impl Query {
         }
     }
 
+    /// Add a spatial range filter.
     pub fn with_range(mut self, range: SpatialRange) -> Self {
         self.range = Some(range);
         self
     }
 
+    /// Restrict results to records at or before `revision`.
     pub fn as_of(mut self, revision: RevisionId) -> Self {
         self.as_of = Some(revision);
         self
     }
 
+    /// Include tombstoned records in query results.
     pub fn include_tombstones(mut self) -> Self {
         self.include_tombstones = true;
         self
     }
 
+    /// Convenience helper to set range bounds from raw coordinate vectors.
     pub fn with_bounds(self, min: Vec<u32>, max: Vec<u32>) -> Self {
         self.with_range(SpatialRange::new(
             DimensionVector::new(min),

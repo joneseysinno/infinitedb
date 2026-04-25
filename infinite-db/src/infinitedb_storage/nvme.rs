@@ -45,6 +45,7 @@ pub struct LruBlockCache {
 }
 
 impl LruBlockCache {
+    /// Create a cache capped at `max_bytes` of resident block data.
     pub fn new(max_bytes: usize) -> Self {
         Self {
             entries: HashMap::new(),
@@ -138,6 +139,7 @@ impl BlockStore {
         Self::open_with_cache(dir, 10 * 1024 * 1024)
     }
 
+    /// Open (or create) a block store with an explicit cache size.
     pub fn open_with_cache(dir: PathBuf, cache_bytes: usize) -> io::Result<Self> {
         let blocks_dir = dir.join("blocks");
         let meta_dir = dir.join("meta");
@@ -223,6 +225,7 @@ impl BlockStore {
         fs::read(self.root.join("meta").join(name))
     }
 
+    /// Return the path to the write-ahead log file.
     pub fn wal_path(&self) -> PathBuf {
         self.root.join("wal.log")
     }

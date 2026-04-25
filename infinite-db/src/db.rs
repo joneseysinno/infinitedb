@@ -549,6 +549,7 @@ impl MemoryStats {
             + 4096
     }
 
+    /// Pretty-print the current memory statistics to stdout.
     pub fn print(&self) {
         println!("\n╔═══ InfiniteDb Memory Stats ═══╗");
         println!("║  Write buffer       {:>6} records  ({} bytes)",

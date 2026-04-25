@@ -22,6 +22,7 @@ pub struct SpaceRegistry {
 }
 
 impl SpaceRegistry {
+    /// Create an empty space registry.
     pub fn new() -> Self {
         Self::default()
     }
@@ -39,14 +40,17 @@ impl SpaceRegistry {
         Ok(())
     }
 
+    /// Look up a space by ID.
     pub fn get(&self, id: SpaceId) -> Option<&SpaceConfig> {
         self.spaces.get(&id)
     }
 
+    /// Look up a space by name.
     pub fn get_by_name(&self, name: &str) -> Option<&SpaceConfig> {
         self.names.get(name).and_then(|id| self.spaces.get(id))
     }
 
+    /// Remove a space and return its previous configuration, if it existed.
     pub fn remove(&mut self, id: SpaceId) -> Option<SpaceConfig> {
         if let Some(config) = self.spaces.remove(&id) {
             self.names.remove(&config.name);
@@ -57,9 +61,13 @@ impl SpaceRegistry {
     }
 }
 
+/// Errors returned by space registry operations.
 #[derive(Debug)]
 pub enum SpaceError {
+    /// The provided `SpaceId` is already registered.
     DuplicateId(SpaceId),
+    /// The provided space name is already registered.
     DuplicateName(String),
+    /// A requested space does not exist.
     NotFound(SpaceId),
 }

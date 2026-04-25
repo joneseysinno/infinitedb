@@ -89,6 +89,7 @@ impl Delta {
         }
     }
 
+    /// Return `true` when this delta has no changes.
     pub fn is_empty(&self) -> bool {
         self.added_blocks.is_empty() && self.removed_block_ids.is_empty()
     }

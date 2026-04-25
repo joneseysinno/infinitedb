@@ -1,4 +1,10 @@
-pub mod wal;         // write-ahead log
-pub mod nvme;        // NVMe-aware block I/O
-pub mod compaction;  // merge small/fragmented blocks
-pub mod gc;          // tombstone + version lifecycle
+//! Embedded storage engine components.
+
+/// Write-ahead logging and recovery.
+pub mod wal;
+/// NVMe-friendly block store and cache.
+pub mod nvme;
+/// Block compaction routines.
+pub mod compaction;
+/// Retention policy and garbage collection helpers.
+pub mod gc;

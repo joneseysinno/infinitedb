@@ -21,6 +21,7 @@ pub struct Dimension {
 }
 
 impl Dimension {
+    /// Create a named dimension coordinate.
     pub fn new(label: &'static str, coord: u32) -> Self {
         Self { label, coord }
     }
@@ -36,7 +37,7 @@ pub struct KeyConfig {
 impl KeyConfig {
     /// Standard 8-bit precision (256 values per axis).
     pub const STANDARD: KeyConfig = KeyConfig { bits_per_dim: 8 };
-    /// High 4-bit precision (16 values per axis), up to 32 dimensions.
+    /// Compact 4-bit precision (16 values per axis).
     pub const COMPACT: KeyConfig = KeyConfig { bits_per_dim: 4 };
 }
 
@@ -61,6 +62,7 @@ pub struct CompositeKey {
 }
 
 impl CompositeKey {
+    /// Start a composite key with the provided precision config.
     pub fn new(config: KeyConfig) -> Self {
         Self { config, dims: Vec::new() }
     }
