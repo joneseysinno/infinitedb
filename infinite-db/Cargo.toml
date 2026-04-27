@@ -1,6 +1,6 @@
 [package]
 name = "infinite-db"
-version = "0.1.1"
+version = "0.1.2"
 authors = ["Jonesey's Innovation"]
 edition = "2024"
 description = "A spatial-graph database using n-dimensional curves and hyperedges for engineering logic."
