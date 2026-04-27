@@ -1,3 +1,8 @@
-pub mod delta;   // diff protocol
-pub mod merkle;  // content verification tree
-pub mod serial;  // snapshot wire encoding
+//! Synchronization and replication protocols.
+
+/// Snapshot delta computation and application.
+pub mod delta;
+/// Merkle tree verification helpers.
+pub mod merkle;
+/// Wire serialization for sync messages.
+pub mod serial;

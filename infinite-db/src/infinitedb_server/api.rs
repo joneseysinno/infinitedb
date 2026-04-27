@@ -76,9 +76,13 @@ pub enum Response {
 /// Structured errors returned to the client.
 #[derive(Debug, Encode, Decode)]
 pub enum ApiError {
+    /// Session lacks required permissions.
     Unauthorised,
+    /// Requested space does not exist.
     SpaceNotFound(SpaceId),
+    /// Request could not be validated.
     InvalidRequest(String),
+    /// Internal failure while handling request.
     Internal(String),
 }
 

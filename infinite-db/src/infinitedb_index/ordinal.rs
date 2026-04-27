@@ -9,6 +9,7 @@ pub fn encode_i32(v: i32) -> u32 {
     (v as i64 + i32::MAX as i64 + 1) as u32
 }
 
+/// Decode a coordinate produced by [`encode_i32`].
 pub fn decode_i32(v: u32) -> i32 {
     (v as i64 - i32::MAX as i64 - 1) as i32
 }
@@ -26,6 +27,7 @@ pub fn encode_f32(v: f32) -> u32 {
     }
 }
 
+/// Decode a coordinate produced by [`encode_f32`].
 pub fn decode_f32(v: u32) -> f32 {
     let bits = if v >> 31 != 0 {
         v ^ 0x8000_0000

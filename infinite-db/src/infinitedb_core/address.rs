@@ -11,8 +11,10 @@ pub struct SpaceId(pub u64);
 pub struct RevisionId(pub u64);
 
 impl RevisionId {
+    /// The initial revision before any writes have occurred.
     pub const ZERO: RevisionId = RevisionId(0);
 
+    /// Return the next logical revision.
     pub fn next(self) -> RevisionId {
         RevisionId(self.0 + 1)
     }
@@ -26,6 +28,7 @@ pub struct DimensionVector {
 }
 
 impl DimensionVector {
+    /// Construct a dimension vector. Supports up to 16 dimensions.
     pub fn new(coords: Vec<u32>) -> Self {
         assert!(
             coords.len() <= 16,
@@ -34,10 +37,12 @@ impl DimensionVector {
         Self { coords }
     }
 
+    /// Number of dimensions in this coordinate.
     pub fn dims(&self) -> usize {
         self.coords.len()
     }
 
+    /// Return the coordinate value at index `idx`.
     pub fn coord(&self, idx: usize) -> u32 {
         self.coords[idx]
     }
@@ -61,6 +66,7 @@ pub struct Address {
 }
 
 impl Address {
+    /// Construct a new address from its space and coordinate point.
     pub fn new(space: SpaceId, point: DimensionVector) -> Self {
         Self { space, point }
     }

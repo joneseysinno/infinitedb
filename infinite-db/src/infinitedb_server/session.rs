@@ -25,6 +25,7 @@ impl SessionId {
         Self(bytes)
     }
 
+    /// Return the session ID as lower-case hexadecimal.
     pub fn as_hex(&self) -> String {
         self.0.iter().map(|b| format!("{:02x}", b)).collect()
     }
@@ -63,6 +64,7 @@ pub struct Session {
 }
 
 impl Session {
+    /// Create a new session with branch/snapshot context and space grants.
     pub fn new(
         branch: BranchId,
         pinned_snapshot: SnapshotId,
