@@ -29,6 +29,11 @@ use std::{
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
 };
+#[cfg(feature = "sync")]
+use std::{
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 use bincode::{config::standard, decode_from_slice, encode_to_vec};
 
@@ -45,6 +50,12 @@ use crate::infinitedb_index::{
 use crate::infinitedb_storage::{
     nvme::{compute_checksum, BlockStore},
     wal::{WalEntry, WalWriter},
+};
+#[cfg(feature = "sync")]
+use crate::infinitedb_sync::{
+    outbox::{load_outbox, save_outbox, OutboxState, SyncReport},
+    transport::{SyncOperation, SyncTransport},
+    worker::BackgroundSyncWorker,
 };
 
 // ---------------------------------------------------------------------------
@@ -72,6 +83,12 @@ pub struct InfiniteDb {
     snapshots: BTreeMap<u64, Snapshot>,
     /// Flush threshold: seal a block after this many buffered records.
     flush_threshold: usize,
+    #[cfg(feature = "sync")]
+    outbox_path: PathBuf,
+    #[cfg(feature = "sync")]
+    outbox_state: Arc<Mutex<OutboxState>>,
+    #[cfg(feature = "sync")]
+    sync_worker: Option<BackgroundSyncWorker>,
 }
 
 impl InfiniteDb {
@@ -80,6 +97,8 @@ impl InfiniteDb {
         let root = dir.as_ref().to_path_buf();
         let store = BlockStore::open(root.clone())?;
         let wal_path = store.wal_path();
+        #[cfg(feature = "sync")]
+        let outbox_path = root.join("meta").join("sync_outbox.bin");
 
         // Replay WAL to recover in-flight writes.
         let recovered = recover_wal(&wal_path)?;
@@ -102,6 +121,12 @@ impl InfiniteDb {
             next_branch_id: AtomicU64::new(2), // 1 is reserved for main
             snapshots,
             flush_threshold: 256,
+            #[cfg(feature = "sync")]
+            outbox_state: Arc::new(Mutex::new(load_outbox(&outbox_path)?)),
+            #[cfg(feature = "sync")]
+            outbox_path,
+            #[cfg(feature = "sync")]
+            sync_worker: None,
         };
 
         // Re-apply recovered WAL entries.
@@ -156,6 +181,12 @@ impl InfiniteDb {
             data: data.clone(),
         };
         self.wal.append(&entry)?;
+        #[cfg(feature = "sync")]
+        self.enqueue_sync(SyncOperation::Write {
+            address: address.clone(),
+            revision: rev,
+            data: data.clone(),
+        })?;
         self.buffer.push(Record {
             address,
             revision: rev,
@@ -177,6 +208,11 @@ impl InfiniteDb {
             revision: rev,
         };
         self.wal.append(&entry)?;
+        #[cfg(feature = "sync")]
+        self.enqueue_sync(SyncOperation::Tombstone {
+            address: address.clone(),
+            revision: rev,
+        })?;
         self.buffer.push(Record {
             address,
             revision: rev,
@@ -455,6 +491,83 @@ impl InfiniteDb {
     }
 
     // -----------------------------------------------------------------------
+    // Replication sync (offline-first)
+    // -----------------------------------------------------------------------
+
+    /// Run one immediate sync pass against the provided transport.
+    #[cfg(feature = "sync")]
+    pub fn sync_now(
+        &mut self,
+        transport: &dyn SyncTransport,
+        max_batch: usize,
+    ) -> io::Result<SyncReport> {
+        let mut state = self
+            .outbox_state
+            .lock()
+            .map_err(|_| io::Error::new(io::ErrorKind::Other, "sync outbox lock poisoned"))?;
+        let report = state.process_once(transport, max_batch);
+        if report.attempted > 0 {
+            save_outbox(&self.outbox_path, &state)?;
+        }
+        Ok(report)
+    }
+
+    /// Start a background worker that retries queued outbox writes.
+    #[cfg(feature = "sync")]
+    pub fn start_background_sync(
+        &mut self,
+        transport: Arc<dyn SyncTransport>,
+        interval: Duration,
+        batch_size: usize,
+    ) -> io::Result<()> {
+        self.stop_background_sync();
+        let worker = BackgroundSyncWorker::start(
+            Arc::clone(&self.outbox_state),
+            self.outbox_path.clone(),
+            transport,
+            interval,
+            batch_size,
+        )?;
+        self.sync_worker = Some(worker);
+        Ok(())
+    }
+
+    /// Stop the running background sync worker (if any).
+    #[cfg(feature = "sync")]
+    pub fn stop_background_sync(&mut self) {
+        if let Some(mut worker) = self.sync_worker.take() {
+            worker.stop();
+        }
+    }
+
+    /// Current number of queued operations waiting to sync.
+    #[cfg(feature = "sync")]
+    pub fn sync_pending_count(&self) -> usize {
+        self.outbox_state
+            .lock()
+            .map(|s| s.pending_count())
+            .unwrap_or(0)
+    }
+
+    /// Last successful outbox sync timestamp (epoch ms).
+    #[cfg(feature = "sync")]
+    pub fn last_successful_sync_at_ms(&self) -> Option<u64> {
+        self.outbox_state
+            .lock()
+            .ok()
+            .and_then(|s| s.last_success_at_ms)
+    }
+
+    /// Last sync error seen by the outbox processor.
+    #[cfg(feature = "sync")]
+    pub fn last_sync_error(&self) -> Option<String> {
+        self.outbox_state
+            .lock()
+            .ok()
+            .and_then(|s| s.last_error.clone())
+    }
+
+    // -----------------------------------------------------------------------
     // Internal helpers
     // -----------------------------------------------------------------------
 
@@ -500,6 +613,23 @@ impl InfiniteDb {
         self.store.write_meta("counters.bin", &counters_bytes)?;
 
         Ok(())
+    }
+
+    #[cfg(feature = "sync")]
+    fn enqueue_sync(&mut self, op: SyncOperation) -> io::Result<()> {
+        let mut state = self
+            .outbox_state
+            .lock()
+            .map_err(|_| io::Error::new(io::ErrorKind::Other, "sync outbox lock poisoned"))?;
+        state.enqueue(op);
+        save_outbox(&self.outbox_path, &state)
+    }
+}
+
+#[cfg(feature = "sync")]
+impl Drop for InfiniteDb {
+    fn drop(&mut self) {
+        self.stop_background_sync();
     }
 }
 
@@ -625,6 +755,10 @@ mod tests {
     use tempfile::TempDir;
     use crate::infinitedb_core::address::{DimensionVector, SpaceId};
     use crate::infinitedb_core::branch::BranchId;
+    #[cfg(feature = "sync")]
+    use std::sync::Arc;
+    #[cfg(feature = "sync")]
+    use crate::infinitedb_sync::transport::{SyncEnvelope, SyncResult, SyncTransport};
 
     fn open_tmp() -> (InfiniteDb, TempDir) {
         let dir = TempDir::new().unwrap();
@@ -682,5 +816,104 @@ mod tests {
         let main = BranchId(1);
         let feature = db.create_branch("feature", main).unwrap();
         assert_ne!(feature, main);
+    }
+
+    #[cfg(feature = "sync")]
+    struct AckTransport;
+    #[cfg(feature = "sync")]
+    impl SyncTransport for AckTransport {
+        fn push_batch(&self, batch: &[SyncEnvelope]) -> Result<Vec<SyncResult>, String> {
+            Ok(batch
+                .iter()
+                .map(|item| SyncResult::Ack { op_id: item.op_id })
+                .collect())
+        }
+    }
+
+    #[cfg(feature = "sync")]
+    struct FlakyTransport;
+    #[cfg(feature = "sync")]
+    impl SyncTransport for FlakyTransport {
+        fn push_batch(&self, batch: &[SyncEnvelope]) -> Result<Vec<SyncResult>, String> {
+            Ok(batch
+                .iter()
+                .map(|item| SyncResult::Retry {
+                    op_id: item.op_id,
+                    error: "offline".to_string(),
+                })
+                .collect())
+        }
+    }
+
+    #[cfg(feature = "sync")]
+    struct StaleConflictTransport;
+    #[cfg(feature = "sync")]
+    impl SyncTransport for StaleConflictTransport {
+        fn push_batch(&self, batch: &[SyncEnvelope]) -> Result<Vec<SyncResult>, String> {
+            Ok(batch
+                .iter()
+                .map(|item| SyncResult::ConflictStale {
+                    op_id: item.op_id,
+                    reason: "stale write".to_string(),
+                })
+                .collect())
+        }
+    }
+
+    #[cfg(feature = "sync")]
+    #[test]
+    fn outbox_survives_restart() {
+        let dir = TempDir::new().unwrap();
+        let space = SpaceId(1);
+        {
+            let mut db = InfiniteDb::open(dir.path()).unwrap();
+            db.insert(space, DimensionVector::new(vec![1, 2]), vec![3]).unwrap();
+            assert_eq!(db.sync_pending_count(), 1);
+        }
+        let db = InfiniteDb::open(dir.path()).unwrap();
+        assert_eq!(db.sync_pending_count(), 1);
+    }
+
+    #[cfg(feature = "sync")]
+    #[test]
+    fn offline_queue_then_manual_sync_drains() {
+        let (mut db, _dir) = open_tmp();
+        let space = SpaceId(1);
+        db.insert(space, DimensionVector::new(vec![10, 10]), vec![7]).unwrap();
+        let retry_report = db.sync_now(&FlakyTransport, 32).unwrap();
+        assert_eq!(retry_report.retried, 1);
+        assert_eq!(db.sync_pending_count(), 1);
+        std::thread::sleep(Duration::from_millis(2100));
+        let ack_report = db.sync_now(&AckTransport, 32).unwrap();
+        assert_eq!(ack_report.acked, 1);
+        assert_eq!(db.sync_pending_count(), 0);
+    }
+
+    #[cfg(feature = "sync")]
+    #[test]
+    fn stale_conflict_is_dropped_under_lww() {
+        let (mut db, _dir) = open_tmp();
+        let space = SpaceId(1);
+        db.insert(space, DimensionVector::new(vec![11, 11]), vec![8]).unwrap();
+        let report = db.sync_now(&StaleConflictTransport, 32).unwrap();
+        assert_eq!(report.dropped_stale, 1);
+        assert_eq!(db.sync_pending_count(), 0);
+    }
+
+    #[cfg(feature = "sync")]
+    #[test]
+    fn background_worker_retries_and_acks() {
+        let (mut db, _dir) = open_tmp();
+        let space = SpaceId(1);
+        db.insert(space, DimensionVector::new(vec![20, 20]), vec![1]).unwrap();
+        db.start_background_sync(
+            Arc::new(AckTransport),
+            Duration::from_millis(20),
+            16,
+        )
+        .unwrap();
+        std::thread::sleep(Duration::from_millis(120));
+        db.stop_background_sync();
+        assert_eq!(db.sync_pending_count(), 0);
     }
 }
