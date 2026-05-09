@@ -9,10 +9,12 @@
 
 use bincode::{Decode, Encode};
 use crate::infinitedb_core::{
-    address::{Address, RevisionId, SpaceId},
+    address::{Address, DimensionVector, RevisionId, SpaceId},
     block::Record,
     branch::BranchId,
+    hyperedge::{Hyperedge, HyperedgeId},
     query::Query,
+    signal::SignalSample,
     snapshot::SnapshotId,
 };
 use crate::infinitedb_server::session::Session;
@@ -43,6 +45,24 @@ pub enum Request {
     /// Delete: append a tombstone revision.
     Delete {
         address: Address,
+        revision: RevisionId,
+    },
+    /// Write: upsert typed hyperedge payload.
+    WriteHyperedge {
+        space: SpaceId,
+        edge: Hyperedge,
+        revision: RevisionId,
+    },
+    /// Delete: tombstone typed hyperedge payload.
+    DeleteHyperedge {
+        space: SpaceId,
+        edge_id: HyperedgeId,
+        revision: RevisionId,
+    },
+    /// Write: append typed signal sample payload.
+    WriteSignal {
+        space: SpaceId,
+        sample: SignalSample,
         revision: RevisionId,
     },
     /// Branch: create a new branch forked from an existing one.
@@ -149,6 +169,53 @@ where
                 return Response::Error(ApiError::Unauthorised);
             }
             match write(address, revision, vec![], true) {
+                Ok(rev) => Response::WriteAck { revision: rev },
+                Err(e) => Response::Error(ApiError::Internal(e)),
+            }
+        }
+
+        Request::WriteHyperedge { space, edge, revision } => {
+            if !session.can_write(space) {
+                return Response::Error(ApiError::Unauthorised);
+            }
+            let point = DimensionVector::new(vec![(edge.id.0 >> 32) as u32, (edge.id.0 & 0xFFFF_FFFF) as u32]);
+            let address = Address::new(space, point);
+            let data = match bincode::encode_to_vec(edge, bincode::config::standard()) {
+                Ok(v) => v,
+                Err(e) => return Response::Error(ApiError::InvalidRequest(e.to_string())),
+            };
+            match write(address, revision, data, false) {
+                Ok(rev) => Response::WriteAck { revision: rev },
+                Err(e) => Response::Error(ApiError::Internal(e)),
+            }
+        }
+
+        Request::DeleteHyperedge { space, edge_id, revision } => {
+            if !session.can_write(space) {
+                return Response::Error(ApiError::Unauthorised);
+            }
+            let point = DimensionVector::new(vec![(edge_id.0 >> 32) as u32, (edge_id.0 & 0xFFFF_FFFF) as u32]);
+            let address = Address::new(space, point);
+            match write(address, revision, vec![], true) {
+                Ok(rev) => Response::WriteAck { revision: rev },
+                Err(e) => Response::Error(ApiError::Internal(e)),
+            }
+        }
+
+        Request::WriteSignal { space, sample, revision } => {
+            if !session.can_write(space) {
+                return Response::Error(ApiError::Unauthorised);
+            }
+            let coords = match sample.scope.address_coords(&sample.local_coords) {
+                Ok(v) => v,
+                Err(e) => return Response::Error(ApiError::InvalidRequest(format!("{:?}", e))),
+            };
+            let address = Address::new(space, DimensionVector::new(coords));
+            let data = match bincode::encode_to_vec(sample, bincode::config::standard()) {
+                Ok(v) => v,
+                Err(e) => return Response::Error(ApiError::InvalidRequest(e.to_string())),
+            };
+            match write(address, revision, data, false) {
                 Ok(rev) => Response::WriteAck { revision: rev },
                 Err(e) => Response::Error(ApiError::Internal(e)),
             }

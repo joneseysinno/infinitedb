@@ -2,6 +2,18 @@
 //!
 //! This crate exposes core spatial data types and, via feature flags,
 //! optional embedded storage, server, and sync layers.
+//!
+//! ## Semantic Vocabulary
+//! - `Space`: named N-dimensional dataset with fixed dimensionality.
+//! - `Address`: (`SpaceId`, `DimensionVector`) coordinate key for a record.
+//! - `Node`: any domain entity represented as one or more records in a space.
+//! - `Hyperedge`: explicit relationship linking 2+ endpoint nodes.
+//! - `Signal`: scoped field/sample value over a parent hyperspace prefix.
+//! - `Scope`: fixed coordinate prefix that bounds child records.
+//! - `Revision`: monotonic logical write clock (`RevisionId`).
+//! - `Snapshot`: immutable view assembled from sealed blocks.
+//! - `Tombstone`: logical delete marker for an address/revision.
+//! - `Adapter`: optional trait-based upstream layer for typed labels and spaces.
 
 /// Core spatial and branching types.
 pub mod infinitedb_core;

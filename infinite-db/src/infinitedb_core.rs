@@ -1,4 +1,12 @@
 //! Core domain types for InfiniteDB.
+//!
+//! Semantics are intentionally explicit for upstream crate discoverability:
+//! - Addressing (`address`) models spatial identity.
+//! - Records/blocks (`block`) model immutable revisioned storage.
+//! - Relationships (`hyperedge`) model external entity topology.
+//! - Fields (`signal`) model scoped internal state across hyperspace.
+//! - Adapter traits (`adapter`) provide typed upstream bindings.
+//! - Kind catalog (`kind_catalog`) provides runtime discoverability/policy checks.
 
 /// Addressing primitives (`Address`, `SpaceId`, `DimensionVector`).
 pub mod address;
@@ -10,6 +18,14 @@ pub mod branch;
 pub mod query;
 /// Schema trait implemented by storable record types.
 pub mod schema;
+/// Upstream adapter traits and conversions.
+pub mod adapter;
+/// Hyperedge relationship primitives.
+pub mod hyperedge;
+/// Signal field primitives and scoped samples.
+pub mod signal;
+/// Runtime kind/role catalog for adapter validation.
+pub mod kind_catalog;
 /// Snapshot model and snapshot utilities.
 pub mod snapshot;
 /// Space registration and configuration.

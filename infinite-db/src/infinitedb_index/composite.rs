@@ -45,9 +45,9 @@ impl KeyConfig {
 ///
 /// # Example
 /// ```
-/// use infinitedb::infinitedb_index::composite::{CompositeKey, Dimension, KeyConfig};
-/// use infinitedb::infinitedb_index::ordinal::encode_i32;
-/// use infinitedb::infinitedb_index::temporal::HlcTimestamp;
+/// use infinite_db::infinitedb_index::composite::{CompositeKey, Dimension, KeyConfig};
+/// use infinite_db::infinitedb_index::ordinal::encode_i32;
+/// use infinite_db::infinitedb_index::temporal::HlcTimestamp;
 ///
 /// let key = CompositeKey::new(KeyConfig::STANDARD)
 ///     .push(Dimension::new("x", 128))

@@ -2,6 +2,9 @@
 
 use bincode::{Decode, Encode};
 use crate::infinitedb_core::address::{Address, RevisionId};
+use crate::infinitedb_core::hyperedge::{Hyperedge, HyperedgeId};
+use crate::infinitedb_core::signal::SignalSample;
+use crate::infinitedb_core::address::SpaceId;
 
 /// Logical operation that should be replicated to a remote node.
 #[derive(Debug, Clone, Encode, Decode)]
@@ -15,6 +18,24 @@ pub enum SyncOperation {
     /// Logical delete at an address revision.
     Tombstone {
         address: Address,
+        revision: RevisionId,
+    },
+    /// Typed hyperedge upsert operation.
+    WriteHyperedge {
+        space: SpaceId,
+        edge: Hyperedge,
+        revision: RevisionId,
+    },
+    /// Typed hyperedge delete operation.
+    DeleteHyperedge {
+        space: SpaceId,
+        edge_id: HyperedgeId,
+        revision: RevisionId,
+    },
+    /// Typed signal upsert operation.
+    WriteSignal {
+        space: SpaceId,
+        sample: SignalSample,
         revision: RevisionId,
     },
 }

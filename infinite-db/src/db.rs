@@ -12,9 +12,9 @@
 //!
 //! # Example
 //! ```no_run
-//! use infinitedb::InfiniteDb;
-//! use infinitedb::infinitedb_core::address::{DimensionVector, SpaceId};
-//! use infinitedb::infinitedb_core::space::{SpaceConfig, SpaceRegistry};
+//! use infinite_db::InfiniteDb;
+//! use infinite_db::infinitedb_core::address::{DimensionVector, SpaceId};
+//! use infinite_db::infinitedb_core::space::{SpaceConfig, SpaceRegistry};
 //!
 //! let mut db = InfiniteDb::open("./mydb").unwrap();
 //! let space = SpaceId(1);
@@ -38,9 +38,13 @@ use std::{
 use bincode::{config::standard, decode_from_slice, encode_to_vec};
 
 use crate::infinitedb_core::{
+    adapter::{AdapterEndpoint, KindLabel, SpaceBinding},
     address::{Address, DimensionVector, RevisionId, SpaceId},
     block::{Block, BlockId, Record},
     branch::{Branch, BranchId, BranchRegistry},
+    hyperedge::{EndpointRef, Hyperedge, HyperedgeId},
+    kind_catalog::KindCatalog,
+    signal::SignalSample,
     snapshot::{Snapshot, SnapshotId},
     space::{SpaceConfig, SpaceRegistry},
 };
@@ -220,6 +224,305 @@ impl InfiniteDb {
             tombstone: true,
         });
         Ok(rev)
+    }
+
+    /// Insert or update a typed hyperedge record.
+    pub fn insert_hyperedge(
+        &mut self,
+        space: SpaceId,
+        mut edge: Hyperedge,
+    ) -> io::Result<RevisionId> {
+        edge.validate()
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("{:?}", e)))?;
+        let point = hyperedge_point(edge.id);
+        let data = encode_to_vec(&edge, standard())
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let rev = self.next_revision();
+        let address = Address::new(space, point);
+        self.wal.append(&WalEntry::Write {
+            address: address.clone(),
+            revision: rev,
+            data: data.clone(),
+        })?;
+        self.buffer.push(Record {
+            address,
+            revision: rev,
+            data,
+            tombstone: false,
+        });
+        if self.buffer.len() >= self.flush_threshold {
+            self.flush(space)?;
+        }
+        edge.valid_from = rev;
+        #[cfg(feature = "sync")]
+        self.enqueue_sync(SyncOperation::WriteHyperedge {
+            space,
+            edge,
+            revision: rev,
+        })?;
+        Ok(rev)
+    }
+
+    /// Logically delete a hyperedge record by ID.
+    pub fn delete_hyperedge(&mut self, space: SpaceId, id: HyperedgeId) -> io::Result<RevisionId> {
+        let point = hyperedge_point(id);
+        let rev = self.next_revision();
+        let address = Address::new(space, point);
+        self.wal.append(&WalEntry::Tombstone {
+            address: address.clone(),
+            revision: rev,
+        })?;
+        self.buffer.push(Record {
+            address,
+            revision: rev,
+            data: vec![],
+            tombstone: true,
+        });
+        #[cfg(feature = "sync")]
+        self.enqueue_sync(SyncOperation::DeleteHyperedge {
+            space,
+            edge_id: id,
+            revision: rev,
+        })?;
+        Ok(rev)
+    }
+
+    /// Query all decodable hyperedges from a space.
+    pub fn query_hyperedges(
+        &mut self,
+        space: SpaceId,
+        as_of: Option<RevisionId>,
+    ) -> io::Result<Vec<Hyperedge>> {
+        self.query(space, as_of)?
+            .into_iter()
+            .map(|r| {
+                decode_from_slice::<Hyperedge, _>(&r.data, standard())
+                    .map(|(edge, _)| edge)
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+            })
+            .collect()
+    }
+
+    /// Query hyperedges that reference the provided endpoint.
+    pub fn query_hyperedges_for_endpoint(
+        &mut self,
+        space: SpaceId,
+        endpoint: &EndpointRef,
+        as_of: Option<RevisionId>,
+    ) -> io::Result<Vec<Hyperedge>> {
+        let edges = self.query_hyperedges(space, as_of)?;
+        Ok(edges
+            .into_iter()
+            .filter(|e| e.endpoints.iter().any(|ep| ep == endpoint))
+            .collect())
+    }
+
+    /// Query hyperedges by relationship kind.
+    pub fn query_hyperedges_by_kind(
+        &mut self,
+        space: SpaceId,
+        kind: &str,
+        as_of: Option<RevisionId>,
+    ) -> io::Result<Vec<Hyperedge>> {
+        let edges = self.query_hyperedges(space, as_of)?;
+        Ok(edges
+            .into_iter()
+            .filter(|e| e.kind.as_str() == kind)
+            .collect())
+    }
+
+    /// Adapter-friendly hyperedge write API with optional catalog enforcement.
+    pub fn insert_hyperedge_typed<K: KindLabel>(
+        &mut self,
+        space: SpaceId,
+        id: HyperedgeId,
+        kind: K,
+        endpoints: Vec<AdapterEndpoint>,
+        weight_milli: Option<i64>,
+        metadata: std::collections::BTreeMap<String, String>,
+        valid_to: Option<RevisionId>,
+        catalog: Option<&KindCatalog>,
+    ) -> io::Result<RevisionId> {
+        let kind_label = kind.label().to_string();
+        if let Some(catalog) = catalog {
+            catalog
+                .validate_edge_kind(&kind_label)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
+            for ep in &endpoints {
+                catalog
+                    .validate_endpoint_role(&ep.role)
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
+            }
+        }
+        let edge = Hyperedge {
+            id,
+            kind: kind_label.into(),
+            endpoints: endpoints.into_iter().map(EndpointRef::from).collect(),
+            weight_milli,
+            metadata,
+            valid_from: RevisionId::ZERO,
+            valid_to,
+        };
+        self.insert_hyperedge(space, edge)
+    }
+
+    /// Adapter-friendly kind-filter query.
+    pub fn query_hyperedges_by_kind_typed<K: KindLabel>(
+        &mut self,
+        space: SpaceId,
+        kind: K,
+        as_of: Option<RevisionId>,
+    ) -> io::Result<Vec<Hyperedge>> {
+        self.query_hyperedges_by_kind(space, kind.label(), as_of)
+    }
+
+    /// Insert a signal sample in the provided signal space.
+    pub fn insert_signal_sample(
+        &mut self,
+        space: SpaceId,
+        sample: SignalSample,
+    ) -> io::Result<RevisionId> {
+        sample.validate()
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("{:?}", e)))?;
+        let full_coords = sample
+            .scope
+            .address_coords(&sample.local_coords)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("{:?}", e)))?;
+        if let Some(cfg) = self.spaces.get(space) {
+            if cfg.dims != full_coords.len() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "signal coordinates do not match space dimensions",
+                ));
+            }
+        }
+        let data = encode_to_vec(&sample, standard())
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let rev = self.next_revision();
+        let address = Address::new(space, DimensionVector::new(full_coords));
+        self.wal.append(&WalEntry::Write {
+            address: address.clone(),
+            revision: rev,
+            data: data.clone(),
+        })?;
+        self.buffer.push(Record {
+            address,
+            revision: rev,
+            data,
+            tombstone: false,
+        });
+        if self.buffer.len() >= self.flush_threshold {
+            self.flush(space)?;
+        }
+        #[cfg(feature = "sync")]
+        self.enqueue_sync(SyncOperation::WriteSignal {
+            space,
+            sample,
+            revision: rev,
+        })?;
+        Ok(rev)
+    }
+
+    /// Adapter-friendly signal write API bound to a typed space.
+    pub fn insert_signal_sample_typed<SB: SpaceBinding, K: KindLabel>(
+        &mut self,
+        signal_id: crate::infinitedb_core::signal::SignalId,
+        kind: K,
+        parent_prefix: DimensionVector,
+        local_coords: Vec<u32>,
+        value_milli: i64,
+        source_revision: Option<RevisionId>,
+        constraint: Option<crate::infinitedb_core::signal::SignalConstraint>,
+        catalog: Option<&KindCatalog>,
+    ) -> io::Result<RevisionId> {
+        if let Some(cfg) = self.spaces.get(SB::SPACE_ID) {
+            if cfg.dims != SB::DIMS {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "SpaceBinding dims mismatch for space {}: trait={}, registry={}",
+                        SB::SPACE_ID.0,
+                        SB::DIMS,
+                        cfg.dims
+                    ),
+                ));
+            }
+        } else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("SpaceBinding refers to unregistered space {}", SB::SPACE_ID.0),
+            ));
+        }
+        let kind_label = kind.label().to_string();
+        if let Some(catalog) = catalog {
+            catalog
+                .validate_signal_kind(&kind_label)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
+        }
+        let sample = crate::infinitedb_core::signal::SignalSample {
+            signal_id,
+            kind: kind_label.into(),
+            scope: crate::infinitedb_core::signal::SignalScope {
+                parent_prefix,
+                total_dims: SB::DIMS,
+            },
+            local_coords,
+            value_milli,
+            source_revision,
+            constraint,
+        };
+        self.insert_signal_sample(SB::SPACE_ID, sample)
+    }
+
+    /// Query all signal samples under a parent scope prefix.
+    pub fn query_signal_scope(
+        &mut self,
+        space: SpaceId,
+        parent_coords: &[u32],
+        as_of: Option<RevisionId>,
+    ) -> io::Result<Vec<SignalSample>> {
+        let rows = self.query_subscope(space, parent_coords, as_of)?;
+        rows.into_iter()
+            .map(|r| {
+                decode_from_slice::<SignalSample, _>(&r.data, standard())
+                    .map(|(sample, _)| sample)
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+            })
+            .collect()
+    }
+
+    /// Query signal samples in a local coordinate range under a parent scope.
+    pub fn query_signal_range(
+        &mut self,
+        space: SpaceId,
+        parent_coords: &[u32],
+        min_local: &[u32],
+        max_local: &[u32],
+        as_of: Option<RevisionId>,
+    ) -> io::Result<Vec<SignalSample>> {
+        if min_local.len() != max_local.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "min_local and max_local dimensions differ",
+            ));
+        }
+        let mut min = parent_coords.to_vec();
+        min.extend_from_slice(min_local);
+        let mut max = parent_coords.to_vec();
+        max.extend_from_slice(max_local);
+        let rows = self.query_bbox(
+            space,
+            DimensionVector::new(min),
+            DimensionVector::new(max),
+            as_of,
+        )?;
+        rows.into_iter()
+            .map(|r| {
+                decode_from_slice::<SignalSample, _>(&r.data, standard())
+                    .map(|(sample, _)| sample)
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+            })
+            .collect()
     }
 
     /// Seal all buffered records for `space` into a new block on disk.
@@ -745,6 +1048,10 @@ fn hilbert_key_for(point: &DimensionVector) -> u128 {
     key.encode()
 }
 
+fn hyperedge_point(id: HyperedgeId) -> DimensionVector {
+    DimensionVector::new(vec![(id.0 >> 32) as u32, (id.0 & 0xFFFF_FFFF) as u32])
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -754,7 +1061,12 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
     use crate::infinitedb_core::address::{DimensionVector, SpaceId};
+    use crate::infinitedb_core::adapter::{AdapterEndpoint, KindLabel, SpaceBinding};
     use crate::infinitedb_core::branch::BranchId;
+    use crate::infinitedb_core::hyperedge::{EndpointRef, EndpointRole, Hyperedge, HyperedgeId, HyperedgeKind};
+    use crate::infinitedb_core::kind_catalog::{KindCatalog, KindDefinition, UnknownKindPolicy};
+    use crate::infinitedb_core::signal::{SignalId, SignalKind, SignalSample, SignalScope};
+    use crate::infinitedb_core::space::SpaceConfig;
     #[cfg(feature = "sync")]
     use std::sync::Arc;
     #[cfg(feature = "sync")]
@@ -764,6 +1076,27 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let db = InfiniteDb::open(dir.path()).unwrap();
         (db, dir)
+    }
+
+    enum BeamKinds {
+        BearsOn,
+        BendingMoment,
+    }
+
+    impl KindLabel for BeamKinds {
+        fn label(&self) -> &str {
+            match self {
+                BeamKinds::BearsOn => "beam.bears_on",
+                BeamKinds::BendingMoment => "beam.bending_moment",
+            }
+        }
+    }
+
+    struct BeamSignalSpace;
+    impl SpaceBinding for BeamSignalSpace {
+        const SPACE_ID: SpaceId = SpaceId(88);
+        const DIMS: usize = 3;
+        const SPACE_NAME: &'static str = "beam_signals";
     }
 
     #[test]
@@ -816,6 +1149,214 @@ mod tests {
         let main = BranchId(1);
         let feature = db.create_branch("feature", main).unwrap();
         assert_ne!(feature, main);
+    }
+
+    #[test]
+    fn hyperedge_insert_query_and_delete() {
+        let (mut db, _dir) = open_tmp();
+        let edge_space = SpaceId(77);
+        db.register_space(SpaceConfig {
+            id: edge_space,
+            name: "hyperedges".to_string(),
+            dims: 2,
+        })
+        .unwrap();
+        let edge = Hyperedge {
+            id: HyperedgeId(42),
+            kind: HyperedgeKind::new("beam.bears_on"),
+            endpoints: vec![
+                EndpointRef {
+                    role: EndpointRole::new("parent"),
+                    space: SpaceId(10),
+                    node: DimensionVector::new(vec![100]),
+                },
+                EndpointRef {
+                    role: EndpointRole::new("support"),
+                    space: SpaceId(11),
+                    node: DimensionVector::new(vec![200]),
+                },
+            ],
+            weight_milli: Some(1_000),
+            metadata: std::collections::BTreeMap::new(),
+            valid_from: RevisionId::ZERO,
+            valid_to: None,
+        };
+        db.insert_hyperedge(edge_space, edge.clone()).unwrap();
+        db.flush(edge_space).unwrap();
+        let by_kind = db
+            .query_hyperedges_by_kind(edge_space, "beam.bears_on", None)
+            .unwrap();
+        assert_eq!(by_kind.len(), 1);
+        assert_eq!(by_kind[0].id.0, edge.id.0);
+        db.delete_hyperedge(edge_space, edge.id).unwrap();
+        let after_delete = db.query_hyperedges(edge_space, None).unwrap();
+        assert!(after_delete.is_empty());
+    }
+
+    #[test]
+    fn signal_scope_and_range_queries() {
+        let (mut db, _dir) = open_tmp();
+        let signal_space = SpaceId(88);
+        db.register_space(SpaceConfig {
+            id: signal_space,
+            name: "beam_signals".to_string(),
+            dims: 3,
+        })
+        .unwrap();
+
+        let scope = SignalScope {
+            parent_prefix: DimensionVector::new(vec![7]),
+            total_dims: 3,
+        };
+        db.insert_signal_sample(
+            signal_space,
+            SignalSample {
+                signal_id: SignalId(1),
+                kind: SignalKind::new("beam.bending_moment"),
+                scope: scope.clone(),
+                local_coords: vec![0, 0],
+                value_milli: 10_000,
+                source_revision: None,
+                constraint: None,
+            },
+        )
+        .unwrap();
+        db.insert_signal_sample(
+            signal_space,
+            SignalSample {
+                signal_id: SignalId(1),
+                kind: SignalKind::new("beam.bending_moment"),
+                scope,
+                local_coords: vec![5, 0],
+                value_milli: 20_000,
+                source_revision: None,
+                constraint: None,
+            },
+        )
+        .unwrap();
+        db.flush(signal_space).unwrap();
+
+        let scoped = db.query_signal_scope(signal_space, &[7], None).unwrap();
+        assert_eq!(scoped.len(), 2);
+        let ranged = db
+            .query_signal_range(signal_space, &[7], &[0, 0], &[2, u32::MAX], None)
+            .unwrap();
+        assert_eq!(ranged.len(), 1);
+    }
+
+    #[test]
+    fn adapter_wrappers_accept_typed_kinds_and_space_binding() {
+        let (mut db, _dir) = open_tmp();
+        let edge_space = SpaceId(177);
+        db.register_space(SpaceConfig {
+            id: edge_space,
+            name: "adapter_edges".to_string(),
+            dims: 2,
+        })
+        .unwrap();
+        db.register_space(SpaceConfig {
+            id: BeamSignalSpace::SPACE_ID,
+            name: BeamSignalSpace::SPACE_NAME.to_string(),
+            dims: BeamSignalSpace::DIMS,
+        })
+        .unwrap();
+
+        let mut catalog = KindCatalog::new(UnknownKindPolicy::RejectUnknown);
+        catalog.register_edge_kind(KindDefinition::new("beam.bears_on"));
+        catalog.register_endpoint_role(KindDefinition::new("parent"));
+        catalog.register_endpoint_role(KindDefinition::new("support"));
+        catalog.register_signal_kind(KindDefinition::new("beam.bending_moment"));
+
+        db.insert_hyperedge_typed(
+            edge_space,
+            HyperedgeId(900),
+            BeamKinds::BearsOn,
+            vec![
+                AdapterEndpoint::new("parent", SpaceId(1), DimensionVector::new(vec![10])),
+                AdapterEndpoint::new("support", SpaceId(2), DimensionVector::new(vec![20])),
+            ],
+            Some(1000),
+            std::collections::BTreeMap::new(),
+            None,
+            Some(&catalog),
+        )
+        .unwrap();
+        db.flush(edge_space).unwrap();
+        let edges = db
+            .query_hyperedges_by_kind_typed(edge_space, BeamKinds::BearsOn, None)
+            .unwrap();
+        assert_eq!(edges.len(), 1);
+
+        db.insert_signal_sample_typed::<BeamSignalSpace, _>(
+            SignalId(1),
+            BeamKinds::BendingMoment,
+            DimensionVector::new(vec![7]),
+            vec![0, 0],
+            1234,
+            None,
+            None,
+            Some(&catalog),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn adapter_rejects_unknown_kind_under_reject_policy() {
+        let (mut db, _dir) = open_tmp();
+        let edge_space = SpaceId(178);
+        db.register_space(SpaceConfig {
+            id: edge_space,
+            name: "adapter_edges2".to_string(),
+            dims: 2,
+        })
+        .unwrap();
+
+        let catalog = KindCatalog::new(UnknownKindPolicy::RejectUnknown);
+        let err = db
+            .insert_hyperedge_typed(
+                edge_space,
+                HyperedgeId(901),
+                "unknown.edge.kind",
+                vec![
+                    AdapterEndpoint::new("parent", SpaceId(1), DimensionVector::new(vec![1])),
+                    AdapterEndpoint::new("support", SpaceId(2), DimensionVector::new(vec![2])),
+                ],
+                None,
+                std::collections::BTreeMap::new(),
+                None,
+                Some(&catalog),
+            )
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn adapter_rejects_space_binding_dim_mismatch() {
+        struct WrongDimSpace;
+        impl SpaceBinding for WrongDimSpace {
+            const SPACE_ID: SpaceId = SpaceId(188);
+            const DIMS: usize = 4;
+        }
+        let (mut db, _dir) = open_tmp();
+        db.register_space(SpaceConfig {
+            id: SpaceId(188),
+            name: "wrong_dim".to_string(),
+            dims: 3,
+        })
+        .unwrap();
+        let err = db
+            .insert_signal_sample_typed::<WrongDimSpace, _>(
+                SignalId(2),
+                "beam.any",
+                DimensionVector::new(vec![7]),
+                vec![0, 0],
+                999,
+                None,
+                None,
+                None,
+            )
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
     }
 
     #[cfg(feature = "sync")]
