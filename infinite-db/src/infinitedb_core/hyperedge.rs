@@ -83,6 +83,40 @@ impl Hyperedge {
         revision >= self.valid_from
             && self.valid_to.map(|to| revision <= to).unwrap_or(true)
     }
+
+    /// Compute the centroid of the endpoints sharing the most common space.
+    ///
+    /// Returns `(space, centroid_coords)` for the modal space, or `None` when no
+    /// single space holds at least two endpoints (a purely cross-space edge has
+    /// no shared coordinate frame, so there is no meaningful centroid). The
+    /// centroid is the per-dimension integer mean over the shared dimensions.
+    pub fn endpoint_centroid(&self) -> Option<(SpaceId, Vec<u32>)> {
+        use std::collections::HashMap;
+        let mut groups: HashMap<u64, Vec<&EndpointRef>> = HashMap::new();
+        for ep in &self.endpoints {
+            groups.entry(ep.space.0).or_default().push(ep);
+        }
+        // Modal space: most endpoints, ties broken by smallest space id.
+        let (space_id, eps) = groups
+            .into_iter()
+            .max_by(|a, b| a.1.len().cmp(&b.1.len()).then(b.0.cmp(&a.0)))?;
+        if eps.len() < 2 {
+            return None;
+        }
+        let dims = eps.iter().map(|e| e.node.coords.len()).min().unwrap_or(0);
+        if dims == 0 {
+            return None;
+        }
+        let mut sums = vec![0u64; dims];
+        for ep in &eps {
+            for (d, slot) in sums.iter_mut().enumerate() {
+                *slot += ep.node.coords[d] as u64;
+            }
+        }
+        let n = eps.len() as u64;
+        let centroid = sums.into_iter().map(|s| (s / n) as u32).collect();
+        Some((SpaceId(space_id), centroid))
+    }
 }
 
 #[derive(Debug)]

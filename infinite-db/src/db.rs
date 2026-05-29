@@ -214,10 +214,15 @@ impl InfiniteDb {
         Ok(())
     }
 
-    /// Append a record to the endpoint index space (buffer + WAL only).
-    fn write_index_record(&mut self, point: DimensionVector, data: Vec<u8>) -> io::Result<()> {
+    /// Append a record to a reserved meta/index space (buffer + WAL only).
+    fn write_meta_record(
+        &mut self,
+        space: SpaceId,
+        point: DimensionVector,
+        data: Vec<u8>,
+    ) -> io::Result<()> {
         let rev = self.next_revision();
-        let address = Address::new(ENDPOINT_INDEX_SPACE, point);
+        let address = Address::new(space, point);
         self.wal.append(&WalEntry::Write {
             address: address.clone(),
             revision: rev,
@@ -238,8 +243,79 @@ impl InfiniteDb {
         for ep in edge_endpoints(edge) {
             let point = endpoint_index_point(ep, edge.id);
             let data = encode_hyperedge_id(edge.id);
-            self.write_index_record(point, data)?;
+            self.write_meta_record(ENDPOINT_INDEX_SPACE, point, data)?;
         }
+        Ok(())
+    }
+
+    /// True when `space` is configured to key hyperedges by endpoint centroid.
+    fn uses_centroid_keying(&self, space: SpaceId) -> bool {
+        self.spaces.get(space).map(|c| c.centroid_keying).unwrap_or(false)
+    }
+
+    /// Choose the storage point for a hyperedge record.
+    ///
+    /// Returns `(point, is_centroid)`. Centroid keying yields spatial locality
+    /// for spatially-related edges; it falls back to id-based keying for spaces
+    /// without the flag or for purely cross-space edges with no shared frame.
+    fn edge_storage_point(&self, space: SpaceId, edge: &Hyperedge) -> (DimensionVector, bool) {
+        if self.uses_centroid_keying(space) {
+            if let Some(point) = centroid_hyperedge_point(edge) {
+                return (point, true);
+            }
+        }
+        (hyperedge_point(edge.id), false)
+    }
+
+    /// Register the reserved hyperedge locator space if not already present.
+    fn ensure_locator_space(&mut self) -> io::Result<()> {
+        if self.spaces.get(HYPEREDGE_LOCATOR_SPACE).is_none() {
+            self.register_space(SpaceConfig::new(
+                HYPEREDGE_LOCATOR_SPACE,
+                "__hyperedge_locator__",
+                HYPEREDGE_LOCATOR_DIMS,
+            ))
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        }
+        Ok(())
+    }
+
+    /// Record the id→point mapping for a centroid-keyed edge so it stays
+    /// addressable by id (the centroid point cannot be recomputed from the id).
+    fn write_edge_locator(
+        &mut self,
+        space: SpaceId,
+        id: HyperedgeId,
+        point: &DimensionVector,
+    ) -> io::Result<()> {
+        self.ensure_locator_space()?;
+        let data = encode_to_vec(point, standard())
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        self.write_meta_record(HYPEREDGE_LOCATOR_SPACE, locator_point(space, id), data)
+    }
+
+    /// Resolve the stored point for a centroid-keyed edge via its locator.
+    fn lookup_edge_locator(
+        &mut self,
+        space: SpaceId,
+        id: HyperedgeId,
+        as_of: Option<RevisionId>,
+    ) -> io::Result<Option<DimensionVector>> {
+        self.ensure_locator_space()?;
+        let p = locator_point(space, id);
+        let records = self.query_bbox(HYPEREDGE_LOCATOR_SPACE, p.clone(), p, as_of)?;
+        for r in records {
+            if let Ok((point, _)) = decode_from_slice::<DimensionVector, _>(&r.data, standard()) {
+                return Ok(Some(point));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Tombstone the id→point locator for a centroid-keyed edge.
+    fn tombstone_edge_locator(&mut self, space: SpaceId, id: HyperedgeId) -> io::Result<()> {
+        self.ensure_locator_space()?;
+        self.delete(HYPEREDGE_LOCATOR_SPACE, locator_point(space, id))?;
         Ok(())
     }
 
@@ -281,7 +357,14 @@ impl InfiniteDb {
         id: HyperedgeId,
         as_of: Option<RevisionId>,
     ) -> io::Result<Option<Hyperedge>> {
-        let p = hyperedge_point(id);
+        let p = if self.uses_centroid_keying(space) {
+            match self.lookup_edge_locator(space, id, as_of)? {
+                Some(point) => point,
+                None => return Ok(None),
+            }
+        } else {
+            hyperedge_point(id)
+        };
         let records = self.query_bbox(space, p.clone(), p, as_of)?;
         for r in records {
             if let Ok((edge, _)) = decode_from_slice::<Hyperedge, _>(&r.data, standard()) {
@@ -362,11 +445,11 @@ impl InfiniteDb {
     ) -> io::Result<RevisionId> {
         edge.validate()
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("{:?}", e)))?;
-        let point = hyperedge_point(edge.id);
+        let (point, is_centroid) = self.edge_storage_point(space, &edge);
         let data = encode_to_vec(&edge, standard())
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         let rev = self.next_revision();
-        let address = Address::new(space, point);
+        let address = Address::new(space, point.clone());
         self.wal.append(&WalEntry::Write {
             address: address.clone(),
             revision: rev,
@@ -378,6 +461,9 @@ impl InfiniteDb {
             data,
             tombstone: false,
         });
+        if is_centroid {
+            self.write_edge_locator(space, edge.id, &point)?;
+        }
         if self.buffer.len() >= self.flush_threshold {
             self.flush(space)?;
         }
@@ -394,10 +480,16 @@ impl InfiniteDb {
 
     /// Logically delete a hyperedge record by ID.
     pub fn delete_hyperedge(&mut self, space: SpaceId, id: HyperedgeId) -> io::Result<RevisionId> {
-        if let Some(edge) = self.fetch_hyperedge_by_id(space, id, None)? {
-            self.tombstone_hyperedge_index(&edge)?;
+        let edge = self.fetch_hyperedge_by_id(space, id, None)?;
+        // Tombstone at the edge's actual stored point. For centroid-keyed
+        // spaces this differs from the id-based point.
+        let point = match &edge {
+            Some(e) => self.edge_storage_point(space, e).0,
+            None => hyperedge_point(id),
+        };
+        if let Some(e) = &edge {
+            self.tombstone_hyperedge_index(e)?;
         }
-        let point = hyperedge_point(id);
         let rev = self.next_revision();
         let address = Address::new(space, point);
         self.wal.append(&WalEntry::Tombstone {
@@ -410,6 +502,9 @@ impl InfiniteDb {
             data: vec![],
             tombstone: true,
         });
+        if edge.is_some() && self.uses_centroid_keying(space) {
+            self.tombstone_edge_locator(space, id)?;
+        }
         #[cfg(feature = "sync")]
         self.enqueue_sync(SyncOperation::DeleteHyperedge {
             space,
@@ -1580,6 +1675,37 @@ fn hyperedge_point(id: HyperedgeId) -> DimensionVector {
     DimensionVector::new(vec![(id.0 >> 32) as u32, (id.0 & 0xFFFF_FFFF) as u32])
 }
 
+/// Reserved space mapping `(edge space, HyperedgeId)` → stored centroid point.
+const HYPEREDGE_LOCATOR_SPACE: SpaceId = SpaceId(u64::MAX - 2);
+/// Locator key dims: `[space_hi, space_lo, id_hi, id_lo]`.
+const HYPEREDGE_LOCATOR_DIMS: usize = 4;
+
+/// Deterministic locator key for an `(edge space, edge id)` pair.
+fn locator_point(space: SpaceId, id: HyperedgeId) -> DimensionVector {
+    DimensionVector::new(vec![
+        (space.0 >> 32) as u32,
+        (space.0 & 0xFFFF_FFFF) as u32,
+        (id.0 >> 32) as u32,
+        (id.0 & 0xFFFF_FFFF) as u32,
+    ])
+}
+
+/// Centroid-based storage point for a hyperedge: `[centroid…, id_hi, id_lo]`.
+///
+/// Spatially-related edges (similar endpoint centroids) get numerically close
+/// Hilbert keys; the trailing id dimensions keep distinct edges from colliding
+/// at the same record address. Returns `None` when the edge has no shared-space
+/// centroid (caller falls back to id-based keying).
+fn centroid_hyperedge_point(edge: &Hyperedge) -> Option<DimensionVector> {
+    let (_space, centroid) = edge.endpoint_centroid()?;
+    // Reserve the final two dimensions for the id; cap the centroid accordingly.
+    let mut coords = centroid;
+    coords.truncate(14);
+    coords.push((edge.id.0 >> 32) as u32);
+    coords.push((edge.id.0 & 0xFFFF_FFFF) as u32);
+    Some(DimensionVector::new(coords))
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -2060,6 +2186,84 @@ mod tests {
         let main = BranchId(1);
         let feature = db.create_branch("feature", main).unwrap();
         assert_ne!(feature, main);
+    }
+
+    fn clustered_edge(id: u64, a: Vec<u32>, b: Vec<u32>) -> Hyperedge {
+        Hyperedge {
+            id: HyperedgeId(id),
+            kind: HyperedgeKind::new("near"),
+            endpoints: vec![
+                EndpointRef {
+                    role: EndpointRole::new("a"),
+                    space: SpaceId(1),
+                    node: DimensionVector::new(a),
+                },
+                EndpointRef {
+                    role: EndpointRole::new("b"),
+                    space: SpaceId(1),
+                    node: DimensionVector::new(b),
+                },
+            ],
+            weight_milli: None,
+            metadata: Default::default(),
+            valid_from: RevisionId::ZERO,
+            valid_to: None,
+        }
+    }
+
+    #[test]
+    fn centroid_keying_clusters_nearby_edges() {
+        // Edges over nearby endpoints should get closer Hilbert keys than edges
+        // over distant endpoints.
+        let a = clustered_edge(1, vec![10, 10], vec![12, 12]); // centroid ~ (11,11)
+        let b = clustered_edge(2, vec![13, 13], vec![15, 15]); // centroid ~ (14,14)
+        let c = clustered_edge(3, vec![240, 240], vec![250, 250]); // centroid ~ (245,245)
+
+        let pa = centroid_hyperedge_point(&a).unwrap();
+        let pb = centroid_hyperedge_point(&b).unwrap();
+        let pc = centroid_hyperedge_point(&c).unwrap();
+
+        let ka = hilbert_key_standard(&pa);
+        let kb = hilbert_key_standard(&pb);
+        let kc = hilbert_key_standard(&pc);
+
+        let near = ka.abs_diff(kb);
+        let far = ka.abs_diff(kc);
+        assert!(
+            near < far,
+            "nearby edges should cluster: near={near} far={far}"
+        );
+    }
+
+    #[test]
+    fn centroid_keyed_edges_are_addressable_by_id() {
+        let (mut db, _dir) = open_tmp();
+        let edge_space = SpaceId(80);
+        db.register_space(
+            SpaceConfig::new(edge_space, "centroid_edges", 4).with_centroid_keying(),
+        )
+        .unwrap();
+
+        let edge = clustered_edge(7, vec![20, 30], vec![22, 34]);
+        db.insert_hyperedge(edge_space, edge.clone()).unwrap();
+        db.flush(edge_space).unwrap();
+
+        // Fetch by id resolves through the locator (point is not derivable from id).
+        let fetched = db.fetch_hyperedge_by_id(edge_space, HyperedgeId(7), None).unwrap();
+        assert!(fetched.is_some());
+        assert_eq!(fetched.unwrap().id, HyperedgeId(7));
+
+        // The endpoint index still resolves incident edges.
+        let incident = db
+            .query_hyperedges_for_endpoint(edge_space, &edge.endpoints[0], None)
+            .unwrap();
+        assert!(incident.iter().any(|e| e.id == HyperedgeId(7)));
+
+        // Delete removes it from id lookup.
+        db.delete_hyperedge(edge_space, HyperedgeId(7)).unwrap();
+        db.flush(edge_space).unwrap();
+        let after = db.fetch_hyperedge_by_id(edge_space, HyperedgeId(7), None).unwrap();
+        assert!(after.is_none(), "deleted edge must not be addressable");
     }
 
     #[test]

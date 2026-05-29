@@ -1,6 +1,6 @@
 [package]
 name = "infinite-db"
-version = "0.1.4"
+version = "0.1.5"
 authors = ["Jonesey's Innovation"]
 edition = "2024"
 description = "A spatial-graph database using n-dimensional curves and hyperedges for engineering logic."
@@ -33,3 +33,8 @@ getrandom = "0.3"
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }
 tempfile = "3"
+criterion = "0.5"
+
+[[bench]]
+name = "engine"
+harness = false

@@ -17,17 +17,29 @@ pub struct SpaceConfig {
     /// at the same precision or `BTreeMap` ordering breaks. It is fixed when the
     /// space is registered and must satisfy `dims * bits_per_dim <= 128`.
     pub bits_per_dim: u32,
+    /// Experimental: key hyperedges in this space by the centroid of their
+    /// endpoints (for spatial locality) instead of by `HyperedgeId`.
+    ///
+    /// When enabled, the database maintains an id→point locator so edges remain
+    /// addressable by id. Defaults to `false`; only affects hyperedge spaces.
+    pub centroid_keying: bool,
 }
 
 impl SpaceConfig {
     /// Create a space configuration with the standard 8-bit Hilbert precision.
     pub fn new(id: SpaceId, name: impl Into<String>, dims: usize) -> Self {
-        Self { id, name: name.into(), dims, bits_per_dim: 8 }
+        Self { id, name: name.into(), dims, bits_per_dim: 8, centroid_keying: false }
     }
 
     /// Override the Hilbert precision (bits per dimension) for this space.
     pub fn with_bits_per_dim(mut self, bits_per_dim: u32) -> Self {
         self.bits_per_dim = bits_per_dim;
+        self
+    }
+
+    /// Enable experimental centroid-based hyperedge keying for this space.
+    pub fn with_centroid_keying(mut self) -> Self {
+        self.centroid_keying = true;
         self
     }
 }
