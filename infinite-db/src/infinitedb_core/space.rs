@@ -11,6 +11,25 @@ pub struct SpaceConfig {
     pub name: String,
     /// Number of dimensions all records in this space must have.
     pub dims: usize,
+    /// Hilbert precision (bits per dimension) for this space.
+    ///
+    /// This is a load-bearing invariant: every block in the space must be keyed
+    /// at the same precision or `BTreeMap` ordering breaks. It is fixed when the
+    /// space is registered and must satisfy `dims * bits_per_dim <= 128`.
+    pub bits_per_dim: u32,
+}
+
+impl SpaceConfig {
+    /// Create a space configuration with the standard 8-bit Hilbert precision.
+    pub fn new(id: SpaceId, name: impl Into<String>, dims: usize) -> Self {
+        Self { id, name: name.into(), dims, bits_per_dim: 8 }
+    }
+
+    /// Override the Hilbert precision (bits per dimension) for this space.
+    pub fn with_bits_per_dim(mut self, bits_per_dim: u32) -> Self {
+        self.bits_per_dim = bits_per_dim;
+        self
+    }
 }
 
 /// Registry of all known spaces in the database.

@@ -26,6 +26,9 @@ pub struct Query {
     pub snapshot: SnapshotId,
     /// Spatial bounds to filter records by. None = all records in the space.
     pub range: Option<SpatialRange>,
+    /// Precomputed Hilbert key interval [min, max] for block pruning.
+    /// Takes precedence over `range` when set; None falls back to `range`.
+    pub key_range: Option<(u128, u128)>,
     /// Only return records at or before this revision.
     /// Defaults to the snapshot's own revision when None.
     pub as_of: Option<RevisionId>,
@@ -40,6 +43,7 @@ impl Query {
             space,
             snapshot,
             range: None,
+            key_range: None,
             as_of: None,
             include_tombstones: false,
         }
@@ -48,6 +52,12 @@ impl Query {
     /// Add a spatial range filter.
     pub fn with_range(mut self, range: SpatialRange) -> Self {
         self.range = Some(range);
+        self
+    }
+
+    /// Set a precomputed Hilbert key interval, taking precedence over `range`.
+    pub fn with_key_range(mut self, lo: u128, hi: u128) -> Self {
+        self.key_range = Some((lo, hi));
         self
     }
 

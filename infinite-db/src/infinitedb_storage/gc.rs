@@ -64,7 +64,7 @@ pub fn safe_to_delete(
     // Collect all block IDs still referenced by any snapshot.
     let referenced: HashSet<BlockId> = live_snapshots
         .iter()
-        .flat_map(|s| s.blocks.values().copied())
+        .flat_map(|s| s.blocks.values().map(|e| e.block_id))
         .collect();
 
     superseded

@@ -137,10 +137,7 @@ where
             }
             let mut q = Query::new(space, snapshot);
             if let Some((lo, hi)) = key_range {
-                // Convert u128 Hilbert bounds back to raw coord vecs is deferred
-                // to the storage layer; pass them via the query's range field
-                // once the index layer provides a decode helper.
-                let _ = (lo, hi); // stored in query range in the full implementation
+                q = q.with_key_range(lo, hi);
             }
             if let Some(rev) = as_of {
                 q = q.as_of(rev);
@@ -270,6 +267,34 @@ mod tests {
         let s = rw_session();
         let r = dispatch(Request::Ping, &s, |_| Ok(vec![]), |_, _, _, _| Ok(RevisionId(1)), |_, _| Ok(BranchId(2)), |_| Ok(SnapshotId(1)));
         assert!(matches!(r, Response::Pong));
+    }
+
+    #[test]
+    fn query_preserves_key_range_into_descriptor() {
+        use std::cell::RefCell;
+
+        let s = rw_session();
+        let captured: RefCell<Option<Query>> = RefCell::new(None);
+        let r = dispatch(
+            Request::Query {
+                space: SpaceId(1),
+                snapshot: SnapshotId(1),
+                key_range: Some((10, 99)),
+                as_of: None,
+                include_tombstones: false,
+            },
+            &s,
+            |q| {
+                *captured.borrow_mut() = Some(q);
+                Ok(vec![])
+            },
+            |_, _, _, _| Ok(RevisionId(1)),
+            |_, _| Ok(BranchId(2)),
+            |_| Ok(SnapshotId(1)),
+        );
+        assert!(matches!(r, Response::Records(_)));
+        let q = captured.borrow().clone().expect("read callback must receive a Query");
+        assert_eq!(q.key_range, Some((10, 99)));
     }
 
     #[test]

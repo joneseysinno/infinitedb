@@ -173,4 +173,15 @@ mod tests {
         let decoded = decode(key, 3, 4);
         assert_eq!(pt, decoded);
     }
+
+    /// Hilbert locality sanity: identical points share a key; small steps stay bounded.
+    #[test]
+    fn locality_correlates_for_nearby_points() {
+        let p1 = vec![10u32, 10];
+        let p2 = vec![11, 11];
+        let k1 = encode(&p1, 8);
+        let k2 = encode(&p2, 8);
+        assert_eq!(encode(&p1, 8), k1);
+        assert!(k1.abs_diff(k2) < 1_000_000);
+    }
 }

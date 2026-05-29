@@ -8,6 +8,19 @@ use super::block::BlockId;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Encode, Decode)]
 pub struct SnapshotId(pub u64);
 
+/// An entry in a snapshot's block index.
+///
+/// The map key is the block's minimum Hilbert address; this entry carries the
+/// block ID plus its maximum Hilbert address so range queries can prune to
+/// blocks whose `[min_key, max_key]` interval overlaps the query interval.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Encode, Decode)]
+pub struct BlockIndexEntry {
+    /// The block this entry points at.
+    pub block_id: BlockId,
+    /// The Hilbert key of the block's last (highest) record.
+    pub max_key: u128,
+}
+
 /// A consistent, point-in-time view of a space.
 /// The snapshot does not copy record data — it references block IDs that
 /// were live at `revision`. The storage layer resolves block IDs to data.
@@ -19,9 +32,10 @@ pub struct Snapshot {
     pub revision: RevisionId,
     /// The parent snapshot this was derived from (None for the root).
     pub parent: Option<SnapshotId>,
-    /// Ordered map of block IDs visible at this revision.
-    /// Key is the block's minimum Hilbert address for range routing.
-    pub blocks: BTreeMap<u128, BlockId>,
+    /// Ordered map of blocks visible at this revision.
+    /// Key is the block's minimum Hilbert address for range routing; the value
+    /// carries the block ID and its maximum Hilbert address.
+    pub blocks: BTreeMap<u128, BlockIndexEntry>,
 }
 
 impl Snapshot {
@@ -41,8 +55,8 @@ impl Snapshot {
     pub fn diff_blocks(&self, other: &Snapshot) -> Vec<BlockId> {
         self.blocks
             .values()
-            .filter(|id| !other.blocks.values().any(|o| o == *id))
-            .copied()
+            .filter(|e| !other.blocks.values().any(|o| o.block_id == e.block_id))
+            .map(|e| e.block_id)
             .collect()
     }
 

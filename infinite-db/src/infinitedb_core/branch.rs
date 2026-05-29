@@ -11,7 +11,7 @@ pub struct BranchId(pub u64);
 /// A named, mutable pointer to a snapshot.
 /// The `main` branch is the canonical truth. Other branches represent
 /// offline or experimental divergences that can be merged back.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode)]
 pub struct Branch {
     pub id: BranchId,
     pub name: String,
@@ -24,7 +24,7 @@ pub struct Branch {
 }
 
 /// Registry of all branches in the database.
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Debug, Default, Serialize, Deserialize, Encode, Decode)]
 pub struct BranchRegistry {
     branches: HashMap<BranchId, Branch>,
     names: HashMap<String, BranchId>,

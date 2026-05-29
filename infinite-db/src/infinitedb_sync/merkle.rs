@@ -124,7 +124,7 @@ mod tests {
     #[test]
     fn different_leaf_detected() {
         let a = MerkleTree::build(&[leaf(1), leaf(2), leaf(3)]);
-        let mut changed = vec![leaf(1), leaf(9), leaf(3)];
+        let changed = vec![leaf(1), leaf(9), leaf(3)];
         let b = MerkleTree::build(&changed);
         assert_ne!(a.root(), b.root());
         let diffs = a.diff_leaves(&b);

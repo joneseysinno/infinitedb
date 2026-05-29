@@ -88,6 +88,32 @@ impl WalWriter {
         self.writer.get_ref().sync_all()
     }
 
+    /// Replace the entire log with `entries`, then continue in append mode.
+    ///
+    /// Called after a flush: records sealed into a durable block no longer need
+    /// to be replayed, so the WAL is rewritten to retain only the still-buffered
+    /// entries (plus a checkpoint marker). This bounds WAL growth and prevents
+    /// replay from double-counting records that already live in a sealed block.
+    pub fn rewrite(&mut self, entries: &[WalEntry]) -> io::Result<()> {
+        // Truncate the existing file to zero length and sync the truncation.
+        let truncated = OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .create(true)
+            .open(&self.path)?;
+        truncated.sync_all()?;
+        drop(truncated);
+
+        // Reopen in append mode for subsequent writes.
+        let file = OpenOptions::new().create(true).append(true).open(&self.path)?;
+        self.writer = BufWriter::new(file);
+
+        for entry in entries {
+            self.append(entry)?;
+        }
+        Ok(())
+    }
+
     /// Return the WAL file path currently used by this writer.
     pub fn path(&self) -> &PathBuf {
         &self.path

@@ -12,3 +12,5 @@ pub mod outbox;
 pub mod transport;
 /// Background replication worker loop.
 pub mod worker;
+/// Block-level sync session driver.
+pub mod session;

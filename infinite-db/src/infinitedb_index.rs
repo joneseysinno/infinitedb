@@ -8,3 +8,7 @@ pub mod ordinal;
 pub mod temporal;
 /// Composite key builder for heterogeneous dimensions.
 pub mod composite;
+/// Hilbert key derivation for spatial points (single source of truth).
+pub mod key;
+
+pub use key::{hilbert_key_for, hilbert_key_standard};

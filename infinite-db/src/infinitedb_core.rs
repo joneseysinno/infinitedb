@@ -22,6 +22,10 @@ pub mod schema;
 pub mod adapter;
 /// Hyperedge relationship primitives.
 pub mod hyperedge;
+/// Reverse endpoint index for hyperedge lookups.
+pub mod endpoint_index;
+/// Cross-space hypergraph traversal.
+pub mod traversal;
 /// Signal field primitives and scoped samples.
 pub mod signal;
 /// Runtime kind/role catalog for adapter validation.

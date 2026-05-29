@@ -40,15 +40,15 @@ impl Delta {
         // Blocks in source but not in target → need to be added.
         let added_blocks: Vec<Block> = source_blocks
             .into_iter()
-            .filter(|b| !target.blocks.values().any(|id| *id == b.id))
+            .filter(|b| !target.blocks.values().any(|e| e.block_id == b.id))
             .collect();
 
         // Block IDs in target but not in source → need to be removed.
         let removed_block_ids: Vec<BlockId> = target
             .blocks
             .values()
-            .filter(|id| !source.blocks.values().any(|s_id| s_id == *id))
-            .copied()
+            .filter(|e| !source.blocks.values().any(|s| s.block_id == e.block_id))
+            .map(|e| e.block_id)
             .collect();
 
         Delta {
@@ -66,18 +66,32 @@ impl Delta {
     /// and deleting `removed_block_ids` via GC after the new snapshot is durable.
     pub fn apply(&self, snapshot: &Snapshot) -> Snapshot {
         use std::collections::BTreeMap;
+        use crate::infinitedb_core::snapshot::BlockIndexEntry;
+        use crate::infinitedb_index::hilbert_key_standard;
 
         // Start from a clone of the current snapshot.
-        let mut blocks: BTreeMap<u128, BlockId> = snapshot.blocks.clone();
+        let mut blocks: BTreeMap<u128, BlockIndexEntry> = snapshot.blocks.clone();
 
         // Remove blocks that the remote no longer has.
-        blocks.retain(|_, id| !self.removed_block_ids.contains(id));
+        blocks.retain(|_, e| !self.removed_block_ids.contains(&e.block_id));
 
-        // Add blocks from the remote (keyed by their minimum Hilbert address).
-        // We use the block's ID as a stand-in key here; the index layer would
-        // derive the real Hilbert key from the block's first record.
+        // Add blocks from the remote, keyed by their minimum Hilbert address.
+        // Records are sorted by Hilbert key at seal time, so the first record's
+        // key is the block minimum and the last record's key is the maximum.
+        // This must match the keying used by `flush` (see `db.rs`) or range
+        // pruning over synced blocks would be incorrect.
         for block in &self.added_blocks {
-            blocks.insert(block.id.0 as u128, block.id);
+            let min_key = block
+                .records
+                .first()
+                .map(|r| hilbert_key_standard(&r.address.point))
+                .unwrap_or(0);
+            let max_key = block
+                .records
+                .last()
+                .map(|r| hilbert_key_standard(&r.address.point))
+                .unwrap_or(min_key);
+            blocks.insert(min_key, BlockIndexEntry { block_id: block.id, max_key });
         }
 
         Snapshot {
@@ -102,8 +116,12 @@ mod tests {
     use crate::infinitedb_core::{
         address::{RevisionId, SpaceId},
         block::{Block, BlockId},
-        snapshot::{Snapshot, SnapshotId},
+        snapshot::{BlockIndexEntry, Snapshot, SnapshotId},
     };
+
+    fn entry(id: u64, max_key: u128) -> BlockIndexEntry {
+        BlockIndexEntry { block_id: BlockId(id), max_key }
+    }
 
     fn empty_snapshot(id: u64) -> Snapshot {
         Snapshot {
@@ -129,7 +147,7 @@ mod tests {
     #[test]
     fn delta_adds_new_blocks() {
         let mut source = empty_snapshot(2);
-        source.blocks.insert(10, BlockId(10));
+        source.blocks.insert(10, entry(10, 10));
         let target = empty_snapshot(1);
 
         let delta = Delta::compute(&source, &target, vec![make_block(10)]);
@@ -137,17 +155,62 @@ mod tests {
         assert!(delta.removed_block_ids.is_empty());
 
         let updated = delta.apply(&target);
-        assert!(updated.blocks.values().any(|id| *id == BlockId(10)));
+        assert!(updated.blocks.values().any(|e| e.block_id == BlockId(10)));
     }
 
     #[test]
     fn empty_delta_when_in_sync() {
         let mut source = empty_snapshot(1);
-        source.blocks.insert(5, BlockId(5));
+        source.blocks.insert(5, entry(5, 5));
         let mut target = empty_snapshot(1);
-        target.blocks.insert(5, BlockId(5));
+        target.blocks.insert(5, entry(5, 5));
 
         let delta = Delta::compute(&source, &target, vec![]);
         assert!(delta.is_empty());
+    }
+
+    #[test]
+    fn apply_keys_blocks_by_hilbert_min_not_block_id() {
+        use crate::infinitedb_core::{
+            address::{Address, DimensionVector},
+            block::Record,
+        };
+        use crate::infinitedb_index::hilbert_key_standard;
+
+        // Build a block whose first (sorted) record sits at a known coordinate.
+        let first_point = DimensionVector::new(vec![10, 20]);
+        let record = Record {
+            address: Address::new(SpaceId(1), first_point.clone()),
+            revision: RevisionId(1),
+            data: vec![1, 2, 3],
+            tombstone: false,
+        };
+        let block = Block {
+            id: BlockId(999),
+            space: SpaceId(1),
+            records: vec![record],
+            min_revision: RevisionId(1),
+            max_revision: RevisionId(1),
+            checksum: [0u8; 32],
+        };
+
+        let delta = Delta {
+            source_snapshot: SnapshotId(2),
+            target_snapshot: SnapshotId(2),
+            added_blocks: vec![block],
+            removed_block_ids: vec![],
+            at_revision: RevisionId(1),
+        };
+
+        let updated = delta.apply(&empty_snapshot(1));
+        let expected_key = hilbert_key_standard(&first_point);
+
+        // The map key must be the Hilbert minimum, not the raw block ID.
+        assert!(updated.blocks.contains_key(&expected_key));
+        assert!(!updated.blocks.contains_key(&(BlockId(999).0 as u128)));
+        assert_eq!(
+            updated.blocks.get(&expected_key).map(|e| e.block_id),
+            Some(BlockId(999))
+        );
     }
 }
