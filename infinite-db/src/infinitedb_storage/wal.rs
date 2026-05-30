@@ -52,6 +52,29 @@ pub enum WalEntry {
 }
 
 // ---------------------------------------------------------------------------
+// Durability policy
+// ---------------------------------------------------------------------------
+
+/// Controls how often the WAL is flushed and fsynced to disk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WalDurability {
+    /// Every appended frame is synced immediately (default for normal writes).
+    Strict,
+    /// Sync after every `sync_every` appended frames (bulk import).
+    Buffered { sync_every: usize },
+}
+
+impl WalDurability {
+    /// Minimum appended frames before an automatic [`WalWriter::sync`].
+    pub fn sync_every(self) -> usize {
+        match self {
+            WalDurability::Strict => 1,
+            WalDurability::Buffered { sync_every } => sync_every.max(1),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Writer
 // ---------------------------------------------------------------------------
 
@@ -59,11 +82,18 @@ pub enum WalEntry {
 pub struct WalWriter {
     writer: BufWriter<File>,
     path: PathBuf,
+    durability: WalDurability,
+    pending_since_sync: usize,
 }
 
 impl WalWriter {
-    /// Open or create a WAL file at `path`. Always appends.
+    /// Open or create a WAL file at `path` with strict durability.
     pub fn open(path: PathBuf) -> io::Result<Self> {
+        Self::open_with_durability(path, WalDurability::Strict)
+    }
+
+    /// Open or create a WAL file with the given durability policy.
+    pub fn open_with_durability(path: PathBuf, durability: WalDurability) -> io::Result<Self> {
         let file = OpenOptions::new()
             .create(true)
             .append(true)
@@ -71,11 +101,28 @@ impl WalWriter {
         Ok(Self {
             writer: BufWriter::new(file),
             path,
+            durability,
+            pending_since_sync: 0,
         })
     }
 
-    /// Append one entry, flush, and fsync.
-    pub fn append(&mut self, entry: &WalEntry) -> io::Result<()> {
+    /// Replace the active durability policy (e.g. bulk import guard).
+    pub fn set_durability(&mut self, durability: WalDurability) {
+        self.durability = durability;
+    }
+
+    /// Current durability policy.
+    pub fn durability(&self) -> WalDurability {
+        self.durability
+    }
+
+    /// Frames written since the last successful [`Self::sync`].
+    pub fn pending_frames(&self) -> usize {
+        self.pending_since_sync
+    }
+
+    /// Append one frame to the log without syncing.
+    pub fn append_frame(&mut self, entry: &WalEntry) -> io::Result<()> {
         let payload = encode_to_vec(entry, standard())
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
         let len = payload.len() as u64;
@@ -84,8 +131,26 @@ impl WalWriter {
         self.writer.write_all(&len.to_le_bytes())?;
         self.writer.write_all(&payload)?;
         self.writer.write_all(&checksum)?;
+        self.pending_since_sync += 1;
+        Ok(())
+    }
+
+    /// Flush the writer buffer and fsync the log file.
+    pub fn sync(&mut self) -> io::Result<()> {
         self.writer.flush()?;
-        self.writer.get_ref().sync_all()
+        self.writer.get_ref().sync_all()?;
+        self.pending_since_sync = 0;
+        Ok(())
+    }
+
+    /// Append one entry and sync according to the active durability policy.
+    pub fn append(&mut self, entry: &WalEntry) -> io::Result<()> {
+        self.append_frame(entry)?;
+        let every = self.durability.sync_every();
+        if self.pending_since_sync >= every {
+            self.sync()?;
+        }
+        Ok(())
     }
 
     /// Replace the entire log with `entries`, then continue in append mode.
@@ -95,7 +160,6 @@ impl WalWriter {
     /// entries (plus a checkpoint marker). This bounds WAL growth and prevents
     /// replay from double-counting records that already live in a sealed block.
     pub fn rewrite(&mut self, entries: &[WalEntry]) -> io::Result<()> {
-        // Truncate the existing file to zero length and sync the truncation.
         let truncated = OpenOptions::new()
             .write(true)
             .truncate(true)
@@ -104,14 +168,14 @@ impl WalWriter {
         truncated.sync_all()?;
         drop(truncated);
 
-        // Reopen in append mode for subsequent writes.
         let file = OpenOptions::new().create(true).append(true).open(&self.path)?;
         self.writer = BufWriter::new(file);
+        self.pending_since_sync = 0;
 
         for entry in entries {
-            self.append(entry)?;
+            self.append_frame(entry)?;
         }
-        Ok(())
+        self.sync()
     }
 
     /// Return the WAL file path currently used by this writer.
@@ -153,7 +217,6 @@ impl WalReader {
             self.file.read_exact(&mut payload)?;
             self.file.read_exact(&mut checksum_buf)?;
 
-            // Discard entries whose checksum does not match (truncated write).
             if blake3_hash(&payload) != checksum_buf {
                 break;
             }
@@ -221,5 +284,45 @@ mod tests {
         let mut reader = WalReader::open(path).unwrap();
         let entries = reader.entries().unwrap();
         assert_eq!(entries.len(), 2);
+    }
+
+    #[test]
+    fn buffered_syncs_periodically() {
+        let tmp = NamedTempFile::new().unwrap();
+        let path = tmp.path().to_path_buf();
+
+        let mut writer = WalWriter::open_with_durability(
+            path.clone(),
+            WalDurability::Buffered { sync_every: 4 },
+        )
+        .unwrap();
+        for _ in 0..3 {
+            writer.append_frame(&sample_entry()).unwrap();
+        }
+        writer.sync().unwrap();
+        writer.append_frame(&sample_entry()).unwrap();
+        writer.sync().unwrap();
+        drop(writer);
+
+        let mut reader = WalReader::open(path).unwrap();
+        assert_eq!(reader.entries().unwrap().len(), 4);
+    }
+
+    #[test]
+    fn rewrite_uses_single_sync() {
+        let tmp = NamedTempFile::new().unwrap();
+        let path = tmp.path().to_path_buf();
+
+        let mut writer = WalWriter::open(path.clone()).unwrap();
+        writer.append(&sample_entry()).unwrap();
+        let entries = vec![
+            sample_entry(),
+            WalEntry::Checkpoint { revision: RevisionId(2) },
+        ];
+        writer.rewrite(&entries).unwrap();
+        drop(writer);
+
+        let mut reader = WalReader::open(path).unwrap();
+        assert_eq!(reader.entries().unwrap().len(), 2);
     }
 }

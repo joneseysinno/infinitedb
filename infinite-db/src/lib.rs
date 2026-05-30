@@ -39,7 +39,11 @@ pub mod infinitedb_sync;
 
 #[cfg(feature = "embedded")]
 /// Top-level embedded database handle and diagnostics.
-pub use db::{InfiniteDb, MemoryStats};
+pub use db::{
+    BulkHyperedgeImport, BulkHyperedgeImportOptions, BulkImportResult, InfiniteDb, MemoryStats,
+    OpenOptions,
+};
+pub use infinitedb_storage::wal::WalDurability;
 
 #[cfg(feature = "embedded")]
 mod db;

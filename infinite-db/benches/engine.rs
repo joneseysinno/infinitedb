@@ -123,6 +123,81 @@ fn build_chain(depth: u32) -> (InfiniteDb, TempDir, SpaceId, EndpointRef) {
     (db, dir, edge_space, node(0))
 }
 
+fn bench_hyperedge_bulk(c: &mut Criterion) {
+    let mut group = c.benchmark_group("hyperedge_bulk");
+    for &n in &[500u32, 2_000] {
+        group.throughput(Throughput::Elements(n as u64));
+        group.bench_with_input(BenchmarkId::new("insert_hyperedge", n), &n, |b, &n| {
+            b.iter_batched(
+                fresh_db,
+                |(mut db, _dir)| {
+                    let edge_space = SpaceId(50);
+                    db.register_space(SpaceConfig::new(edge_space, "edges", 2)).unwrap();
+                    for i in 0..n {
+                        let edge = Hyperedge {
+                            id: HyperedgeId(i as u64 + 1),
+                            kind: HyperedgeKind::new("chain"),
+                            endpoints: vec![
+                                EndpointRef {
+                                    role: EndpointRole::new("n"),
+                                    space: SpaceId(1000 + i as u64),
+                                    node: DimensionVector::new(vec![i, 0]),
+                                },
+                                EndpointRef {
+                                    role: EndpointRole::new("n"),
+                                    space: SpaceId(1001 + i as u64),
+                                    node: DimensionVector::new(vec![i, 1]),
+                                },
+                            ],
+                            weight_milli: None,
+                            metadata: BTreeMap::new(),
+                            valid_from: infinite_db::infinitedb_core::address::RevisionId::ZERO,
+                            valid_to: None,
+                        };
+                        db.insert_hyperedge(edge_space, edge).unwrap();
+                    }
+                    db.flush(edge_space).unwrap();
+                },
+                BatchSize::SmallInput,
+            );
+        });
+        group.bench_with_input(BenchmarkId::new("insert_hyperedges_bulk", n), &n, |b, &n| {
+            b.iter_batched(
+                fresh_db,
+                |(mut db, _dir)| {
+                    let edge_space = SpaceId(50);
+                    db.register_space(SpaceConfig::new(edge_space, "edges", 2)).unwrap();
+                    let edges: Vec<Hyperedge> = (0..n)
+                        .map(|i| Hyperedge {
+                            id: HyperedgeId(i as u64 + 1),
+                            kind: HyperedgeKind::new("chain"),
+                            endpoints: vec![
+                                EndpointRef {
+                                    role: EndpointRole::new("n"),
+                                    space: SpaceId(1000 + i as u64),
+                                    node: DimensionVector::new(vec![i, 0]),
+                                },
+                                EndpointRef {
+                                    role: EndpointRole::new("n"),
+                                    space: SpaceId(1001 + i as u64),
+                                    node: DimensionVector::new(vec![i, 1]),
+                                },
+                            ],
+                            weight_milli: None,
+                            metadata: BTreeMap::new(),
+                            valid_from: infinite_db::infinitedb_core::address::RevisionId::ZERO,
+                            valid_to: None,
+                        })
+                        .collect();
+                    db.insert_hyperedges_bulk(edge_space, edges).unwrap();
+                },
+                BatchSize::SmallInput,
+            );
+        });
+    }
+    group.finish();
+}
+
 fn bench_traversal(c: &mut Criterion) {
     let mut group = c.benchmark_group("traversal");
     for &depth in &[2u32, 4, 8] {
@@ -147,5 +222,5 @@ fn bench_traversal(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_insert, bench_query, bench_traversal);
+criterion_group!(benches, bench_insert, bench_query, bench_hyperedge_bulk, bench_traversal);
 criterion_main!(benches);

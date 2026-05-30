@@ -43,7 +43,7 @@ use crate::infinitedb_core::{
     block::{Block, BlockId, Record},
     branch::{Branch, BranchId, BranchRegistry},
     endpoint_index::{
-        decode_hyperedge_id, encode_hyperedge_id, endpoint_index_point, endpoint_lookup_prefix,
+        decode_hyperedge_id, endpoint_index_point, endpoint_lookup_prefix,
         edge_endpoints, ENDPOINT_INDEX_BITS_PER_DIM, ENDPOINT_INDEX_DIMS, ENDPOINT_INDEX_SPACE,
     },
     hyperedge::{EndpointRef, Hyperedge, HyperedgeId},
@@ -60,7 +60,13 @@ use crate::infinitedb_storage::{
     compaction::{compact, CompactionConfig, CompactionResult},
     gc::safe_to_delete,
     nvme::{compute_checksum, BlockStore},
-    wal::{WalEntry, WalWriter},
+    wal::{WalDurability, WalEntry, WalWriter},
+};
+
+#[path = "bulk_import.rs"]
+mod bulk_import;
+pub use bulk_import::{
+    BulkHyperedgeImport, BulkHyperedgeImportOptions, BulkImportResult,
 };
 #[cfg(feature = "sync")]
 use crate::infinitedb_sync::{delta::Delta, merkle};
@@ -70,6 +76,38 @@ use crate::infinitedb_sync::{
     transport::{SyncOperation, SyncTransport},
     worker::BackgroundSyncWorker,
 };
+
+// ---------------------------------------------------------------------------
+// Open options
+// ---------------------------------------------------------------------------
+
+/// Options for opening an embedded database.
+#[derive(Debug, Clone)]
+pub struct OpenOptions {
+    /// WAL fsync policy. Default: [`WalDurability::Strict`].
+    pub wal_durability: WalDurability,
+    /// In-memory records before auto-sealing a block. Default: 256.
+    pub flush_threshold: usize,
+    /// LRU cache size for decoded blocks. Default: 10 MiB.
+    pub block_cache_bytes: usize,
+}
+
+impl Default for OpenOptions {
+    fn default() -> Self {
+        Self {
+            wal_durability: WalDurability::Strict,
+            flush_threshold: 256,
+            block_cache_bytes: 10 * 1024 * 1024,
+        }
+    }
+}
+
+impl OpenOptions {
+    /// Open (or create) a database directory with these options.
+    pub fn open<P: AsRef<Path>>(&self, dir: P) -> io::Result<InfiniteDb> {
+        InfiniteDb::open_with_options(dir, self)
+    }
+}
 
 // ---------------------------------------------------------------------------
 // InfiniteDb
@@ -96,6 +134,8 @@ pub struct InfiniteDb {
     snapshots: BTreeMap<u64, Snapshot>,
     /// Flush threshold: seal a block after this many buffered records.
     flush_threshold: usize,
+    /// When true, auto-flush on buffer size is suppressed (bulk import).
+    defer_auto_flush: bool,
     #[cfg(feature = "sync")]
     outbox_path: PathBuf,
     #[cfg(feature = "sync")]
@@ -107,8 +147,13 @@ pub struct InfiniteDb {
 impl InfiniteDb {
     /// Open (or create) a database in `dir`. Replays the WAL on first open.
     pub fn open<P: AsRef<Path>>(dir: P) -> io::Result<Self> {
+        OpenOptions::default().open(dir)
+    }
+
+    /// Open with explicit tuning (cache size, flush threshold, WAL policy).
+    pub fn open_with_options<P: AsRef<Path>>(dir: P, options: &OpenOptions) -> io::Result<Self> {
         let root = dir.as_ref().to_path_buf();
-        let store = BlockStore::open(root.clone())?;
+        let store = BlockStore::open_with_cache(root.clone(), options.block_cache_bytes)?;
         let wal_path = store.wal_path();
         #[cfg(feature = "sync")]
         let outbox_path = root.join("meta").join("sync_outbox.bin");
@@ -116,7 +161,7 @@ impl InfiniteDb {
         // Replay WAL to recover in-flight writes.
         let recovered = recover_wal(&wal_path)?;
 
-        let wal = WalWriter::open(wal_path)?;
+        let wal = WalWriter::open_with_durability(wal_path, options.wal_durability)?;
 
         // Load persisted metadata (spaces, branches, snapshots) if present.
         let (spaces, branches, snapshots, next_rev, next_block, next_snap, next_branch) =
@@ -133,7 +178,8 @@ impl InfiniteDb {
             next_snapshot_id: AtomicU64::new(next_snap),
             next_branch_id: AtomicU64::new(next_branch), // 1 is reserved for main
             snapshots,
-            flush_threshold: 256,
+            flush_threshold: options.flush_threshold,
+            defer_auto_flush: false,
             #[cfg(feature = "sync")]
             outbox_state: Arc::new(Mutex::new(load_outbox(&outbox_path)?)),
             #[cfg(feature = "sync")]
@@ -214,40 +260,6 @@ impl InfiniteDb {
         Ok(())
     }
 
-    /// Append a record to a reserved meta/index space (buffer + WAL only).
-    fn write_meta_record(
-        &mut self,
-        space: SpaceId,
-        point: DimensionVector,
-        data: Vec<u8>,
-    ) -> io::Result<()> {
-        let rev = self.next_revision();
-        let address = Address::new(space, point);
-        self.wal.append(&WalEntry::Write {
-            address: address.clone(),
-            revision: rev,
-            data: data.clone(),
-        })?;
-        self.buffer.push(Record {
-            address,
-            revision: rev,
-            data,
-            tombstone: false,
-        });
-        Ok(())
-    }
-
-    /// Write reverse-index records for every endpoint on a hyperedge.
-    fn index_hyperedge_endpoints(&mut self, edge: &Hyperedge) -> io::Result<()> {
-        self.ensure_endpoint_index_space()?;
-        for ep in edge_endpoints(edge) {
-            let point = endpoint_index_point(ep, edge.id);
-            let data = encode_hyperedge_id(edge.id);
-            self.write_meta_record(ENDPOINT_INDEX_SPACE, point, data)?;
-        }
-        Ok(())
-    }
-
     /// True when `space` is configured to key hyperedges by endpoint centroid.
     fn uses_centroid_keying(&self, space: SpaceId) -> bool {
         self.spaces.get(space).map(|c| c.centroid_keying).unwrap_or(false)
@@ -278,20 +290,6 @@ impl InfiniteDb {
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
         }
         Ok(())
-    }
-
-    /// Record the id→point mapping for a centroid-keyed edge so it stays
-    /// addressable by id (the centroid point cannot be recomputed from the id).
-    fn write_edge_locator(
-        &mut self,
-        space: SpaceId,
-        id: HyperedgeId,
-        point: &DimensionVector,
-    ) -> io::Result<()> {
-        self.ensure_locator_space()?;
-        let data = encode_to_vec(point, standard())
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-        self.write_meta_record(HYPEREDGE_LOCATOR_SPACE, locator_point(space, id), data)
     }
 
     /// Resolve the stored point for a centroid-keyed edge via its locator.
@@ -335,8 +333,8 @@ impl InfiniteDb {
         prefix: &[u32],
         as_of: Option<RevisionId>,
     ) -> io::Result<Vec<HyperedgeId>> {
-        // Prefix-match on the leading coordinates (space + node). A Hilbert
-        // subscope over-approximates this prefix in 16-D and can drop entries.
+        // Full-space scan: Hilbert subscope can drop index entries in 16-D layout
+        // (see endpoint_index_point). Prefix filter is cheap vs per-edge hyperedge scan.
         let records = self.query(ENDPOINT_INDEX_SPACE, as_of)?;
         Ok(records
             .iter()
@@ -408,7 +406,7 @@ impl InfiniteDb {
             data,
             tombstone: false,
         });
-        if self.buffer.len() >= self.flush_threshold {
+        if !self.defer_auto_flush && self.buffer.len() >= self.flush_threshold {
             self.flush(space)?;
         }
         Ok(rev)
@@ -445,30 +443,17 @@ impl InfiniteDb {
     ) -> io::Result<RevisionId> {
         edge.validate()
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("{:?}", e)))?;
-        let (point, is_centroid) = self.edge_storage_point(space, &edge);
-        let data = encode_to_vec(&edge, standard())
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        let rev = self.next_revision();
-        let address = Address::new(space, point.clone());
-        self.wal.append(&WalEntry::Write {
-            address: address.clone(),
-            revision: rev,
-            data: data.clone(),
-        })?;
-        self.buffer.push(Record {
-            address,
-            revision: rev,
-            data,
-            tombstone: false,
-        });
-        if is_centroid {
-            self.write_edge_locator(space, edge.id, &point)?;
+        if self.edge_storage_point(space, &edge).1 {
+            self.ensure_locator_space()?;
         }
-        if self.buffer.len() >= self.flush_threshold {
+        let build_index = true;
+        self.ensure_endpoint_index_space()?;
+        let prepared = self.prepare_hyperedge_writes(space, &edge, build_index)?;
+        let rev = self.apply_prepared_writes_strict(prepared)?;
+        edge.valid_from = rev;
+        if !self.defer_auto_flush && self.buffer.len() >= self.flush_threshold {
             self.flush(space)?;
         }
-        edge.valid_from = rev;
-        self.index_hyperedge_endpoints(&edge)?;
         #[cfg(feature = "sync")]
         self.enqueue_sync(SyncOperation::WriteHyperedge {
             space,
@@ -699,7 +684,7 @@ impl InfiniteDb {
             data,
             tombstone: false,
         });
-        if self.buffer.len() >= self.flush_threshold {
+        if !self.defer_auto_flush && self.buffer.len() >= self.flush_threshold {
             self.flush(space)?;
         }
         #[cfg(feature = "sync")]
@@ -891,6 +876,7 @@ impl InfiniteDb {
         snapshot.revision = max_rev;
 
         self.persist_meta()?;
+        self.wal.sync()?;
 
         // The sealed records are now durable in `snapshots.bin`. Rewrite the WAL
         // so it retains only the records still buffered (other spaces, not yet
@@ -1079,9 +1065,22 @@ impl InfiniteDb {
             for block_id in block_ids {
                 let block = self.store.read_block(block_id)?;
                 for record in block.records {
-                    if record.revision <= rev_ceiling && (include_tombstones || !record.tombstone) {
-                        results.push(record);
+                    if record.revision > rev_ceiling {
+                        continue;
                     }
+                    if !include_tombstones && record.tombstone {
+                        continue;
+                    }
+                    // Point lookups (lo == hi): records are sorted by Hilbert key at seal.
+                    if let Some((lo, hi)) = key_range {
+                        if lo == hi {
+                            let k = self.space_key(space, &record.address.point);
+                            if k != lo {
+                                continue;
+                            }
+                        }
+                    }
+                    results.push(record);
                 }
             }
         }
@@ -1676,12 +1675,12 @@ fn hyperedge_point(id: HyperedgeId) -> DimensionVector {
 }
 
 /// Reserved space mapping `(edge space, HyperedgeId)` → stored centroid point.
-const HYPEREDGE_LOCATOR_SPACE: SpaceId = SpaceId(u64::MAX - 2);
+pub(super) const HYPEREDGE_LOCATOR_SPACE: SpaceId = SpaceId(u64::MAX - 2);
 /// Locator key dims: `[space_hi, space_lo, id_hi, id_lo]`.
 const HYPEREDGE_LOCATOR_DIMS: usize = 4;
 
 /// Deterministic locator key for an `(edge space, edge id)` pair.
-fn locator_point(space: SpaceId, id: HyperedgeId) -> DimensionVector {
+pub(super) fn locator_point(space: SpaceId, id: HyperedgeId) -> DimensionVector {
     DimensionVector::new(vec![
         (space.0 >> 32) as u32,
         (space.0 & 0xFFFF_FFFF) as u32,
