@@ -63,10 +63,11 @@ use crate::infinitedb_storage::{
     wal::{WalDurability, WalEntry, WalWriter},
 };
 
-#[path = "bulk_import.rs"]
-mod bulk_import;
-pub use bulk_import::{
-    BulkHyperedgeImport, BulkHyperedgeImportOptions, BulkImportResult,
+#[path = "bulk/mod.rs"]
+mod bulk;
+pub use bulk::{
+    BulkHyperedgeImport, BulkHyperedgeImportOptions, BulkImportResult, BulkRecordImport,
+    BulkSignalImport, BulkWriteOptions, BulkWriteResult,
 };
 #[cfg(feature = "sync")]
 use crate::infinitedb_sync::{delta::Delta, merkle};
@@ -136,6 +137,8 @@ pub struct InfiniteDb {
     flush_threshold: usize,
     /// When true, auto-flush on buffer size is suppressed (bulk import).
     defer_auto_flush: bool,
+    /// True while a bulk write guard holds an active session.
+    bulk_session_active: bool,
     #[cfg(feature = "sync")]
     outbox_path: PathBuf,
     #[cfg(feature = "sync")]
@@ -180,6 +183,7 @@ impl InfiniteDb {
             snapshots,
             flush_threshold: options.flush_threshold,
             defer_auto_flush: false,
+            bulk_session_active: false,
             #[cfg(feature = "sync")]
             outbox_state: Arc::new(Mutex::new(load_outbox(&outbox_path)?)),
             #[cfg(feature = "sync")]
@@ -448,8 +452,8 @@ impl InfiniteDb {
         }
         let build_index = true;
         self.ensure_endpoint_index_space()?;
-        let prepared = self.prepare_hyperedge_writes(space, &edge, build_index)?;
-        let rev = self.apply_prepared_writes_strict(prepared)?;
+        let rows = self.prepare_hyperedge_writes(space, &edge, build_index)?;
+        let rev = self.apply_prepared_writes_strict(rows)?;
         edge.valid_from = rev;
         if !self.defer_auto_flush && self.buffer.len() >= self.flush_threshold {
             self.flush(space)?;
@@ -1045,6 +1049,13 @@ impl InfiniteDb {
 
         let mut results: Vec<Record> = Vec::new();
 
+        let mut tombstoned: std::collections::HashSet<_> = self
+            .buffer
+            .iter()
+            .filter(|r| r.address.space == space && r.tombstone && r.revision <= rev_ceiling)
+            .map(|r| r.address.point.coords.clone())
+            .collect();
+
         // Query sealed blocks if a snapshot exists.
         if let Some(snapshot) = self.snapshots.get(&space.0) {
             let block_ids: Vec<BlockId> = match key_range {
@@ -1062,6 +1073,17 @@ impl InfiniteDb {
                         .collect()
                 }
             };
+            for block_id in &block_ids {
+                let block = self.store.read_block(*block_id)?;
+                for record in &block.records {
+                    if record.address.space == space
+                        && record.tombstone
+                        && record.revision <= rev_ceiling
+                    {
+                        tombstoned.insert(record.address.point.coords.clone());
+                    }
+                }
+            }
             for block_id in block_ids {
                 let block = self.store.read_block(block_id)?;
                 for record in block.records {
@@ -1083,22 +1105,12 @@ impl InfiniteDb {
                     results.push(record);
                 }
             }
+            if !include_tombstones {
+                results.retain(|r| !tombstoned.contains(&r.address.point.coords));
+            }
         }
 
-        // Always check the in-memory buffer (records not yet flushed to disk).
-        // Collect tombstoned coordinates so we can suppress stale sealed records,
-        // unless the caller explicitly asked to see tombstones.
-        let tombstoned: std::collections::HashSet<_> = self
-            .buffer
-            .iter()
-            .filter(|r| r.address.space == space && r.tombstone && r.revision <= rev_ceiling)
-            .map(|r| r.address.point.coords.clone())
-            .collect();
-
-        if !include_tombstones {
-            results.retain(|r| !tombstoned.contains(&r.address.point.coords));
-        }
-
+        // In-memory buffer (records not yet flushed).
         for record in &self.buffer {
             let visible = record.address.space == space
                 && record.revision <= rev_ceiling
@@ -1518,7 +1530,7 @@ impl InfiniteDb {
     }
 
     #[cfg(feature = "sync")]
-    fn enqueue_sync(&mut self, op: SyncOperation) -> io::Result<()> {
+    pub(super) fn enqueue_sync(&mut self, op: SyncOperation) -> io::Result<()> {
         let mut state = self
             .outbox_state
             .lock()

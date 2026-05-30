@@ -222,5 +222,42 @@ fn bench_traversal(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_insert, bench_query, bench_hyperedge_bulk, bench_traversal);
+fn bench_record_bulk(c: &mut Criterion) {
+    let mut group = c.benchmark_group("record_bulk");
+    for &n in &[1_000u32, 5_000] {
+        group.throughput(Throughput::Elements(n as u64));
+        group.bench_with_input(BenchmarkId::new("insert", n), &n, |b, &n| {
+            b.iter_batched(
+                fresh_db,
+                |(mut db, _dir)| {
+                    let space = SpaceId(60);
+                    db.register_space(SpaceConfig::new(space, "bench", 2)).unwrap();
+                    for i in 0..n {
+                        db.insert(space, grid_point(i, 256), vec![(i & 0xFF) as u8])
+                            .unwrap();
+                    }
+                    db.flush(space).unwrap();
+                },
+                BatchSize::SmallInput,
+            );
+        });
+        group.bench_with_input(BenchmarkId::new("insert_records_bulk", n), &n, |b, &n| {
+            b.iter_batched(
+                fresh_db,
+                |(mut db, _dir)| {
+                    let space = SpaceId(60);
+                    db.register_space(SpaceConfig::new(space, "bench", 2)).unwrap();
+                    let rows: Vec<_> = (0..n)
+                        .map(|i| (grid_point(i, 256), vec![(i & 0xFF) as u8]))
+                        .collect();
+                    db.insert_records_bulk(space, rows).unwrap();
+                },
+                BatchSize::SmallInput,
+            );
+        });
+    }
+    group.finish();
+}
+
+criterion_group!(benches, bench_insert, bench_query, bench_hyperedge_bulk, bench_record_bulk, bench_traversal);
 criterion_main!(benches);
