@@ -1,51 +1,78 @@
 //! In-memory live tail published by the I/O thread after fsync.
 
-use std::sync::atomic::{AtomicU64, Ordering};
-
-use arc_swap::ArcSwap;
+use std::collections::{BTreeMap, HashSet};
+use std::sync::Arc;
 
 use crate::infinitedb_core::{
     address::RevisionId,
     block::Record,
+    snapshot::BlockIndexEntry,
 };
 
+use super::shard_view::{ShardView, ShardViewHandle, TailChunk};
+
 /// Records visible to readers before hot segment seal.
+///
+/// Internally pairs sealed block index entries with the live tail in a single
+/// [`ShardViewHandle`] so readers observe a consistent view.
 pub struct LiveTailView {
-    records: ArcSwap<Vec<Record>>,
-    captured_at: AtomicU64,
+    view: ShardViewHandle,
 }
 
 impl LiveTailView {
     pub fn new() -> Self {
         Self {
-            records: ArcSwap::from_pointee(Vec::new()),
-            captured_at: AtomicU64::new(0),
+            view: ShardViewHandle::new(),
         }
     }
 
-    /// Replace the visible tail (called from the I/O thread).
+    /// Load the atomic shard view for consistent reads.
+    pub fn load_view(&self) -> arc_swap::Guard<Arc<ShardView>> {
+        self.view.load()
+    }
+
+    /// Load shared tail chunks (zero-copy read path).
+    pub fn load(&self) -> Arc<Vec<TailChunk>> {
+        self.view.load_tail_chunks()
+    }
+
+    /// Replace the visible tail (called from the I/O thread on recovery).
     pub fn publish(&self, records: Vec<Record>) {
-        let max_rev = records.iter().map(|r| r.revision.0).max().unwrap_or(0);
-        self.records.store(std::sync::Arc::new(records));
-        self.captured_at.store(max_rev, Ordering::Release);
+        self.view.publish_tail(records);
     }
 
     /// Append one durable record to the published tail.
     pub fn append(&self, record: Record) {
-        let mut next = self.snapshot();
-        next.push(record);
-        let max_rev = next.iter().map(|r| r.revision.0).max().unwrap_or(0);
-        self.records.store(std::sync::Arc::new(next));
-        self.captured_at.store(max_rev, Ordering::Release);
+        self.view.append(record);
     }
 
-    /// Current snapshot of the live tail.
+    /// Publish a group of durable records in one chunk.
+    pub fn extend_chunk(&self, records: Vec<Record>) {
+        self.view.extend_chunk(records);
+    }
+
+    /// Publish a new sealed block and truncated tail atomically.
+    pub fn seal(
+        &self,
+        block_min_key: u128,
+        entry: BlockIndexEntry,
+        sealed: &HashSet<(Vec<u32>, u64)>,
+    ) {
+        self.view.seal(block_min_key, entry, sealed);
+    }
+
+    /// Initialize sealed blocks from recovery.
+    pub fn init_blocks(&self, blocks: BTreeMap<u128, BlockIndexEntry>) {
+        self.view.init_blocks(blocks);
+    }
+
+    /// Explicit clone of all tail records (prefer [`load`] for zero-copy read paths).
     pub fn snapshot(&self) -> Vec<Record> {
-        self.records.load_full().as_ref().clone()
+        self.load_view().tail_vec()
     }
 
     pub fn captured_at(&self) -> RevisionId {
-        RevisionId(self.captured_at.load(Ordering::Acquire))
+        self.view.captured_at()
     }
 }
 

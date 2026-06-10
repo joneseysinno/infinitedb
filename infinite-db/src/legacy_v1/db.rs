@@ -409,6 +409,7 @@ impl LegacyDb {
             revision: rev,
             data,
             tombstone: false,
+            hilbert_key: 0,
         });
         if !self.defer_auto_flush && self.buffer.len() >= self.flush_threshold {
             self.flush(space)?;
@@ -435,6 +436,7 @@ impl LegacyDb {
             revision: rev,
             data: vec![],
             tombstone: true,
+            hilbert_key: 0,
         });
         Ok(rev)
     }
@@ -490,6 +492,7 @@ impl LegacyDb {
             revision: rev,
             data: vec![],
             tombstone: true,
+            hilbert_key: 0,
         });
         if edge.is_some() && self.uses_centroid_keying(space) {
             self.tombstone_edge_locator(space, id)?;
@@ -687,6 +690,7 @@ impl LegacyDb {
             revision: rev,
             data,
             tombstone: false,
+            hilbert_key: 0,
         });
         if !self.defer_auto_flush && self.buffer.len() >= self.flush_threshold {
             self.flush(space)?;
@@ -1429,10 +1433,10 @@ impl LegacyDb {
     fn apply_wal_entry(&mut self, entry: WalEntry) -> io::Result<()> {
         match entry {
             WalEntry::Write { address, revision, data } => {
-                self.buffer.push(Record { address, revision, data, tombstone: false });
+                self.buffer.push(Record { address, revision, data, tombstone: false, hilbert_key: 0 });
             }
             WalEntry::Tombstone { address, revision } => {
-                self.buffer.push(Record { address, revision, data: vec![], tombstone: true });
+                self.buffer.push(Record { address, revision, data: vec![], tombstone: true, hilbert_key: 0 });
             }
             WalEntry::BlockSealed { block_id, space, snapshot } => {
                 self.reconcile_sealed_block(block_id, space, snapshot)?;
@@ -1899,6 +1903,7 @@ mod tests {
                 revision: rev,
                 data: vec![5],
                 tombstone: false,
+            hilbert_key: 0,
             };
             let mut block = Block {
                 id: block_id,
@@ -2562,3 +2567,4 @@ mod tests {
         assert_eq!(db.sync_pending_count(), 0);
     }
 }
+

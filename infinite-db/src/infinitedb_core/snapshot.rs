@@ -21,9 +21,13 @@ pub struct BlockIndexEntry {
     pub max_key: u128,
 }
 
-/// A consistent, point-in-time view of a space.
-/// The snapshot does not copy record data — it references block IDs that
-/// were live at `revision`. The storage layer resolves block IDs to data.
+/// Immutable snapshot value minted at meaningful boundaries (branch creation,
+/// merge completion, sync negotiation).
+///
+/// The per-space entry in [`SnapshotStore`] is a *mutable head index* updated
+/// in place as shards seal blocks; immutable [`Snapshot`] clones capture fixed
+/// state for branches and replication. The snapshot does not copy record data —
+/// it references block IDs that were live at `revision`.
 #[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode)]
 pub struct Snapshot {
     pub id: SnapshotId,

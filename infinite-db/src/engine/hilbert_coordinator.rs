@@ -14,23 +14,21 @@ use crate::infinitedb_core::{
     branch::BranchId,
     space::SpaceRegistry,
 };
+use crate::infinitedb_storage::wal::WalEntry;
 use crate::infinitedb_storage::nvme::BlockStore;
 
 use super::branch_overlay::BranchOverlayStore;
 use super::hilbert_live_tails::HilbertLiveTails;
-use super::hilbert_shard::{pack_shard_key, shard_for_point, shard_count};
+use super::hilbert_shard::{hilbert_shard_id, shard_for_point, shard_count, ShardKey, DEFAULT_SHARD_BITS};
 use super::io_thread::{IoStats, IoThreadConfig};
-use super::live_tail::LiveTailView;
 use super::snapshot_store::SnapshotStore;
-use super::space_io::{open_space_pipeline, SpaceIoHandle};
+use super::space_io::{bootstrap_live_tail_blocks, open_space_pipeline, SpaceIoHandle};
+use super::watermark::RevisionWatermark;
 use super::write_queue::{WriteJob, WriteQueueSender};
 
 struct HilbertShard {
     queue: WriteQueueSender,
     io_handle: Mutex<SpaceIoHandle>,
-    live_tail: Arc<LiveTailView>,
-    space_id: u64,
-    shard_id: u32,
 }
 
 /// Routes main-branch writes to per Hilbert-shard I/O threads; branch writes stay in overlays.
@@ -42,9 +40,9 @@ pub struct HilbertCoordinator {
     branch_overlays: Arc<BranchOverlayStore>,
     spaces: Arc<RwLock<SpaceRegistry>>,
     next_block_id: Arc<AtomicU64>,
-    next_snapshot_id: Arc<AtomicU64>,
     config: IoThreadConfig,
-    shards: DashMap<u64, Arc<HilbertShard>>,
+    watermark: Arc<RevisionWatermark>,
+    shards: DashMap<ShardKey, Arc<HilbertShard>>,
 }
 
 impl HilbertCoordinator {
@@ -55,8 +53,8 @@ impl HilbertCoordinator {
         branch_overlays: Arc<BranchOverlayStore>,
         spaces: Arc<RwLock<SpaceRegistry>>,
         next_block_id: Arc<AtomicU64>,
-        next_snapshot_id: Arc<AtomicU64>,
         config: IoThreadConfig,
+        watermark: Arc<RevisionWatermark>,
     ) -> Self {
         Self {
             root,
@@ -66,8 +64,8 @@ impl HilbertCoordinator {
             branch_overlays,
             spaces,
             next_block_id,
-            next_snapshot_id,
             config,
+            watermark,
             shards: DashMap::new(),
         }
     }
@@ -81,7 +79,7 @@ impl HilbertCoordinator {
     }
 
     pub fn ensure_shard(&self, space_id: u64, shard_id: u32) -> io::Result<()> {
-        let key = pack_shard_key(space_id, shard_id);
+        let key = ShardKey::new(space_id, shard_id);
         if self.shards.contains_key(&key) {
             return Ok(());
         }
@@ -91,6 +89,13 @@ impl HilbertCoordinator {
         std::fs::create_dir_all(shard_dir.join("wal"))?;
 
         let live_tail = self.live_tails.get_or_create(space_id, shard_id);
+        let shard_bits = self.shard_bits_for_space(space_id);
+        bootstrap_live_tail_blocks(
+            &live_tail,
+            &self.snapshots,
+            space_id,
+            Some((shard_id, shard_bits)),
+        );
         let (queue, io_handle) = open_space_pipeline(
             space_id,
             shard_dir,
@@ -99,19 +104,27 @@ impl HilbertCoordinator {
             Arc::clone(&live_tail),
             Arc::clone(&self.spaces),
             Arc::clone(&self.next_block_id),
-            Arc::clone(&self.next_snapshot_id),
             self.config.clone(),
+            Some((shard_id, shard_bits)),
+            Arc::clone(&self.watermark),
         );
 
         let shard = Arc::new(HilbertShard {
             queue,
             io_handle: Mutex::new(io_handle),
-            live_tail,
-            space_id,
-            shard_id,
         });
-        self.shards.insert(key, Arc::clone(&shard));
-        Ok(())
+
+        match self.shards.entry(key) {
+            dashmap::mapref::entry::Entry::Occupied(_) => {
+                let _ = shard.queue.shutdown();
+                let _ = shard.io_handle.lock().join();
+                Ok(())
+            }
+            dashmap::mapref::entry::Entry::Vacant(v) => {
+                v.insert(shard);
+                Ok(())
+            }
+        }
     }
 
     fn shard_bits_for_space(&self, space_id: u64) -> u32 {
@@ -119,21 +132,20 @@ impl HilbertCoordinator {
             .read()
             .get(SpaceId(space_id))
             .map(|c| c.shard_bits)
-            .unwrap_or(4)
+            .unwrap_or(DEFAULT_SHARD_BITS)
     }
 
     pub fn enqueue_write(&self, job: WriteJob) -> io::Result<()> {
         debug_assert_eq!(job.branch_id, BranchId::MAIN);
-        let space_id = job.record.address.space.0;
+        let space_id = job.space_id();
         let shard_bits = self.shard_bits_for_space(space_id);
-        let shard_id = shard_for_point(
-            &self.spaces.read(),
-            SpaceId(space_id),
-            &job.record.address.point,
-            shard_bits,
-        );
+        let shard_id = if job.hilbert_key != 0 {
+            hilbert_shard_id(job.hilbert_key, shard_bits)
+        } else {
+            shard_for_point_from_job(&self.spaces.read(), &job, shard_bits)
+        };
         self.ensure_shard(space_id, shard_id)?;
-        let key = pack_shard_key(space_id, shard_id);
+        let key = ShardKey::new(space_id, shard_id);
         let shard = self.shards.get(&key).expect("shard just ensured");
         shard.queue.enqueue_write(job)
     }
@@ -142,25 +154,31 @@ impl HilbertCoordinator {
         let mut by_route: BTreeMap<(u64, u32), Vec<WriteJob>> = BTreeMap::new();
         for job in jobs {
             debug_assert_eq!(job.branch_id, BranchId::MAIN);
-            let space_id = job.record.address.space.0;
+            let space_id = job.space_id();
             let shard_bits = self.shard_bits_for_space(space_id);
-            let shard_id = shard_for_point(
-                &self.spaces.read(),
-                SpaceId(space_id),
-                &job.record.address.point,
-                shard_bits,
-            );
-            by_route
-                .entry((space_id, shard_id))
-                .or_default()
-                .push(job);
+            let shard_id = if job.hilbert_key != 0 {
+                hilbert_shard_id(job.hilbert_key, shard_bits)
+            } else {
+                shard_for_point_from_job(&self.spaces.read(), &job, shard_bits)
+            };
+            by_route.entry((space_id, shard_id)).or_default().push(job);
         }
         for ((space_id, shard_id), jobs) in by_route {
             self.ensure_shard(space_id, shard_id)?;
-            let key = pack_shard_key(space_id, shard_id);
+            let key = ShardKey::new(space_id, shard_id);
             let shard = self.shards.get(&key).expect("shard just ensured");
-            for job in jobs {
-                shard.queue.enqueue_write(job)?;
+            shard.queue.enqueue_write_batch(jobs)?;
+        }
+        Ok(())
+    }
+
+    pub fn compact_space(&self, space_id: u64) -> io::Result<()> {
+        let shard_bits = self.shard_bits_for_space(space_id);
+        let count = shard_count(shard_bits);
+        for shard_id in 0..count {
+            let key = ShardKey::new(space_id, shard_id);
+            if let Some(shard) = self.shards.get(&key) {
+                shard.queue.request_flush(space_id)?;
             }
         }
         Ok(())
@@ -170,7 +188,7 @@ impl HilbertCoordinator {
         let shard_bits = self.shard_bits_for_space(space_id);
         let count = shard_count(shard_bits);
         for shard_id in 0..count {
-            let key = pack_shard_key(space_id, shard_id);
+            let key = ShardKey::new(space_id, shard_id);
             if let Some(shard) = self.shards.get(&key) {
                 shard.queue.request_flush(space_id)?;
             }
@@ -179,10 +197,26 @@ impl HilbertCoordinator {
     }
 
     pub fn sync_all(&self) -> io::Result<()> {
+        let mut receivers = Vec::new();
         for entry in self.shards.iter() {
-            entry.value().queue.request_sync()?;
+            let (done_tx, done_rx) = crossbeam_channel::bounded(1);
+            entry.value().queue.post_sync(done_tx)?;
+            receivers.push(done_rx);
         }
-        Ok(())
+        let mut first_err = None;
+        for rx in receivers {
+            match rx.recv() {
+                Ok(Err(e)) if first_err.is_none() => first_err = Some(e),
+                Err(_) if first_err.is_none() => {
+                    first_err = Some(io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "I/O thread stopped",
+                    ));
+                }
+                _ => {}
+            }
+        }
+        first_err.map_or(Ok(()), Err)
     }
 
     pub fn shutdown_all(&self) -> io::Result<()> {
@@ -211,28 +245,38 @@ impl HilbertCoordinator {
     }
 
     pub fn bootstrap_registered_spaces(&self) -> io::Result<()> {
-        let mut ids: std::collections::BTreeSet<u64> = self
-            .spaces
-            .read()
-            .space_ids()
-            .into_iter()
-            .map(|s| s.0)
-            .collect();
-        for key in self.snapshots.all().keys() {
-            ids.insert(*key);
-        }
+        let mut bootstrapped = std::collections::BTreeSet::new();
         if let Ok(entries) = std::fs::read_dir(self.spaces_root()) {
             for entry in entries.flatten() {
-                if let Ok(n) = entry.file_name().to_string_lossy().parse::<u64>() {
-                    ids.insert(n);
+                let space_id: u64 = match entry.file_name().to_string_lossy().parse() {
+                    Ok(id) => id,
+                    Err(_) => continue,
+                };
+                let shard_bits = self.shard_bits_for_space(space_id);
+                if let Some(snap) = self.snapshots.get(SpaceId(space_id)) {
+                    for min_key in snap.blocks.keys() {
+                        let shard_id = hilbert_shard_id(*min_key, shard_bits);
+                        bootstrapped.insert((space_id, shard_id));
+                        let _ = self.ensure_shard(space_id, shard_id)?;
+                    }
                 }
-            }
-        }
-        for space_id in ids {
-            let shard_bits = self.shard_bits_for_space(space_id);
-            let count = shard_count(shard_bits);
-            for shard_id in 0..count {
-                let _ = self.ensure_shard(space_id, shard_id)?;
+                let shards_dir = entry.path().join("shards");
+                if !shards_dir.exists() {
+                    continue;
+                }
+                for shard_entry in std::fs::read_dir(shards_dir)?.flatten() {
+                    let shard_id: u32 = match shard_entry.file_name().to_string_lossy().parse() {
+                        Ok(id) => id,
+                        Err(_) => continue,
+                    };
+                    if bootstrapped.contains(&(space_id, shard_id)) {
+                        continue;
+                    }
+                    let hot = shard_entry.path().join("hot.seg");
+                    if hot.exists() && hot.metadata()?.len() > 16 {
+                        let _ = self.ensure_shard(space_id, shard_id)?;
+                    }
+                }
             }
         }
         Ok(())
@@ -245,4 +289,14 @@ impl HilbertCoordinator {
     pub fn spaces_root(&self) -> PathBuf {
         self.root.join("spaces")
     }
+}
+
+fn shard_for_point_from_job(spaces: &SpaceRegistry, job: &WriteJob, shard_bits: u32) -> u32 {
+    let point = match &job.entry {
+        WalEntry::Write { address, .. } | WalEntry::Tombstone { address, .. } => {
+            &address.point
+        }
+        _ => return 0,
+    };
+    shard_for_point(spaces, SpaceId(job.space_id()), point, shard_bits)
 }

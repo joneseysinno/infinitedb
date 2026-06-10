@@ -133,6 +133,7 @@ pub fn resolution_record(conflict: &MergeConflict, data: Vec<u8>, revision: Revi
         revision,
         data,
         tombstone: false,
+        hilbert_key: 0,
     }
 }
 
@@ -143,5 +144,6 @@ pub fn resolution_tombstone(conflict: &MergeConflict, revision: RevisionId) -> R
         revision,
         data: vec![],
         tombstone: true,
+        hilbert_key: 0,
     }
 }

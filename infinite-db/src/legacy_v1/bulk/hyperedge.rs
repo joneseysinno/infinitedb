@@ -161,6 +161,7 @@ fn delete_hyperedge_bulk_session(
                         revision: rev,
                         data: vec![],
                         tombstone: true,
+                        hilbert_key: 0,
                     },
                 ));
             }
@@ -178,6 +179,7 @@ fn delete_hyperedge_bulk_session(
                 revision: main_rev,
                 data: vec![],
                 tombstone: true,
+                hilbert_key: 0,
             },
         ));
         if edge.is_some() && db.uses_centroid_keying(space) {
@@ -195,6 +197,7 @@ fn delete_hyperedge_bulk_session(
                     revision: loc_rev,
                     data: vec![],
                     tombstone: true,
+                    hilbert_key: 0,
                 },
             ));
             touch.push(HYPEREDGE_LOCATOR_SPACE);
@@ -239,6 +242,7 @@ fn index_hyperedge_endpoints_session(
                 revision: idx_rev,
                 data: idx_data,
                 tombstone: false,
+                hilbert_key: 0,
             },
         ));
     }
@@ -341,6 +345,7 @@ impl LegacyDb {
                 revision: rev,
                 data,
                 tombstone: false,
+                hilbert_key: 0,
             },
         )];
 
@@ -361,6 +366,7 @@ impl LegacyDb {
                     revision: loc_rev,
                     data: locator_data,
                     tombstone: false,
+                    hilbert_key: 0,
                 },
             ));
         }
@@ -382,6 +388,7 @@ impl LegacyDb {
                         revision: idx_rev,
                         data: idx_data,
                         tombstone: false,
+                        hilbert_key: 0,
                     },
                 ));
             }

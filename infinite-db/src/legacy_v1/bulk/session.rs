@@ -123,6 +123,7 @@ impl<'a> BulkSessionCore<'a> {
                 revision: rev,
                 data,
                 tombstone: false,
+                hilbert_key: 0,
             },
         )?;
         self.touch_space(space);
@@ -148,6 +149,7 @@ impl<'a> BulkSessionCore<'a> {
                 revision: rev,
                 data: vec![],
                 tombstone: true,
+                hilbert_key: 0,
             },
         )?;
         self.touch_space(space);

@@ -6,7 +6,6 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
 
 use crossbeam_channel::Receiver;
 use parking_lot::RwLock;
@@ -14,36 +13,43 @@ use parking_lot::RwLock;
 use crate::infinitedb_core::{
     address::{RevisionId, SpaceId},
     block::{Block, BlockId},
-    snapshot::{BlockIndexEntry, SnapshotId},
+    snapshot::BlockIndexEntry,
     space::SpaceRegistry,
 };
 use crate::infinitedb_storage::{
     hot_segment::{wal_entry_to_record, HotSegment},
     nvme::{compute_checksum, BlockStore},
-    wal::{WalDurability, WalEntry, WalWriter},
+    wal::WalReader,
 };
 
+use super::compactor::maybe_compact_after_seal;
+use super::group_commit::{commit_group_to_hot_segment, drain_write_group, migrate_staging_to_hot, WriteGroup};
 use super::live_tail::LiveTailView;
-use super::query::space_key;
 use super::snapshot_store::SnapshotStore;
-use super::write_queue::{IoCommand, WriteJob, WriteQueueSender};
+use super::watermark::RevisionWatermark;
+use super::write_queue::{IoCommand, WriteQueueSender};
 
 /// Tuning for the dedicated I/O thread.
 #[derive(Debug, Clone)]
 pub struct IoThreadConfig {
-    pub direct_write_timeout: Duration,
+    /// Deprecated: ignored; all writes use group-committed hot segments.
+    pub direct_write_timeout: std::time::Duration,
+    /// Secondary seal trigger by record count (pathological tiny records).
     pub hot_segment_seal_threshold: usize,
+    /// Primary seal trigger by committed hot-segment bytes.
+    pub hot_segment_seal_bytes: usize,
     pub write_queue_capacity: usize,
-    pub wal_group_commit_interval: Duration,
+    pub wal_group_commit_interval: std::time::Duration,
 }
 
 impl Default for IoThreadConfig {
     fn default() -> Self {
         Self {
-            direct_write_timeout: Duration::from_millis(2),
-            hot_segment_seal_threshold: 256,
+            direct_write_timeout: std::time::Duration::from_millis(2),
+            hot_segment_seal_threshold: 65_536,
+            hot_segment_seal_bytes: 8 * 1024 * 1024,
             write_queue_capacity: 4096,
-            wal_group_commit_interval: Duration::from_millis(1),
+            wal_group_commit_interval: std::time::Duration::from_millis(1),
         }
     }
 }
@@ -52,7 +58,9 @@ impl Default for IoThreadConfig {
 #[derive(Debug, Clone, Default)]
 pub struct IoStats {
     pub queue_depth: usize,
+    /// Number of group commits to the hot segment.
     pub direct_writes: u64,
+    /// Deprecated: always zero (staging WAL removed).
     pub staged_writes: u64,
     pub staging_wal_frames: usize,
 }
@@ -76,16 +84,16 @@ impl IoThreadHandle {
         snapshots: Arc<SnapshotStore>,
         live_tail: Arc<LiveTailView>,
         spaces: Arc<RwLock<SpaceRegistry>>,
-        revision: Arc<AtomicU64>,
         next_block_id: Arc<AtomicU64>,
-        next_snapshot_id: Arc<AtomicU64>,
         rx: Receiver<IoCommand>,
         config: IoThreadConfig,
+        watermark: Arc<RevisionWatermark>,
     ) -> Self {
         let direct_writes = Arc::new(AtomicU64::new(0));
         let staged_writes = Arc::new(AtomicU64::new(0));
         let direct_clone = Arc::clone(&direct_writes);
         let staged_clone = Arc::clone(&staged_writes);
+        let watermark_clone = Arc::clone(&watermark);
 
         let join = thread::Builder::new()
             .name("infinitedb-io".into())
@@ -96,11 +104,10 @@ impl IoThreadHandle {
                     snapshots,
                     live_tail,
                     spaces,
-                    revision,
                     next_block_id,
-                    next_snapshot_id,
                     rx,
                     config,
+                    watermark_clone,
                     direct_clone,
                     staged_clone,
                 )
@@ -138,10 +145,9 @@ pub fn open_io_pipeline(
     snapshots: Arc<SnapshotStore>,
     live_tail: Arc<LiveTailView>,
     spaces: Arc<RwLock<SpaceRegistry>>,
-    revision: Arc<AtomicU64>,
     next_block_id: Arc<AtomicU64>,
-    next_snapshot_id: Arc<AtomicU64>,
     config: IoThreadConfig,
+    watermark: Arc<RevisionWatermark>,
 ) -> (WriteQueueSender, IoThreadHandle) {
     let (tx, rx) = WriteQueueSender::new(config.write_queue_capacity);
     let handle = IoThreadHandle::spawn(
@@ -150,11 +156,10 @@ pub fn open_io_pipeline(
         snapshots,
         live_tail,
         spaces,
-        revision,
         next_block_id,
-        next_snapshot_id,
         rx,
         config,
+        watermark,
     );
     (tx, handle)
 }
@@ -165,44 +170,13 @@ struct IoState {
     snapshots: Arc<SnapshotStore>,
     live_tail: Arc<LiveTailView>,
     spaces: Arc<RwLock<SpaceRegistry>>,
-    revision: Arc<AtomicU64>,
     next_block_id: Arc<AtomicU64>,
-    next_snapshot_id: Arc<AtomicU64>,
     config: IoThreadConfig,
     hot: HashMap<u64, HotSegment>,
-    staging: StagingWal,
     hot_record_counts: HashMap<u64, usize>,
-}
-
-struct StagingWal {
-    writer: WalWriter,
-    entries: Vec<WalEntry>,
-}
-
-impl StagingWal {
-    fn open(path: PathBuf) -> io::Result<Self> {
-        std::fs::create_dir_all(path.parent().unwrap())?;
-        let writer =
-            WalWriter::open_with_durability(path.clone(), WalDurability::Buffered { sync_every: usize::MAX })?;
-        let mut reader = crate::infinitedb_storage::wal::WalReader::open(path)?;
-        let entries = reader.entries()?;
-        Ok(Self { writer, entries })
-    }
-
-    fn append(&mut self, entry: &WalEntry) -> io::Result<()> {
-        self.writer.append_frame(entry)?;
-        self.entries.push(entry.clone());
-        Ok(())
-    }
-
-    fn sync(&mut self) -> io::Result<()> {
-        self.writer.sync()
-    }
-
-    fn rewrite_remaining(&mut self, entries: Vec<WalEntry>) -> io::Result<()> {
-        self.entries = entries;
-        self.writer.rewrite(&self.entries)
-    }
+    hot_committed_bytes: HashMap<u64, u64>,
+    watermark: Arc<RevisionWatermark>,
+    pending_error: Option<io::Error>,
 }
 
 fn run_io_loop(
@@ -211,38 +185,48 @@ fn run_io_loop(
     snapshots: Arc<SnapshotStore>,
     live_tail: Arc<LiveTailView>,
     spaces: Arc<RwLock<SpaceRegistry>>,
-    revision: Arc<AtomicU64>,
     next_block_id: Arc<AtomicU64>,
-    next_snapshot_id: Arc<AtomicU64>,
     rx: Receiver<IoCommand>,
     config: IoThreadConfig,
-    direct_writes: Arc<AtomicU64>,
-    staged_writes: Arc<AtomicU64>,
+    watermark: Arc<RevisionWatermark>,
+    group_commits: Arc<AtomicU64>,
+    _staged_writes: Arc<AtomicU64>,
 ) -> io::Result<()> {
     let staging_path = store.staging_wal_path();
     let mut state = IoState {
-        root,
+        root: root.clone(),
         store,
         snapshots,
         live_tail,
         spaces,
-        revision,
         next_block_id,
-        next_snapshot_id,
         config: config.clone(),
         hot: HashMap::new(),
-        staging: StagingWal::open(staging_path)?,
         hot_record_counts: HashMap::new(),
+        hot_committed_bytes: HashMap::new(),
+        watermark: Arc::clone(&watermark),
+        pending_error: None,
     };
 
-    // Recover staging WAL into live tail.
-    for entry in state.staging.entries.clone() {
-        if let Some(record) = wal_entry_to_record(entry) {
-            state.live_tail.append(record);
+    if staging_path.exists() {
+        let mut reader = WalReader::open(staging_path.clone())?;
+        let entries = reader.entries()?;
+        for entry in entries {
+            if let Some(record) = wal_entry_to_record(entry.clone()) {
+                let space_id = record.address.space.0;
+                let hot = state
+                    .hot
+                    .entry(space_id)
+                    .or_insert_with(|| HotSegment::open(root.clone(), space_id).expect("open hot"));
+                let rev = record.revision.0;
+                migrate_staging_to_hot(hot, std::slice::from_ref(&entry))?;
+                state.live_tail.append(record);
+                watermark.retire(rev);
+            }
         }
+        let _ = std::fs::remove_file(staging_path);
     }
 
-    // Recover hot segments into live tail (idempotent merge handled by revision uniqueness in tests).
     let hot_dir = state.root.join("hot");
     if hot_dir.exists() {
         for entry in std::fs::read_dir(hot_dir)? {
@@ -253,8 +237,13 @@ fn run_io_loop(
                     let mut seg = HotSegment::open(state.root.clone(), space_id)?;
                     let records = seg.read_all_records()?;
                     state.hot_record_counts.insert(space_id, records.len());
+                    state
+                        .hot_committed_bytes
+                        .insert(space_id, seg.committed_bytes());
                     for record in records {
+                        let rev = record.revision.0;
                         state.live_tail.append(record);
+                        watermark.retire(rev);
                     }
                     state.hot.insert(space_id, seg);
                 }
@@ -262,158 +251,153 @@ fn run_io_loop(
         }
     }
 
-    let mut shutting_down = false;
-    while !shutting_down {
-        match rx.recv_timeout(config.wal_group_commit_interval) {
-            Ok(cmd) => {
-                if matches!(cmd, IoCommand::Shutdown) {
-                    handle_command(&mut state, cmd, &direct_writes, &staged_writes)?;
-                    shutting_down = true;
-                } else {
-                    handle_command(&mut state, cmd, &direct_writes, &staged_writes)?;
-                }
-            }
-            Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
-                promote_staging(&mut state)?;
-            }
-            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => shutting_down = true,
+    while let Ok(cmd) = rx.recv() {
+        if matches!(cmd, IoCommand::Shutdown) {
+            let _ = handle_barrier(&mut state, cmd, &group_commits);
+            break;
+        }
+        if let Err(e) = dispatch_command(&mut state, &rx, cmd, &group_commits) {
+            state.pending_error = Some(e);
         }
     }
 
     Ok(())
 }
 
-fn handle_command(
+fn dispatch_command(
     state: &mut IoState,
+    rx: &Receiver<IoCommand>,
     cmd: IoCommand,
-    direct_writes: &AtomicU64,
-    staged_writes: &AtomicU64,
+    group_commits: &AtomicU64,
 ) -> io::Result<()> {
     match cmd {
-        IoCommand::Write(job) => {
-            let space_id = job_space(&job);
-            process_write(state, job, direct_writes, staged_writes)?;
-            maybe_auto_seal(state, space_id)?;
+        IoCommand::Write(_) | IoCommand::WriteBatch(_) => {
+            let (group, barrier) =
+                drain_write_group(rx, cmd, state.config.wal_group_commit_interval);
+            let affected = commit_write_group(state, group, group_commits)?;
+            for space_id in affected {
+                maybe_auto_seal(state, space_id)?;
+            }
+            if let Some(barrier) = barrier {
+                handle_barrier(state, barrier, group_commits)?;
+            }
         }
-        IoCommand::Sync { done } => {
-            promote_staging(state)?;
-            state.staging.sync()?;
-            let _ = done.send(Ok(()));
-        }
-        IoCommand::Flush { space_id, done } => {
-            let result = seal_space(state, space_id);
-            let _ = done.send(result);
-        }
-        IoCommand::Shutdown => {
-            promote_staging(state)?;
-            state.staging.sync()?;
-            return Ok(());
-        }
+        barrier => handle_barrier(state, barrier, group_commits)?,
     }
     Ok(())
 }
 
-fn job_space(job: &WriteJob) -> u64 {
-    job.record.address.space.0
+fn commit_write_group(
+    state: &mut IoState,
+    group: WriteGroup,
+    group_commits: &AtomicU64,
+) -> io::Result<Vec<u64>> {
+    if group.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut by_space: HashMap<u64, WriteGroup> = HashMap::new();
+    for job in group.jobs {
+        by_space.entry(job.space_id()).or_default().jobs.push(job);
+    }
+
+    let affected: Vec<u64> = by_space.keys().copied().collect();
+    for (space_id, space_group) in by_space {
+        let hot = state
+            .hot
+            .entry(space_id)
+            .or_insert_with(|| HotSegment::open(state.root.clone(), space_id).expect("open hot"));
+        let frame_bytes = space_group.frame_bytes;
+        let record_count = space_group.jobs.len();
+        match commit_group_to_hot_segment(
+            hot,
+            space_group,
+            &state.live_tail,
+            &state.watermark,
+            group_commits,
+        ) {
+            Ok(()) => {
+                *state.hot_record_counts.entry(space_id).or_insert(0) += record_count;
+                *state.hot_committed_bytes.entry(space_id).or_insert(0) += frame_bytes as u64;
+            }
+            Err(e) => {
+                state.pending_error = Some(e);
+                return Ok(affected);
+            }
+        }
+    }
+    Ok(affected)
 }
 
-fn process_write(
+fn handle_barrier(
     state: &mut IoState,
-    job: WriteJob,
-    direct_writes: &AtomicU64,
-    staged_writes: &AtomicU64,
+    cmd: IoCommand,
+    group_commits: &AtomicU64,
 ) -> io::Result<()> {
-    let space_id = job_space(&job);
-    let hot = state
-        .hot
-        .entry(space_id)
-        .or_insert_with(|| {
-            HotSegment::open(state.root.clone(), space_id).expect("open hot segment")
-        });
-
-    let routed = if hot.try_append_with_deadline(&job.entry, state.config.direct_write_timeout)? {
-        direct_writes.fetch_add(1, Ordering::Relaxed);
-        WriteRoute::Direct
-    } else {
-        state.staging.append(&job.entry)?;
-        state.staging.sync()?;
-        staged_writes.fetch_add(1, Ordering::Relaxed);
-        WriteRoute::Staged
-    };
-
-    let _ = routed;
-    state.live_tail.append(job.record);
-    *state.hot_record_counts.entry(space_id).or_insert(0) += 1;
+    match cmd {
+        IoCommand::Sync { done } => {
+            let result = state
+                .pending_error
+                .take()
+                .map(Err)
+                .unwrap_or(Ok(()));
+            let _ = done.send(result);
+        }
+        IoCommand::Flush { space_id, done } => {
+            let result = match state.pending_error.take() {
+                Some(e) => Err(e),
+                None => seal_space(state, space_id),
+            };
+            let _ = done.send(result);
+        }
+        IoCommand::Shutdown => {}
+        IoCommand::Write(_) | IoCommand::WriteBatch(_) => unreachable!(),
+    }
+    let _ = group_commits;
     Ok(())
 }
 
 fn maybe_auto_seal(state: &mut IoState, space_id: u64) -> io::Result<()> {
     let count = state.hot_record_counts.get(&space_id).copied().unwrap_or(0);
-    if count >= state.config.hot_segment_seal_threshold {
+    let bytes = state.hot_committed_bytes.get(&space_id).copied().unwrap_or(0);
+    if count >= state.config.hot_segment_seal_threshold
+        || bytes >= state.config.hot_segment_seal_bytes as u64
+    {
         seal_space(state, space_id)?;
     }
     Ok(())
 }
 
-fn promote_staging(state: &mut IoState) -> io::Result<()> {
-    if state.staging.entries.is_empty() {
-        return Ok(());
-    }
-
-    let mut remaining = Vec::new();
-    for entry in state.staging.entries.drain(..) {
-        let space_id = match &entry {
-            WalEntry::Write { address, .. } | WalEntry::Tombstone { address, .. } => address.space.0,
-            _ => {
-                remaining.push(entry);
-                continue;
-            }
-        };
-
-        let hot = state
-            .hot
-            .entry(space_id)
-            .or_insert_with(|| HotSegment::open(state.root.clone(), space_id).expect("open hot segment"));
-
-        if hot.append_and_sync(&entry).is_ok() {
-            // promoted
-        } else {
-            remaining.push(entry);
-        }
-    }
-
-    state.staging.rewrite_remaining(remaining)?;
-    Ok(())
-}
-
 fn seal_space(state: &mut IoState, space_id: u64) -> io::Result<()> {
-    let mut hot = match state.hot.remove(&space_id) {
-        Some(seg) => seg,
-        None => HotSegment::open(state.root.clone(), space_id)?,
-    };
-
-    let mut records = hot.read_all_records()?;
+    let view = state.live_tail.load_view();
+    let mut records: Vec<_> = view
+        .tail_iter()
+        .filter(|r| r.address.space.0 == space_id)
+        .cloned()
+        .collect();
     if records.is_empty() {
-        state.hot.insert(space_id, hot);
         return Ok(());
     }
 
-    let space = SpaceId(space_id);
-    let spaces = state.spaces.read();
-    records.sort_by_key(|r| {
-        let key = space_key(&spaces, space, &r.address.point);
-        (key, r.revision.0)
-    });
-    drop(spaces);
+    records.sort_by_key(|r| (r.hilbert_key, r.revision.0));
 
     let min_rev = records.iter().map(|r| r.revision).min().unwrap_or(RevisionId::ZERO);
     let max_rev = records.iter().map(|r| r.revision).max().unwrap_or(RevisionId::ZERO);
     let block_id = BlockId(state.next_block_id.fetch_add(1, Ordering::Relaxed));
+    let space = SpaceId(space_id);
+
+    let hilbert_min = records.first().map(|r| r.hilbert_key).unwrap_or(0);
+    let hilbert_max = records.last().map(|r| r.hilbert_key).unwrap_or(hilbert_min);
+
+    let sealed: HashSet<(Vec<u32>, u64)> = records
+        .iter()
+        .map(|r| (r.address.point.coords.clone(), r.revision.0))
+        .collect();
 
     let mut block = Block {
         id: block_id,
         space,
-        records: records.clone(),
+        records,
         min_revision: min_rev,
         max_revision: max_rev,
         checksum: [0u8; 32],
@@ -421,51 +405,38 @@ fn seal_space(state: &mut IoState, space_id: u64) -> io::Result<()> {
     block.checksum = compute_checksum(&block)?;
     state.store.write_block(&block)?;
 
-    let hilbert_min = {
-        let spaces = state.spaces.read();
-        block
-            .records
-            .first()
-            .map(|r| space_key(&spaces, space, &r.address.point))
-            .unwrap_or(0)
+    let block_entry = BlockIndexEntry {
+        block_id,
+        max_key: hilbert_max,
     };
-    let hilbert_max = {
-        let spaces = state.spaces.read();
-        block
-            .records
-            .last()
-            .map(|r| space_key(&spaces, space, &r.address.point))
-            .unwrap_or(hilbert_min)
-    };
+    state.live_tail.seal(hilbert_min, block_entry, &sealed);
 
-    let snap_id = SnapshotId(state.next_snapshot_id.fetch_add(1, Ordering::Relaxed));
     state.snapshots.update(space, |snap| {
-        snap.blocks.insert(
-            hilbert_min,
-            BlockIndexEntry {
-                block_id,
-                max_key: hilbert_max,
-            },
-        );
+        snap.blocks.insert(hilbert_min, block_entry);
         if snap.revision < max_rev {
             snap.revision = max_rev;
         }
-        if snap.id.0 == 0 {
-            snap.id = snap_id;
-        }
     });
 
-    let sealed: HashSet<(Vec<u32>, u64)> = records
-        .iter()
-        .map(|r| (r.address.point.coords.clone(), r.revision.0))
-        .collect();
-
-    let mut tail = state.live_tail.snapshot();
-    tail.retain(|r| !sealed.contains(&(r.address.point.coords.clone(), r.revision.0)));
-    state.live_tail.publish(tail);
-
-    hot.reset()?;
-    state.hot.insert(space_id, hot);
+    if let Some(hot) = state.hot.get_mut(&space_id) {
+        hot.reset()?;
+    }
     state.hot_record_counts.insert(space_id, 0);
+    state.hot_committed_bytes.insert(space_id, hot_header_len());
+
+    maybe_compact_after_seal(
+        &state.store,
+        &state.snapshots,
+        &state.live_tail,
+        &state.spaces,
+        &state.next_block_id,
+        space,
+        None,
+    )?;
+
     Ok(())
+}
+
+fn hot_header_len() -> u64 {
+    16
 }

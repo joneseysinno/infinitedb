@@ -184,6 +184,7 @@ mod tests {
             revision: RevisionId(1),
             data: vec![1, 2, 3],
             tombstone: false,
+            hilbert_key: 0,
         };
         let block = Block {
             id: BlockId(999),

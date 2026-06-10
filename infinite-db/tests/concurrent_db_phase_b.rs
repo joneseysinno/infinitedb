@@ -23,14 +23,22 @@ fn space(id: u64, dims: usize) -> SpaceConfig {
 }
 
 #[test]
-fn per_space_io_threads_spawn_on_register() {
+fn lazy_space_io_threads_spawn_on_first_write() {
     let dir = TempDir::new().unwrap();
     let db = open_v3(&dir);
     db.register_space(space(1, 2)).unwrap();
     db.register_space(space(2, 2)).unwrap();
+    assert_eq!(db.space_shard_count(), 0);
+
+    db.insert(SpaceId(1), DimensionVector::new(vec![1, 1]), vec![1])
+        .unwrap();
+    db.sync().unwrap();
+    assert_eq!(db.space_shard_count(), 1);
+
+    db.insert(SpaceId(2), DimensionVector::new(vec![2, 2]), vec![2])
+        .unwrap();
+    db.sync().unwrap();
     assert_eq!(db.space_shard_count(), 2);
-    assert!(dir.path().join("spaces").join("1").join("hot.seg").exists()
-        || dir.path().join("spaces/1").exists());
 }
 
 #[test]
@@ -74,7 +82,6 @@ fn enqueue_batch_cross_space() {
     db.register_space(space(20, 2)).unwrap();
 
     use infinite_db::infinitedb_core::address::Address;
-    use infinite_db::infinitedb_core::block::Record;
     use infinite_db::WriteJob;
     use infinite_db::infinitedb_storage::wal::WalEntry;
 
@@ -90,12 +97,7 @@ fn enqueue_batch_cross_space() {
                 revision: rev1,
                 data: vec![1],
             },
-            record: Record {
-                address: Address::new(SpaceId(10), DimensionVector::new(vec![1, 1])),
-                revision: rev1,
-                data: vec![1],
-                tombstone: false,
-            },
+            hilbert_key: 0,
         },
         WriteJob {
             branch_id: BranchId::MAIN,
@@ -105,12 +107,7 @@ fn enqueue_batch_cross_space() {
                 revision: rev2,
                 data: vec![2],
             },
-            record: Record {
-                address: Address::new(SpaceId(20), DimensionVector::new(vec![2, 2])),
-                revision: rev2,
-                data: vec![2],
-                tombstone: false,
-            },
+            hilbert_key: 0,
         },
     ];
 

@@ -4,12 +4,12 @@ use std::sync::Arc;
 
 use dashmap::DashMap;
 
-use super::hilbert_shard::pack_shard_key;
+use super::hilbert_shard::ShardKey;
 use super::live_tail::LiveTailView;
 
 /// One [`LiveTailView`] per `(space_id, hilbert_shard_id)` pair.
 pub struct HilbertLiveTails {
-    tails: DashMap<u64, Arc<LiveTailView>>,
+    tails: DashMap<ShardKey, Arc<LiveTailView>>,
 }
 
 impl HilbertLiveTails {
@@ -20,7 +20,7 @@ impl HilbertLiveTails {
     }
 
     pub fn get_or_create(&self, space_id: u64, shard_id: u32) -> Arc<LiveTailView> {
-        let key = pack_shard_key(space_id, shard_id);
+        let key = ShardKey::new(space_id, shard_id);
         if let Some(t) = self.tails.get(&key) {
             return Arc::clone(t.value());
         }
@@ -31,7 +31,7 @@ impl HilbertLiveTails {
 
     pub fn get(&self, space_id: u64, shard_id: u32) -> Option<Arc<LiveTailView>> {
         self.tails
-            .get(&pack_shard_key(space_id, shard_id))
+            .get(&ShardKey::new(space_id, shard_id))
             .map(|e| Arc::clone(e.value()))
     }
 
@@ -39,8 +39,20 @@ impl HilbertLiveTails {
     pub fn tails_for_space(&self, space_id: u64) -> Vec<Arc<LiveTailView>> {
         self.tails
             .iter()
-            .filter(|e| e.key() >> 16 == space_id)
+            .filter(|e| e.key().space_id == space_id)
             .map(|e| Arc::clone(e.value()))
+            .collect()
+    }
+
+    /// Load each shard's consistent view for `space_id` (one load per shard).
+    pub fn views_for_space(
+        &self,
+        space_id: u64,
+    ) -> Vec<arc_swap::Guard<std::sync::Arc<super::shard_view::ShardView>>> {
+        self.tails
+            .iter()
+            .filter(|e| e.key().space_id == space_id)
+            .map(|e| e.value().load_view())
             .collect()
     }
 

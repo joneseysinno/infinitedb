@@ -213,8 +213,3 @@ pub fn merge_branches(
         applied_records: to_apply,
     })
 }
-
-/// Index of latest record per address from a slice.
-pub fn index_latest(records: &[Record]) -> HashMap<Address, Record> {
-    latest_per_address(records.to_vec())
-}

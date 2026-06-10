@@ -13,16 +13,15 @@ use crate::infinitedb_core::space::SpaceRegistry;
 use crate::infinitedb_storage::nvme::BlockStore;
 
 use super::io_thread::{IoStats, IoThreadConfig};
-use super::live_tail::LiveTailView;
 use super::snapshot_store::SnapshotStore;
-use super::space_io::{open_space_pipeline, SpaceIoHandle};
+use super::space_io::{bootstrap_live_tail_blocks, open_space_pipeline, SpaceIoHandle};
+use super::watermark::RevisionWatermark;
 use super::space_live_tails::SpaceLiveTails;
 use super::write_queue::{WriteJob, WriteQueueSender};
 
 struct SpaceShard {
     queue: WriteQueueSender,
     io_handle: Mutex<SpaceIoHandle>,
-    live_tail: Arc<LiveTailView>,
 }
 
 /// Routes fire-and-forget writes to per-space I/O threads.
@@ -33,8 +32,8 @@ pub struct SpaceCoordinator {
     live_tails: Arc<SpaceLiveTails>,
     spaces: Arc<RwLock<SpaceRegistry>>,
     next_block_id: Arc<AtomicU64>,
-    next_snapshot_id: Arc<AtomicU64>,
     config: IoThreadConfig,
+    watermark: Arc<RevisionWatermark>,
     shards: DashMap<u64, Arc<SpaceShard>>,
 }
 
@@ -45,8 +44,8 @@ impl SpaceCoordinator {
         snapshots: Arc<SnapshotStore>,
         spaces: Arc<RwLock<SpaceRegistry>>,
         next_block_id: Arc<AtomicU64>,
-        next_snapshot_id: Arc<AtomicU64>,
         config: IoThreadConfig,
+        watermark: Arc<RevisionWatermark>,
     ) -> Self {
         Self {
             root,
@@ -55,8 +54,8 @@ impl SpaceCoordinator {
             live_tails: Arc::new(SpaceLiveTails::new()),
             spaces,
             next_block_id,
-            next_snapshot_id,
             config,
+            watermark,
             shards: DashMap::new(),
         }
     }
@@ -74,6 +73,7 @@ impl SpaceCoordinator {
         std::fs::create_dir_all(space_dir.join("wal"))?;
 
         let live_tail = self.live_tails.get_or_create(space_id);
+        bootstrap_live_tail_blocks(&live_tail, &self.snapshots, space_id, None);
         let (queue, io_handle) = open_space_pipeline(
             space_id,
             space_dir,
@@ -82,21 +82,31 @@ impl SpaceCoordinator {
             Arc::clone(&live_tail),
             Arc::clone(&self.spaces),
             Arc::clone(&self.next_block_id),
-            Arc::clone(&self.next_snapshot_id),
             self.config.clone(),
+            None,
+            Arc::clone(&self.watermark),
         );
 
         let shard = Arc::new(SpaceShard {
             queue,
             io_handle: Mutex::new(io_handle),
-            live_tail,
         });
-        self.shards.insert(space_id, Arc::clone(&shard));
-        Ok(())
+
+        match self.shards.entry(space_id) {
+            dashmap::mapref::entry::Entry::Occupied(_) => {
+                let _ = shard.queue.shutdown();
+                let _ = shard.io_handle.lock().join();
+                Ok(())
+            }
+            dashmap::mapref::entry::Entry::Vacant(v) => {
+                v.insert(shard);
+                Ok(())
+            }
+        }
     }
 
     pub fn enqueue_write(&self, job: WriteJob) -> io::Result<()> {
-        let space_id = job.record.address.space.0;
+        let space_id = job.space_id();
         self.ensure_space(space_id)?;
         let shard = self.shards.get(&space_id).expect("shard just ensured");
         shard.queue.enqueue_write(job)
@@ -106,17 +116,19 @@ impl SpaceCoordinator {
     pub fn enqueue_batch(&self, jobs: Vec<WriteJob>) -> io::Result<()> {
         let mut by_space: BTreeMap<u64, Vec<WriteJob>> = BTreeMap::new();
         for job in jobs {
-            by_space
-                .entry(job.record.address.space.0)
-                .or_default()
-                .push(job);
+            by_space.entry(job.space_id()).or_default().push(job);
         }
         for (space_id, jobs) in by_space {
             self.ensure_space(space_id)?;
             let shard = self.shards.get(&space_id).expect("shard just ensured");
-            for job in jobs {
-                shard.queue.enqueue_write(job)?;
-            }
+            shard.queue.enqueue_write_batch(jobs)?;
+        }
+        Ok(())
+    }
+
+    pub fn compact_space(&self, space_id: u64) -> io::Result<()> {
+        if let Some(shard) = self.shards.get(&space_id) {
+            shard.queue.request_flush(space_id)?;
         }
         Ok(())
     }
@@ -129,10 +141,26 @@ impl SpaceCoordinator {
     }
 
     pub fn sync_all(&self) -> io::Result<()> {
+        let mut receivers = Vec::new();
         for entry in self.shards.iter() {
-            entry.value().queue.request_sync()?;
+            let (done_tx, done_rx) = crossbeam_channel::bounded(1);
+            entry.value().queue.post_sync(done_tx)?;
+            receivers.push(done_rx);
         }
-        Ok(())
+        let mut first_err = None;
+        for rx in receivers {
+            match rx.recv() {
+                Ok(Err(e)) if first_err.is_none() => first_err = Some(e),
+                Err(_) if first_err.is_none() => {
+                    first_err = Some(io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "I/O thread stopped",
+                    ));
+                }
+                _ => {}
+            }
+        }
+        first_err.map_or(Ok(()), Err)
     }
 
     pub fn shutdown_all(&self) -> io::Result<()> {
@@ -162,25 +190,17 @@ impl SpaceCoordinator {
 
     /// Bootstrap shards for spaces registered before open.
     pub fn bootstrap_registered_spaces(&self) -> io::Result<()> {
-        let mut ids: std::collections::BTreeSet<u64> = self
-            .spaces
-            .read()
-            .space_ids()
-            .into_iter()
-            .map(|s| s.0)
-            .collect();
-        for key in self.snapshots.all().keys() {
-            ids.insert(*key);
-        }
         if let Ok(entries) = std::fs::read_dir(self.spaces_root()) {
             for entry in entries.flatten() {
-                if let Ok(n) = entry.file_name().to_string_lossy().parse::<u64>() {
-                    ids.insert(n);
+                let space_id: u64 = match entry.file_name().to_string_lossy().parse() {
+                    Ok(id) => id,
+                    Err(_) => continue,
+                };
+                let hot = entry.path().join("hot.seg");
+                if hot.exists() && hot.metadata()?.len() > 16 {
+                    let _ = self.ensure_space(space_id)?;
                 }
             }
-        }
-        for id in ids {
-            let _ = self.ensure_space(id)?;
         }
         Ok(())
     }

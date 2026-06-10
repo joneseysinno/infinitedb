@@ -88,6 +88,7 @@ mod tests {
             revision: RevisionId(rev),
             data: vec![],
             tombstone,
+            hilbert_key: 0,
         }
     }
 

@@ -7,7 +7,7 @@ use crate::infinitedb_core::{
 
 use super::query::space_key;
 
-/// Default `SpaceConfig::shard_bits` (16 intra-space I/O shards).
+/// Default Hilbert shard bits when a space config omits an explicit value.
 pub const DEFAULT_SHARD_BITS: u32 = 4;
 
 /// Number of Hilbert shards for the given `shard_bits` (`2^shard_bits`, capped at 65536).
@@ -35,12 +35,15 @@ pub fn shard_for_point(
     hilbert_shard_id(key, shard_bits)
 }
 
-/// Pack `(space_id, shard_id)` into a single map key.
-pub fn pack_shard_key(space_id: u64, shard_id: u32) -> u64 {
-    (space_id << 16) | (shard_id as u64)
+/// Composite key for `(space_id, hilbert_shard_id)` maps.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct ShardKey {
+    pub space_id: u64,
+    pub shard_id: u32,
 }
 
-/// Unpack a packed shard key.
-pub fn unpack_shard_key(key: u64) -> (u64, u32) {
-    (key >> 16, (key & 0xFFFF) as u32)
+impl ShardKey {
+    pub fn new(space_id: u64, shard_id: u32) -> Self {
+        Self { space_id, shard_id }
+    }
 }

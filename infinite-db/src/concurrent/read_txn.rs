@@ -31,9 +31,12 @@ pub struct ReadTxn<'a> {
 }
 
 impl<'a> ReadTxn<'a> {
-    /// Pin reads at the current database revision on `main`.
+    /// Pin reads at the current stable revision on `main`.
+    ///
+    /// Queries through this view are repeatable: the visible record set at the
+    /// pinned revision cannot change while the transaction is held.
     pub fn new(db: &'a InfiniteDb) -> Self {
-        let as_of = Some(RevisionId(db.revision()));
+        let as_of = Some(RevisionId(db.stable_revision()));
         Self {
             db,
             branch: BranchId::MAIN,

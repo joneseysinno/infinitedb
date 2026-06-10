@@ -24,14 +24,17 @@ fn space(id: u64, dims: usize) -> SpaceConfig {
 }
 
 #[test]
-fn v4_hilbert_shards_spawn_on_register() {
+fn lazy_hilbert_shards_spawn_on_first_write() {
     let dir = TempDir::new().unwrap();
     let db = open_v4(&dir);
     db.register_space(space(1, 2)).unwrap();
     assert_eq!(db.format_version(), 4);
-    assert!(db.space_shard_count() >= 16);
-    let shard_dir = dir.path().join("spaces/1/shards/0");
-    assert!(shard_dir.join("hot.seg").exists() || shard_dir.join("wal/staging.log").exists());
+    assert_eq!(db.space_shard_count(), 0);
+
+    db.insert(SpaceId(1), DimensionVector::new(vec![1, 1]), vec![1])
+        .unwrap();
+    db.sync().unwrap();
+    assert_eq!(db.space_shard_count(), 1);
 }
 
 #[test]

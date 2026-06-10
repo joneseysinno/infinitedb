@@ -2,6 +2,27 @@
 
 ## Unreleased
 
+### Added
+
+- `InfiniteDb::insert_many` / `insert_many_on_branch` bulk write API with per-shard `WriteBatch` routing.
+- `InfiniteDb::compact(space)` manual compaction trigger.
+- Hilbert bounding-box key decomposition (`range_decompose`) for tighter `query_bbox` pruning.
+- Branch overlay durability via append-only `overlay.log` with replay on open.
+
+### Changed
+
+- Default queries return exactly one record per address (latest revision wins at the query ceiling). Use `Query::include_tombstones()` for full revision history.
+- Per-shard atomic read views (`ShardView`) pair sealed blocks and live tail so readers never observe seal-window duplicates.
+- `ReadTxn` pins at `stable_revision()` (not allocation `revision()`); added `InfiniteDb::stable_revision()` for repeatable reads.
+- Group commit on shard I/O loops: drain channel, batch fsync, batch tail publish, watermark retire (staging WAL removed).
+- `WriteJob` deduplicates payload (WAL entry only); `IoCommand::WriteBatch` for shard-local batches.
+- Live tail uses immutable chunk list; `LiveTailView::load()` returns shared `Arc` chunks.
+- Seal from in-memory tail (no hot-segment re-read); byte-based `hot_segment_seal_bytes` seal threshold.
+- `sync_all` / `flush_space` fan-out in parallel across shards (latency = max, not sum).
+- Lazy Hilbert shard provisioning: `register_space` no longer spawns all shards eagerly.
+- Per-space snapshot head is a mutable index; `SnapshotId` no longer allocated per seal.
+- `IoThreadConfig::direct_write_timeout` deprecated (ignored).
+
 ## 0.3.0
 
 ### Added

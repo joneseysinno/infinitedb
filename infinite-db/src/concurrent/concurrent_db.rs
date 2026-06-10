@@ -15,9 +15,10 @@ use crate::engine::hilbert_live_tails::HilbertLiveTails;
 use crate::engine::io_thread::{open_io_pipeline, IoStats, IoThreadConfig, IoThreadHandle};
 use crate::engine::live_tail::LiveTailView;
 use crate::engine::merge::merge_branches;
-use crate::engine::query::{query_bbox, query_inner, snapshots_map_for_persist};
+use crate::engine::query::{query_bbox, query_inner, snapshots_map_for_persist, space_key};
 use crate::engine::snapshot_store::SnapshotStore;
 use crate::engine::space_live_tails::SpaceLiveTails;
+use crate::engine::watermark::RevisionWatermark;
 use crate::engine::write_queue::{WriteJob, WriteQueueSender};
 use crate::infinitedb_core::{
     address::{Address, DimensionVector, RevisionId, SpaceId},
@@ -87,6 +88,7 @@ pub struct InfiniteDb {
     branches: Arc<RwLock<BranchRegistry>>,
     pub(crate) snapshots: Arc<SnapshotStore>,
     pub(crate) revision: Arc<AtomicU64>,
+    watermark: Arc<RevisionWatermark>,
     next_block_id: Arc<AtomicU64>,
     next_snapshot_id: Arc<AtomicU64>,
     next_branch_id: Arc<AtomicU64>,
@@ -136,6 +138,9 @@ impl InfiniteDb {
         }
 
         let branch_overlays = Arc::new(BranchOverlayStore::new());
+        if format_version == FORMAT_VERSION_V4 {
+            branch_overlays.replay_all(&root)?;
+        }
         #[cfg(feature = "sync")]
         let conflicts = Arc::new(crate::infinitedb_sync::conflict_queue::ConflictQueue::open(&root)?);
 
@@ -146,6 +151,7 @@ impl InfiniteDb {
         let branches = Arc::new(RwLock::new(branches));
         let snapshots = Arc::new(SnapshotStore::new(snapshots));
         let revision = Arc::new(AtomicU64::new(next_rev));
+        let watermark = Arc::new(RevisionWatermark::new(Arc::clone(&revision)));
         let next_block_id = Arc::new(AtomicU64::new(next_block));
         let next_snapshot_id = Arc::new(AtomicU64::new(next_snap));
         let next_branch_id = Arc::new(AtomicU64::new(next_branch));
@@ -169,10 +175,11 @@ impl InfiniteDb {
                 Arc::clone(&branch_overlays),
                 Arc::clone(&spaces),
                 Arc::clone(&next_block_id),
-                Arc::clone(&next_snapshot_id),
                 options.io_thread.clone(),
+                Arc::clone(&watermark),
             );
             coordinator.bootstrap_registered_spaces()?;
+            coordinator.sync_all()?;
             WriteBackend::V4 { coordinator }
         } else if format_version == FORMAT_VERSION_V3 {
             let coordinator = SpaceCoordinator::new(
@@ -181,10 +188,11 @@ impl InfiniteDb {
                 Arc::clone(&snapshots),
                 Arc::clone(&spaces),
                 Arc::clone(&next_block_id),
-                Arc::clone(&next_snapshot_id),
                 options.io_thread.clone(),
+                Arc::clone(&watermark),
             );
             coordinator.bootstrap_registered_spaces()?;
+            coordinator.sync_all()?;
             WriteBackend::V3 { coordinator }
         } else {
             let live_tail = Arc::new(LiveTailView::new());
@@ -194,10 +202,9 @@ impl InfiniteDb {
                 Arc::clone(&snapshots),
                 Arc::clone(&live_tail),
                 Arc::clone(&spaces),
-                Arc::clone(&revision),
                 Arc::clone(&next_block_id),
-                Arc::clone(&next_snapshot_id),
                 options.io_thread.clone(),
+                Arc::clone(&watermark),
             );
             WriteBackend::V2 {
                 queue,
@@ -214,6 +221,7 @@ impl InfiniteDb {
             branches,
             snapshots,
             revision,
+            watermark,
             next_block_id,
             next_snapshot_id,
             next_branch_id,
@@ -257,26 +265,15 @@ impl InfiniteDb {
             ));
         }
         let space_id = config.id.0;
-        let shard_bits = config.shard_bits;
         self.spaces
             .write()
             .register(config)
             .map_err(|e| format!("{:?}", e))?;
+        let space_dir = self.root.join("spaces").join(space_id.to_string());
+        std::fs::create_dir_all(&space_dir).map_err(|e| e.to_string())?;
         match &self.backend {
-            WriteBackend::V3 { coordinator } => {
-                coordinator
-                    .ensure_space(space_id)
-                    .map_err(|e| e.to_string())?;
-            }
-            WriteBackend::V4 { coordinator } => {
-                let count = crate::engine::hilbert_shard::shard_count(shard_bits);
-                for shard_id in 0..count {
-                    coordinator
-                        .ensure_shard(space_id, shard_id)
-                        .map_err(|e| e.to_string())?;
-                }
-            }
             WriteBackend::V2 { .. } => {}
+            WriteBackend::V3 { .. } | WriteBackend::V4 { .. } => {}
         }
         self.persist_meta().map_err(|e| e.to_string())?;
         Ok(())
@@ -301,23 +298,18 @@ impl InfiniteDb {
         data: Vec<u8>,
     ) -> io::Result<RevisionId> {
         let rev = self.next_revision();
-        let address = Address::new(space, point);
+        let address = Address::new(space, point.clone());
+        let hilbert_key = space_key(&self.spaces.read(), space, &point);
         let entry = WalEntry::Write {
-            address: address.clone(),
-            revision: rev,
-            data: data.clone(),
-        };
-        let record = Record {
             address,
             revision: rev,
             data,
-            tombstone: false,
         };
         let job = WriteJob {
             branch_id: branch,
             revision: rev,
             entry,
-            record,
+            hilbert_key,
         };
         self.enqueue(job)?;
         Ok(rev)
@@ -336,22 +328,17 @@ impl InfiniteDb {
         point: DimensionVector,
     ) -> io::Result<RevisionId> {
         let rev = self.next_revision();
-        let address = Address::new(space, point);
+        let address = Address::new(space, point.clone());
+        let hilbert_key = space_key(&self.spaces.read(), space, &point);
         let entry = WalEntry::Tombstone {
-            address: address.clone(),
-            revision: rev,
-        };
-        let record = Record {
             address,
             revision: rev,
-            data: vec![],
-            tombstone: true,
         };
         let job = WriteJob {
             branch_id: branch,
             revision: rev,
             entry,
-            record,
+            hilbert_key,
         };
         self.enqueue(job)?;
         Ok(rev)
@@ -378,6 +365,9 @@ impl InfiniteDb {
             .write()
             .insert(branch)
             .map_err(|e| format!("{:?}", e))?;
+        for (_, snap) in self.snapshots.all() {
+            self.branch_overlays.register_branch(id, snap);
+        }
         self.persist_meta().map_err(|e| e.to_string())?;
         Ok(id)
     }
@@ -423,7 +413,7 @@ impl InfiniteDb {
                 )?;
             }
         }
-        self.branch_overlays.clear_branch(source);
+        self.branch_overlays.clear_branch(source, &self.root)?;
         self.sync()?;
         Ok(result)
     }
@@ -470,9 +460,13 @@ impl InfiniteDb {
         let mut main_jobs = Vec::with_capacity(jobs.len());
         for job in jobs {
             if job.branch_id != BranchId::MAIN {
+                let branch_id = job.branch_id;
+                let record = job.into_record();
+                let space = record.address.space;
                 self.branch_overlays
-                    .append(job.branch_id, job.record.address.space, job.record);
+                    .append_with_durability(branch_id, space, record, &self.root)?;
             } else {
+                self.watermark.register(job.revision.0);
                 main_jobs.push(job);
             }
         }
@@ -563,9 +557,17 @@ impl InfiniteDb {
         self.persist_meta()
     }
 
-    /// Current monotonic revision counter (logical write clock).
+    /// Allocation high-water mark: highest revision id handed to a writer.
+    ///
+    /// A returned revision may not yet be visible; use [`Self::stable_revision`] or
+    /// [`Self::sync`] before reading.
     pub fn revision(&self) -> u64 {
         self.revision.load(Ordering::Relaxed)
+    }
+
+    /// Highest revision guaranteed applied and visible (repeatable-read ceiling).
+    pub fn stable_revision(&self) -> u64 {
+        self.watermark.stable_revision().0
     }
 
     /// Begin a concurrent read transaction pinned at the current revision.
@@ -599,11 +601,6 @@ impl InfiniteDb {
         }
     }
 
-    pub(crate) fn live_tail_refs(&self) -> (Option<&LiveTailView>, Option<&SpaceLiveTails>) {
-        let ctx = self.query_ctx();
-        (ctx.live_tail, ctx.space_tails)
-    }
-
     pub(crate) fn query_ctx(&self) -> QueryCtx<'_> {
         match &self.backend {
             WriteBackend::V2 { live_tail, .. } => QueryCtx {
@@ -624,12 +621,81 @@ impl InfiniteDb {
         }
     }
 
+    /// Bulk insert on `main`; returns `(first_revision, last_revision)`.
+    pub fn insert_many(
+        &self,
+        space: SpaceId,
+        rows: Vec<(DimensionVector, Vec<u8>)>,
+    ) -> io::Result<(RevisionId, RevisionId)> {
+        self.insert_many_on_branch(BranchId::MAIN, space, rows)
+    }
+
+    /// Bulk insert on a branch.
+    pub fn insert_many_on_branch(
+        &self,
+        branch: BranchId,
+        space: SpaceId,
+        rows: Vec<(DimensionVector, Vec<u8>)>,
+    ) -> io::Result<(RevisionId, RevisionId)> {
+        if rows.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "insert_many requires at least one row",
+            ));
+        }
+        const CHUNK: usize = 4096;
+        let count = rows.len() as u64;
+        let first = RevisionId(self.revision.fetch_add(count, Ordering::Relaxed) + 1);
+        let last = RevisionId(first.0 + count - 1);
+        let mut jobs = Vec::with_capacity(rows.len().min(CHUNK));
+        let spaces = self.spaces.read();
+        for (idx, (point, data)) in rows.into_iter().enumerate() {
+            let rev = RevisionId(first.0 + idx as u64);
+            let address = Address::new(space, point.clone());
+            let hilbert_key = space_key(&spaces, space, &point);
+            let entry = WalEntry::Write {
+                address,
+                revision: rev,
+                data,
+            };
+            jobs.push(WriteJob {
+                branch_id: branch,
+                revision: rev,
+                entry,
+                hilbert_key,
+            });
+            if jobs.len() >= CHUNK {
+                self.enqueue_batch(jobs)?;
+                jobs = Vec::new();
+            }
+        }
+        drop(spaces);
+        if !jobs.is_empty() {
+            self.enqueue_batch(jobs)?;
+        }
+        Ok((first, last))
+    }
+
+    /// Manually compact small blocks in `space`.
+    pub fn compact(&self, space: SpaceId) -> io::Result<()> {
+        self.sync()?;
+        match &self.backend {
+            WriteBackend::V4 { coordinator } => coordinator.compact_space(space.0),
+            WriteBackend::V3 { coordinator } => coordinator.compact_space(space.0),
+            WriteBackend::V2 { .. } => Ok(()),
+        }
+    }
+
     fn enqueue(&self, job: WriteJob) -> io::Result<()> {
         if job.branch_id != BranchId::MAIN {
+            let branch_id = job.branch_id;
+            let record = job.into_record();
+            let space = record.address.space;
             self.branch_overlays
-                .append(job.branch_id, job.record.address.space, job.record);
+                .append_with_durability(branch_id, space, record, &self.root)?;
             return Ok(());
         }
+        self.watermark.register(job.revision.0);
         match &self.backend {
             WriteBackend::V4 { coordinator } => coordinator.enqueue_write(job),
             WriteBackend::V3 { coordinator } => coordinator.enqueue_write(job),

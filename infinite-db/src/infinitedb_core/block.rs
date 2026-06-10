@@ -17,6 +17,9 @@ pub struct Record {
     pub data: Vec<u8>,
     /// Marks this revision as a logical deletion.
     pub tombstone: bool,
+    /// Hilbert key computed once at insert; zero means recompute from coordinates.
+    #[serde(default)]
+    pub hilbert_key: u128,
 }
 
 /// An immutable, sorted collection of records sharing a contiguous Hilbert

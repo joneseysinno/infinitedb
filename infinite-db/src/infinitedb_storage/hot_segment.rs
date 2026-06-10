@@ -7,7 +7,6 @@ use std::{
     fs::{File, OpenOptions},
     io::{self, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
-    time::{Duration, Instant},
 };
 
 use bincode::{config::standard, decode_from_slice, encode_to_vec};
@@ -82,56 +81,32 @@ impl HotSegment {
         })
     }
 
-    /// Append one record frame and fsync if completed within `deadline`.
+    /// Append one WAL frame without fsync (group-commit path).
     ///
-    /// Returns `true` when the record is durably committed in the hot segment.
-    /// On timeout, rolls back the in-flight append and returns `false`.
-    pub fn try_append_with_deadline(
-        &mut self,
-        entry: &WalEntry,
-        deadline: Duration,
-    ) -> io::Result<bool> {
-        let start = Instant::now();
+    /// Returns the number of bytes added to the file (frame header + payload + checksum).
+    pub fn append_frame(&mut self, entry: &WalEntry) -> io::Result<usize> {
         let payload = encode_to_vec(entry, standard())
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
         let len = payload.len() as u64;
         let checksum = blake3_hash(&payload);
-        let frame_start = self.file.seek(SeekFrom::End(0))?;
-
         self.file.write_all(&len.to_le_bytes())?;
         self.file.write_all(&payload)?;
         self.file.write_all(&checksum)?;
-
-        if start.elapsed() > deadline {
-            self.file.set_len(frame_start)?;
-            self.file.seek(SeekFrom::End(0))?;
-            return Ok(false);
-        }
-
-        self.file.sync_all()?;
-        if start.elapsed() > deadline {
-            self.file.set_len(frame_start)?;
-            self.file.seek(SeekFrom::End(0))?;
-            return Ok(false);
-        }
-
-        self.committed_len = self.file.metadata()?.len();
-        self.write_committed_len()?;
-        Ok(true)
+        Ok(8 + payload.len() + 32)
     }
 
-    /// Append and fsync without a deadline (I/O thread promotion path).
-    pub fn append_and_sync(&mut self, entry: &WalEntry) -> io::Result<()> {
-        let payload = encode_to_vec(entry, standard())
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-        let len = payload.len() as u64;
-        let checksum = blake3_hash(&payload);
-        self.file.write_all(&len.to_le_bytes())?;
-        self.file.write_all(&payload)?;
-        self.file.write_all(&checksum)?;
+    /// Fsync the segment and commit the length header once for a write group.
+    pub fn sync_group(&mut self) -> io::Result<()> {
         self.file.sync_all()?;
-        self.committed_len = self.file.metadata()?.len();
-        self.write_committed_len()
+        self.write_committed_len_header()
+    }
+
+    /// Append and fsync a single frame (recovery / staging migration).
+    pub fn append_and_sync(&mut self, entry: &WalEntry) -> io::Result<()> {
+        let added = self.append_frame(entry)?;
+        self.committed_len = self.committed_len.saturating_add(added as u64);
+        self.file.sync_all()?;
+        self.write_committed_len_header()
     }
 
     /// Read all valid frames from disk (recovery and query).
@@ -159,7 +134,7 @@ impl HotSegment {
         self.file.set_len((MAGIC.len() + 8) as u64)?;
         self.file.seek(SeekFrom::End(0))?;
         self.committed_len = (MAGIC.len() + 8) as u64;
-        self.write_committed_len()?;
+        self.write_committed_len_header()?;
         self.file.sync_all()
     }
 
@@ -167,12 +142,17 @@ impl HotSegment {
         &self.path
     }
 
-    fn write_committed_len(&mut self) -> io::Result<()> {
+    fn write_committed_len_header(&mut self) -> io::Result<()> {
         self.file.seek(SeekFrom::Start(MAGIC.len() as u64))?;
         self.file.write_all(&self.committed_len.to_le_bytes())?;
         self.file.sync_all()?;
         self.file.seek(SeekFrom::End(0))?;
         Ok(())
+    }
+
+    /// Add `bytes` to the tracked committed length (after in-memory append).
+    pub fn track_appended_bytes(&mut self, bytes: usize) {
+        self.committed_len = self.committed_len.saturating_add(bytes as u64);
     }
 }
 
@@ -212,12 +192,14 @@ pub fn wal_entry_to_record(entry: WalEntry) -> Option<Record> {
             revision,
             data,
             tombstone: false,
+            hilbert_key: 0,
         }),
         WalEntry::Tombstone { address, revision } => Some(Record {
             address,
             revision,
             data: vec![],
             tombstone: true,
+            hilbert_key: 0,
         }),
         _ => None,
     }
@@ -247,9 +229,9 @@ mod tests {
     fn roundtrip_append_and_read() {
         let dir = TempDir::new().unwrap();
         let mut seg = HotSegment::open(dir.path().to_path_buf(), 1).unwrap();
-        assert!(seg
-            .try_append_with_deadline(&sample_entry(), Duration::from_secs(5))
-            .unwrap());
+        let added = seg.append_frame(&sample_entry()).unwrap();
+        seg.track_appended_bytes(added);
+        seg.sync_group().unwrap();
         let records = seg.read_all_records().unwrap();
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].data, vec![9]);

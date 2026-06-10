@@ -1,6 +1,6 @@
 [package]
 name = "infinite-db"
-version = "0.3.0"
+version = "0.3.1"
 authors = ["Jonesey's Innovation"]
 edition = "2024"
 rust-version = "1.85"
@@ -67,6 +67,11 @@ required-features = ["embedded"]
 [[test]]
 name = "durability"
 path = "tests/durability.rs"
+required-features = ["embedded"]
+
+[[test]]
+name = "crcw_correctness"
+path = "tests/crcw_correctness.rs"
 required-features = ["embedded"]
 
 [[test]]
