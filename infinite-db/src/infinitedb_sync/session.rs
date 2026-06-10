@@ -1,24 +1,26 @@
-//! End-to-end block-level sync session driver.
+//! Block-level sync session driver.
 //!
-//! Negotiates Merkle roots over a framed byte stream (`serial::SyncMessage`),
-//! transfers a [`Delta`] when roots differ, and applies it to the local database.
+//! v1 Merkle/delta wire protocol (`run_sync_session_*`, `converge_spaces`) requires
+//! the `legacy-v1` feature. For CRCW [`crate::InfiniteDb`], use
+//! [`crate::infinitedb_sync::replicate::converge_main_records`].
 
 use std::io::{self, Read, Write};
 
-use crate::infinitedb_core::{
-    address::SpaceId,
-    block::Block,
-    snapshot::Snapshot,
-};
+use crate::infinitedb_core::address::SpaceId;
 use crate::infinitedb_sync::{
     delta::Delta,
     serial::{read_message, write_message, SyncMessage},
 };
 
+#[cfg(feature = "legacy-v1")]
+use crate::infinitedb_core::{block::Block, snapshot::Snapshot};
+#[cfg(feature = "legacy-v1")]
+use crate::legacy_v1::LegacyDb;
 
 /// Run a sync session as the initiator (sends our root first, receives delta to apply).
+#[cfg(feature = "legacy-v1")]
 pub fn run_sync_session_initiator<R: Read, W: Write>(
-    local: &mut crate::InfiniteDb,
+    local: &mut LegacyDb,
     space: SpaceId,
     reader: &mut R,
     writer: &mut W,
@@ -82,8 +84,9 @@ pub fn run_sync_session_initiator<R: Read, W: Write>(
 }
 
 /// Run a sync session as the responder (reads initiator root, may send tree + delta).
+#[cfg(feature = "legacy-v1")]
 pub fn run_sync_session_responder<R: Read, W: Write>(
-    local: &mut crate::InfiniteDb,
+    local: &mut LegacyDb,
     space: SpaceId,
     reader: &mut R,
     writer: &mut W,
@@ -126,10 +129,11 @@ pub fn run_sync_session_responder<R: Read, W: Write>(
     }
 }
 
-/// In-memory convergence helper used by integration tests (no wire I/O).
+/// In-memory convergence helper for v1 databases (no wire I/O). Requires `legacy-v1`.
+#[cfg(feature = "legacy-v1")]
 pub fn converge_spaces(
-    local: &mut crate::InfiniteDb,
-    remote: &mut crate::InfiniteDb,
+    local: &mut LegacyDb,
+    remote: &mut LegacyDb,
     space: SpaceId,
 ) -> io::Result<()> {
     let remote_snap = remote
@@ -154,30 +158,35 @@ pub fn converge_spaces(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::infinitedb_core::address::DimensionVector;
+    use crate::infinitedb_core::address::{DimensionVector, SpaceId};
+    use crate::infinitedb_core::branch::BranchId;
     use crate::infinitedb_core::space::SpaceConfig;
+    use crate::infinitedb_sync::replicate::{converge_main_records, snapshot_merkle};
+    use crate::InfiniteDb;
     use tempfile::TempDir;
 
     #[test]
-    fn converge_brings_diverged_databases_to_same_merkle_root() {
+    fn converge_brings_diverged_crcw_databases_to_same_merkle_root() {
         let dir_a = TempDir::new().unwrap();
         let dir_b = TempDir::new().unwrap();
         let space = SpaceId(1);
 
-        let mut a = crate::InfiniteDb::open(dir_a.path()).unwrap();
-        let mut b = crate::InfiniteDb::open(dir_b.path()).unwrap();
+        let a = InfiniteDb::open(dir_a.path()).unwrap();
+        let b = InfiniteDb::open(dir_b.path()).unwrap();
         a.register_space(SpaceConfig::new(space, "s", 2)).unwrap();
         b.register_space(SpaceConfig::new(space, "s", 2)).unwrap();
 
-        // Remote has data; local is empty — convergence should make roots match.
-        b.insert(space, DimensionVector::new(vec![2, 2]), vec![2]).unwrap();
-        b.flush(space).unwrap();
+        b.insert(space, DimensionVector::new(vec![2, 2]), vec![2])
+            .unwrap();
+        b.sync().unwrap();
 
-        let root_b = b.snapshot_merkle(space).unwrap().root();
-        assert!(a.snapshot_for_space(space).is_none());
+        let root_b = snapshot_merkle(&b, space, BranchId::MAIN).unwrap().root();
+        assert!(a.query(space, None).unwrap().is_empty());
 
-        converge_spaces(&mut a, &mut b, space).unwrap();
-        assert_eq!(a.snapshot_merkle(space).unwrap().root(), root_b);
+        converge_main_records(&a, &b, space).unwrap();
+        assert_eq!(
+            snapshot_merkle(&a, space, BranchId::MAIN).unwrap().root(),
+            root_b
+        );
     }
 }

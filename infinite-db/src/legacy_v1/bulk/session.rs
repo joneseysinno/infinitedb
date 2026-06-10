@@ -9,7 +9,7 @@ use crate::infinitedb_core::{
 };
 use crate::infinitedb_storage::wal::{WalDurability, WalEntry, WalWriter};
 
-use super::super::InfiniteDb;
+use super::super::LegacyDb;
 
 /// Default WAL sync interval during bulk import (frames between fsyncs).
 pub const DEFAULT_BULK_SYNC_EVERY: usize = 4096;
@@ -47,7 +47,7 @@ pub type BulkImportResult = BulkWriteResult;
 
 /// Active bulk session state shared by record, hyperedge, and signal guards.
 pub struct BulkSessionCore<'a> {
-    pub(super) db: &'a mut InfiniteDb,
+    pub(super) db: &'a mut LegacyDb,
     saved_durability: WalDurability,
     saved_flush_threshold: usize,
     pub(super) touched_spaces: BTreeSet<u64>,
@@ -61,8 +61,8 @@ pub struct BulkSessionCore<'a> {
 }
 
 impl<'a> BulkSessionCore<'a> {
-    /// Start a bulk session. Only one session may be active per [`InfiniteDb`].
-    pub fn begin(db: &'a mut InfiniteDb, options: BulkWriteOptions) -> io::Result<Self> {
+    /// Start a bulk session. Only one session may be active per [`LegacyDb`].
+    pub fn begin(db: &'a mut LegacyDb, options: BulkWriteOptions) -> io::Result<Self> {
         if db.bulk_session_active {
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
@@ -261,7 +261,7 @@ mod tests {
     #[test]
     fn second_bulk_session_returns_already_exists() {
         let dir = TempDir::new().unwrap();
-        let mut db = InfiniteDb::open(dir.path()).unwrap();
+        let mut db = LegacyDb::open(dir.path()).unwrap();
         db.bulk_session_active = true;
         let second = BulkSessionCore::begin(&mut db, BulkWriteOptions::default());
         assert!(matches!(
@@ -273,14 +273,14 @@ mod tests {
     #[test]
     fn drop_without_finish_clears_active_flag() {
         let dir = TempDir::new().unwrap();
-        let mut db = InfiniteDb::open(dir.path()).unwrap();
+        let mut db = LegacyDb::open(dir.path()).unwrap();
         let session = BulkSessionCore::begin(&mut db, BulkWriteOptions::default()).unwrap();
         drop(session);
         assert!(!db.bulk_session_active);
     }
 }
 
-impl InfiniteDb {
+impl LegacyDb {
     pub(crate) fn wal_mut(&mut self) -> &mut WalWriter {
         &mut self.wal
     }

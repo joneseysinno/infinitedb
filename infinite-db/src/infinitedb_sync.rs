@@ -14,3 +14,7 @@ pub mod transport;
 pub mod worker;
 /// Block-level sync session driver.
 pub mod session;
+/// Persisted unresolved merge conflicts.
+pub mod conflict_queue;
+/// Branch-aware replication for [`crate::InfiniteDb`].
+pub mod replicate;

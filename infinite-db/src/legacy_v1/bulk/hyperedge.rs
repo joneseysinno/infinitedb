@@ -16,7 +16,7 @@ use super::session::{
     BulkImportResult, BulkSessionCore, BulkWriteOptions, BulkWriteResult, DEFAULT_BULK_FLUSH_THRESHOLD,
     DEFAULT_BULK_SYNC_EVERY,
 };
-use super::super::{hyperedge_point, locator_point, InfiniteDb, HYPEREDGE_LOCATOR_SPACE};
+use super::super::{hyperedge_point, locator_point, LegacyDb, HYPEREDGE_LOCATOR_SPACE};
 
 /// Tuning for bulk hyperedge import.
 #[derive(Debug, Clone)]
@@ -47,7 +47,7 @@ impl BulkHyperedgeImportOptions {
 
 /// Bulk hyperedge insert/delete session.
 ///
-/// Only one bulk session per [`InfiniteDb`] at a time. Call [`Self::finish`] before drop.
+/// Only one bulk session per [`LegacyDb`] at a time. Call [`Self::finish`] before drop.
 pub struct BulkHyperedgeImport<'a> {
     session: BulkSessionCore<'a>,
     space: SpaceId,
@@ -250,7 +250,7 @@ fn index_hyperedge_endpoints_session(
     Ok(n)
 }
 
-impl InfiniteDb {
+impl LegacyDb {
     pub fn begin_hyperedge_import(
         &mut self,
         space: SpaceId,

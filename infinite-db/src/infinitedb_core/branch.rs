@@ -8,6 +8,11 @@ use super::snapshot::SnapshotId;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Encode, Decode)]
 pub struct BranchId(pub u64);
 
+impl BranchId {
+    /// Canonical `main` branch (created on first open).
+    pub const MAIN: BranchId = BranchId(1);
+}
+
 /// A named, mutable pointer to a snapshot.
 /// The `main` branch is the canonical truth. Other branches represent
 /// offline or experimental divergences that can be merged back.

@@ -3,11 +3,11 @@
 use crate::infinitedb_core::address::{DimensionVector, RevisionId, SpaceId};
 
 use super::session::{BulkSessionCore, BulkWriteOptions, BulkWriteResult};
-use super::super::InfiniteDb;
+use super::super::LegacyDb;
 
 /// Bulk insert/delete session for raw records in one space.
 ///
-/// Only one bulk session may be active per [`InfiniteDb`] at a time.
+/// Only one bulk session may be active per [`LegacyDb`] at a time.
 /// Parallelize parsing upstream; use a single thread for `push`.
 pub struct BulkRecordImport<'a> {
     session: BulkSessionCore<'a>,
@@ -32,7 +32,7 @@ impl<'a> BulkRecordImport<'a> {
     }
 }
 
-impl InfiniteDb {
+impl LegacyDb {
     /// Begin a buffered bulk record import into `space`.
     pub fn begin_record_import(&mut self, space: SpaceId) -> std::io::Result<BulkRecordImport<'_>> {
         self.begin_record_import_with_options(space, BulkWriteOptions::default())

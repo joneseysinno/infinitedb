@@ -23,12 +23,24 @@ pub struct SpaceConfig {
     /// When enabled, the database maintains an id→point locator so edges remain
     /// addressable by id. Defaults to `false`; only affects hyperedge spaces.
     pub centroid_keying: bool,
+    /// Hilbert range sharding within this space (format v4).
+    ///
+    /// `shard_id = hilbert_key >> (128 - shard_bits)`. Default `4` → 16 shards.
+    /// `0` disables intra-space sharding (single I/O thread per space).
+    pub shard_bits: u32,
 }
 
 impl SpaceConfig {
     /// Create a space configuration with the standard 8-bit Hilbert precision.
     pub fn new(id: SpaceId, name: impl Into<String>, dims: usize) -> Self {
-        Self { id, name: name.into(), dims, bits_per_dim: 8, centroid_keying: false }
+        Self {
+            id,
+            name: name.into(),
+            dims,
+            bits_per_dim: 8,
+            centroid_keying: false,
+            shard_bits: 4,
+        }
     }
 
     /// Override the Hilbert precision (bits per dimension) for this space.
@@ -40,6 +52,12 @@ impl SpaceConfig {
     /// Enable experimental centroid-based hyperedge keying for this space.
     pub fn with_centroid_keying(mut self) -> Self {
         self.centroid_keying = true;
+        self
+    }
+
+    /// Override Hilbert range shard count (`2^shard_bits` I/O threads per space).
+    pub fn with_shard_bits(mut self, shard_bits: u32) -> Self {
+        self.shard_bits = shard_bits;
         self
     }
 }
@@ -79,6 +97,11 @@ impl SpaceRegistry {
     /// Look up a space by name.
     pub fn get_by_name(&self, name: &str) -> Option<&SpaceConfig> {
         self.names.get(name).and_then(|id| self.spaces.get(id))
+    }
+
+    /// Return all registered space IDs.
+    pub fn space_ids(&self) -> Vec<SpaceId> {
+        self.spaces.keys().copied().collect()
     }
 
     /// Remove a space and return its previous configuration, if it existed.

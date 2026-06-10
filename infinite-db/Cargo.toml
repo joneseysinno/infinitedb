@@ -1,18 +1,26 @@
 [package]
 name = "infinite-db"
-version = "0.2.0"
+version = "0.3.0"
 authors = ["Jonesey's Innovation"]
 edition = "2024"
+rust-version = "1.85"
 description = "A spatial-graph database using n-dimensional curves and hyperedges for engineering logic."
 license = "MIT"
+readme = "README.md"
+documentation = "https://docs.rs/infinite-db/0.3.0"
 keywords = ["database", "spatial", "hypergraph", "engineering", "peano"]
 categories = ["database-implementations", "science"]
 repository = "https://github.com/joneseysinno/infinitedb.git"
-exclude = ["target/**"]
+exclude = ["target/**", "INFINITEDB_PLAN.md"]
+
+[package.metadata.docs.rs]
+all-features = true
 
 [features]
 default = ["embedded"]
 embedded = []
+# Internal v1 WAL engine (reference only; not for new code).
+legacy-v1 = ["embedded"]
 server = ["embedded", "dep:tokio"]
 sync = ["server"]
 
@@ -30,11 +38,47 @@ tokio = { version = "1", features = ["full"], optional = true }
 # Random session IDs
 getrandom = "0.3"
 
+# Phase A CRCW: concurrent reads + fire-and-forget write queue
+arc-swap = "1"
+crossbeam-channel = "0.5"
+dashmap = "6"
+parking_lot = "0.12"
+
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }
 tempfile = "3"
 criterion = "0.5"
 
-[[bench]]
-name = "engine"
-harness = false
+[[test]]
+name = "concurrent_db"
+path = "tests/concurrent_db.rs"
+required-features = ["embedded"]
+
+[[test]]
+name = "concurrent_db_phase_b"
+path = "tests/concurrent_db_phase_b.rs"
+required-features = ["embedded"]
+
+[[test]]
+name = "concurrent_db_phase_c"
+path = "tests/concurrent_db_phase_c.rs"
+required-features = ["embedded"]
+
+[[test]]
+name = "durability"
+path = "tests/durability.rs"
+required-features = ["embedded"]
+
+[[test]]
+name = "server_phase_d"
+path = "tests/server_phase_d.rs"
+required-features = ["sync"]
+
+[[bin]]
+name = "infinite-db-test"
+path = "src/bin/infinite-db-test.rs"
+required-features = ["sync"]
+
+[[example]]
+name = "quickstart"
+required-features = ["embedded"]

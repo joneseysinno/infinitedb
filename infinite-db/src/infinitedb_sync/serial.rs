@@ -31,6 +31,17 @@ pub enum SyncMessage {
     Ack { applied_revision: u64 },
     /// Explicit outbox operation batch exchange (typed writes included).
     OperationBatch(Vec<SyncEnvelope>),
+    /// Branch-aware sync negotiation (Phase D).
+    BranchState {
+        branch: crate::infinitedb_core::branch::BranchId,
+        merkle_root: [u8; 32],
+        revision: u64,
+    },
+    /// Overlay records from a diverged branch.
+    BranchOverlay {
+        branch: crate::infinitedb_core::branch::BranchId,
+        records: Vec<crate::infinitedb_core::block::Record>,
+    },
     /// Either side signals an error.
     Error { message: String },
 }
@@ -109,14 +120,14 @@ mod tests {
     fn roundtrip_operation_batch_message() {
         use crate::infinitedb_core::address::{Address, DimensionVector, RevisionId, SpaceId};
         use crate::infinitedb_sync::transport::SyncOperation;
-        let batch = vec![SyncEnvelope {
-            op_id: 99,
-            op: SyncOperation::Write {
+        let batch = vec![SyncEnvelope::new(
+            99,
+            SyncOperation::Write {
                 address: Address::new(SpaceId(1), DimensionVector::new(vec![1, 2])),
                 revision: RevisionId(3),
                 data: vec![7, 8],
             },
-        }];
+        )];
         let msg = SyncMessage::OperationBatch(batch);
         let mut buf = Vec::new();
         write_message(&mut buf, &msg).unwrap();

@@ -95,6 +95,33 @@ impl Session {
             Some(AccessLevel::ReadWrite) | Some(AccessLevel::Admin)
         )
     }
+
+    /// Return `true` if the session has read-write or admin access to any space.
+    pub fn can_manage_branches(&self) -> bool {
+        self.grants.iter().any(|g| {
+            matches!(g.level, AccessLevel::ReadWrite | AccessLevel::Admin)
+        })
+    }
+
+    /// Return `true` if the session may write to `target_branch`.
+    pub fn can_write_branch(&self, target_branch: BranchId) -> bool {
+        if self.branch == target_branch {
+            return true;
+        }
+        self.grants
+            .iter()
+            .any(|g| matches!(g.level, AccessLevel::Admin))
+    }
+
+    /// Open a session pinned at the current database revision.
+    pub fn open_at_revision(
+        branch: BranchId,
+        pinned_snapshot: SnapshotId,
+        revision: u64,
+        grants: Vec<SpaceGrant>,
+    ) -> Self {
+        Self::new(branch, pinned_snapshot, RevisionId(revision), grants)
+    }
 }
 
 #[cfg(test)]

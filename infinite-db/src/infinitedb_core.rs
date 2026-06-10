@@ -14,6 +14,8 @@ pub mod address;
 pub mod block;
 /// Branching model and branch registry.
 pub mod branch;
+/// Branch merge strategies and conflict types.
+pub mod merge;
 /// Query descriptor types.
 pub mod query;
 /// Schema trait implemented by storable record types.

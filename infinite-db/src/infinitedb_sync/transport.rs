@@ -2,6 +2,7 @@
 
 use bincode::{Decode, Encode};
 use crate::infinitedb_core::address::{Address, RevisionId};
+use crate::infinitedb_core::branch::BranchId;
 use crate::infinitedb_core::hyperedge::{Hyperedge, HyperedgeId};
 use crate::infinitedb_core::signal::SignalSample;
 use crate::infinitedb_core::address::SpaceId;
@@ -44,7 +45,22 @@ pub enum SyncOperation {
 #[derive(Debug, Clone, Encode, Decode)]
 pub struct SyncEnvelope {
     pub op_id: u64,
+    /// Target branch on the remote node (default `main`).
+    pub branch_id: BranchId,
+    /// Hilbert shard id when known (format v4).
+    pub shard_id: Option<u32>,
     pub op: SyncOperation,
+}
+
+impl SyncEnvelope {
+    pub fn new(op_id: u64, op: SyncOperation) -> Self {
+        Self {
+            op_id,
+            branch_id: BranchId::MAIN,
+            shard_id: None,
+            op,
+        }
+    }
 }
 
 /// Result of attempting to apply one operation on the remote side.

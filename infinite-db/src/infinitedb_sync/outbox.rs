@@ -73,10 +73,7 @@ impl OutboxState {
             .iter()
             .filter(|e| e.next_attempt_at_ms <= now)
             .take(max_batch)
-            .map(|e| SyncEnvelope {
-                op_id: e.op_id,
-                op: e.op.clone(),
-            })
+            .map(|e| SyncEnvelope::new(e.op_id, e.op.clone()))
             .collect();
 
         if due.is_empty() {

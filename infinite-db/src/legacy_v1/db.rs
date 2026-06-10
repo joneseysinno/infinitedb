@@ -1,4 +1,4 @@
-//! `InfiniteDb` — the top-level embedded database handle.
+//! `LegacyDb` — the top-level embedded database handle.
 //!
 //! This is the single entry point for embedded use. It owns:
 //!   - A `BlockStore` (NVMe-aware file storage)
@@ -11,12 +11,11 @@
 //! the WAL is replayed to recover any in-flight writes from a prior crash.
 //!
 //! # Example
-//! ```no_run
-//! use infinite_db::InfiniteDb;
+//! ```ignore
+//! use infinite_db::legacy_v1::LegacyDb;
 //! use infinite_db::infinitedb_core::address::{DimensionVector, SpaceId};
-//! use infinite_db::infinitedb_core::space::{SpaceConfig, SpaceRegistry};
 //!
-//! let mut db = InfiniteDb::open("./mydb").unwrap();
+//! let mut db = LegacyDb::open("./mydb").unwrap();
 //! let space = SpaceId(1);
 //! let point = DimensionVector::new(vec![128, 64]);
 //! let data  = bincode::encode_to_vec(&42u32, bincode::config::standard()).unwrap();
@@ -65,6 +64,7 @@ use crate::infinitedb_storage::{
 
 #[path = "bulk/mod.rs"]
 mod bulk;
+#[allow(unused_imports)]
 pub use bulk::{
     BulkHyperedgeImport, BulkHyperedgeImportOptions, BulkImportResult, BulkRecordImport,
     BulkSignalImport, BulkWriteOptions, BulkWriteResult,
@@ -84,7 +84,7 @@ use crate::infinitedb_sync::{
 
 /// Options for opening an embedded database.
 #[derive(Debug, Clone)]
-pub struct OpenOptions {
+pub struct LegacyOpenOptions {
     /// WAL fsync policy. Default: [`WalDurability::Strict`].
     pub wal_durability: WalDurability,
     /// In-memory records before auto-sealing a block. Default: 256.
@@ -93,7 +93,7 @@ pub struct OpenOptions {
     pub block_cache_bytes: usize,
 }
 
-impl Default for OpenOptions {
+impl Default for LegacyOpenOptions {
     fn default() -> Self {
         Self {
             wal_durability: WalDurability::Strict,
@@ -103,20 +103,20 @@ impl Default for OpenOptions {
     }
 }
 
-impl OpenOptions {
+impl LegacyOpenOptions {
     /// Open (or create) a database directory with these options.
-    pub fn open<P: AsRef<Path>>(&self, dir: P) -> io::Result<InfiniteDb> {
-        InfiniteDb::open_with_options(dir, self)
+    pub fn open<P: AsRef<Path>>(&self, dir: P) -> io::Result<LegacyDb> {
+        LegacyDb::open_with_options(dir, self)
     }
 }
 
 // ---------------------------------------------------------------------------
-// InfiniteDb
+// LegacyDb
 // ---------------------------------------------------------------------------
 
 /// The embedded database handle. Not `Send`/`Sync` — create one per thread
 /// or wrap in a `Mutex` for multi-threaded access.
-pub struct InfiniteDb {
+pub struct LegacyDb {
     store: BlockStore,
     wal: WalWriter,
     spaces: SpaceRegistry,
@@ -147,14 +147,14 @@ pub struct InfiniteDb {
     sync_worker: Option<BackgroundSyncWorker>,
 }
 
-impl InfiniteDb {
+impl LegacyDb {
     /// Open (or create) a database in `dir`. Replays the WAL on first open.
     pub fn open<P: AsRef<Path>>(dir: P) -> io::Result<Self> {
-        OpenOptions::default().open(dir)
+        LegacyOpenOptions::default().open(dir)
     }
 
     /// Open with explicit tuning (cache size, flush threshold, WAL policy).
-    pub fn open_with_options<P: AsRef<Path>>(dir: P, options: &OpenOptions) -> io::Result<Self> {
+    pub fn open_with_options<P: AsRef<Path>>(dir: P, options: &LegacyOpenOptions) -> io::Result<Self> {
         let root = dir.as_ref().to_path_buf();
         let store = BlockStore::open_with_cache(root.clone(), options.block_cache_bytes)?;
         let wal_path = store.wal_path();
@@ -1541,7 +1541,7 @@ impl InfiniteDb {
 }
 
 #[cfg(feature = "sync")]
-impl Drop for InfiniteDb {
+impl Drop for LegacyDb {
     fn drop(&mut self) {
         self.stop_background_sync();
     }
@@ -1595,7 +1595,7 @@ impl MemoryStats {
 
     /// Pretty-print the current memory statistics to stdout.
     pub fn print(&self) {
-        println!("\n╔═══ InfiniteDb Memory Stats ═══╗");
+        println!("\n╔═══ LegacyDb Memory Stats ═══╗");
         println!("║  Write buffer       {:>6} records  ({} bytes)",
             self.buffer_records, fmt_bytes(self.buffer_bytes));
         println!("║  LRU block cache    {:>6} blocks   ({} bytes / 10 MB limit)",
@@ -1737,9 +1737,9 @@ mod tests {
     #[cfg(feature = "sync")]
     use crate::infinitedb_sync::transport::{SyncEnvelope, SyncResult, SyncTransport};
 
-    fn open_tmp() -> (InfiniteDb, TempDir) {
+    fn open_tmp() -> (LegacyDb, TempDir) {
         let dir = TempDir::new().unwrap();
-        let db = InfiniteDb::open(dir.path()).unwrap();
+        let db = LegacyDb::open(dir.path()).unwrap();
         (db, dir)
     }
 
@@ -1885,7 +1885,7 @@ mod tests {
         let space = SpaceId(1);
         let point = DimensionVector::new(vec![7, 9]);
         {
-            let mut db = InfiniteDb::open(dir.path()).unwrap();
+            let mut db = LegacyDb::open(dir.path()).unwrap();
             db.register_space(SpaceConfig::new(space, "s", 2)).unwrap();
             let rev = db.insert(space, point.clone(), vec![5]).unwrap();
 
@@ -1917,7 +1917,7 @@ mod tests {
 
         // Reopen: snapshots.bin never recorded the block, but BlockSealed replay
         // must relink it and the record must surface exactly once.
-        let mut db = InfiniteDb::open(dir.path()).unwrap();
+        let mut db = LegacyDb::open(dir.path()).unwrap();
         let results = db.query(space, None).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].data, vec![5]);
@@ -2511,11 +2511,11 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let space = SpaceId(1);
         {
-            let mut db = InfiniteDb::open(dir.path()).unwrap();
+            let mut db = LegacyDb::open(dir.path()).unwrap();
             db.insert(space, DimensionVector::new(vec![1, 2]), vec![3]).unwrap();
             assert_eq!(db.sync_pending_count(), 1);
         }
-        let db = InfiniteDb::open(dir.path()).unwrap();
+        let db = LegacyDb::open(dir.path()).unwrap();
         assert_eq!(db.sync_pending_count(), 1);
     }
 

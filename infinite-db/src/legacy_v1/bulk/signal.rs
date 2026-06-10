@@ -8,7 +8,7 @@ use crate::infinitedb_core::{
 };
 
 use super::session::{BulkSessionCore, BulkWriteOptions, BulkWriteResult};
-use super::super::InfiniteDb;
+use super::super::LegacyDb;
 
 /// Bulk insert/delete session for [`SignalSample`] values in one space.
 pub struct BulkSignalImport<'a> {
@@ -72,7 +72,7 @@ impl<'a> BulkSignalImport<'a> {
     }
 }
 
-impl InfiniteDb {
+impl LegacyDb {
     /// Begin a buffered bulk signal import into `space`.
     pub fn begin_signal_import(&mut self, space: SpaceId) -> std::io::Result<BulkSignalImport<'_>> {
         self.begin_signal_import_with_options(space, BulkWriteOptions::default())
