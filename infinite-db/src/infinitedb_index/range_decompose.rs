@@ -1,6 +1,9 @@
 //! Hilbert key interval decomposition for bounding-box queries.
 
-use crate::infinitedb_core::address::DimensionVector;
+use crate::infinitedb_core::{
+    address::DimensionVector,
+    hilbert_key::HilbertKey,
+};
 use crate::infinitedb_index::composite::KeyConfig;
 use crate::infinitedb_index::key::hilbert_key_for;
 
@@ -13,8 +16,8 @@ pub const MAX_DEPTH: u32 = 12;
 /// Disjoint key intervals whose union conservatively covers `bbox`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KeyInterval {
-    pub lo: u128,
-    pub hi: u128,
+    pub lo: HilbertKey,
+    pub hi: HilbertKey,
 }
 
 /// Decompose a bounding box into Hilbert key intervals for pruning.
@@ -26,7 +29,10 @@ pub fn decompose_bbox(
     assert_eq!(min.dims(), max.dims());
     let dims = min.dims();
     if dims == 0 {
-        return vec![KeyInterval { lo: 0, hi: u128::MAX }];
+        return vec![KeyInterval {
+            lo: HilbertKey::ZERO,
+            hi: HilbertKey(u128::MAX),
+        }];
     }
 
     let max_coord = (1u32 << bits_per_dim.min(31)) - 1;
@@ -66,8 +72,8 @@ fn decompose_cell(
     match cell_relation(cell_min, cell_max, bbox_min, bbox_max) {
         CellRelation::Outside => {}
         CellRelation::Inside => {
-            let lo = hilbert_key_for(&coords_vec(cell_min), KeyConfig { bits_per_dim });
-            let hi = hilbert_key_for(&coords_vec(cell_max), KeyConfig { bits_per_dim });
+            let lo = HilbertKey(hilbert_key_for(&coords_vec(cell_min), KeyConfig { bits_per_dim }));
+            let hi = HilbertKey(hilbert_key_for(&coords_vec(cell_max), KeyConfig { bits_per_dim }));
             let (lo, hi) = if lo <= hi { (lo, hi) } else { (hi, lo) };
             out.push(KeyInterval { lo, hi });
         }
@@ -158,24 +164,28 @@ fn push_bbox_hull(
                 min.coords[d]
             });
         }
-        keys.push(hilbert_key_for(
+        keys.push(HilbertKey(hilbert_key_for(
             &DimensionVector::new(coords),
             KeyConfig { bits_per_dim },
-        ));
+        )));
     }
-    let lo = *keys.iter().min().unwrap_or(&0);
-    let hi = *keys.iter().max().unwrap_or(&0);
+    let lo = *keys.iter().min().unwrap_or(&HilbertKey::ZERO);
+    let hi = *keys.iter().max().unwrap_or(&HilbertKey::ZERO);
     let (lo, hi) = if lo <= hi { (lo, hi) } else { (hi, lo) };
     out.push(KeyInterval { lo, hi });
 }
 
 /// True when `key` falls inside any interval (inclusive).
-pub fn key_in_intervals(key: u128, intervals: &[KeyInterval]) -> bool {
+pub fn key_in_intervals(key: HilbertKey, intervals: &[KeyInterval]) -> bool {
     intervals.iter().any(|i| key >= i.lo && key <= i.hi)
 }
 
 /// True when block `[min_key, max_key]` overlaps any interval.
-pub fn block_overlaps_intervals(min_key: u128, max_key: u128, intervals: &[KeyInterval]) -> bool {
+pub fn block_overlaps_intervals(
+    min_key: HilbertKey,
+    max_key: HilbertKey,
+    intervals: &[KeyInterval],
+) -> bool {
     intervals
         .iter()
         .any(|i| min_key <= i.hi && max_key >= i.lo)
@@ -194,10 +204,11 @@ mod tests {
         for x in [10u32, 50] {
             for y in [10u32, 50] {
                 let point = DimensionVector::new(vec![x, y]);
-                let key = hilbert_key_for(&point, KeyConfig::STANDARD);
+                let key = HilbertKey(hilbert_key_for(&point, KeyConfig::STANDARD));
                 assert!(
                     key_in_intervals(key, &intervals),
-                    "corner ({x},{y}) key {key} not covered"
+                    "corner ({x},{y}) key {} not covered",
+                    key.raw()
                 );
             }
         }

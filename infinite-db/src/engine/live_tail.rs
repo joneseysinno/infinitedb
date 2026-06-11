@@ -6,6 +6,8 @@ use std::sync::Arc;
 use crate::infinitedb_core::{
     address::RevisionId,
     block::Record,
+    hilbert_key::HilbertKey,
+    record_identity::RecordIdentityKey,
     snapshot::BlockIndexEntry,
 };
 
@@ -54,15 +56,15 @@ impl LiveTailView {
     /// Publish a new sealed block and truncated tail atomically.
     pub fn seal(
         &self,
-        block_min_key: u128,
+        block_min_key: HilbertKey,
         entry: BlockIndexEntry,
-        sealed: &HashSet<(Vec<u32>, u64)>,
+        sealed: &HashSet<RecordIdentityKey>,
     ) {
         self.view.seal(block_min_key, entry, sealed);
     }
 
     /// Initialize sealed blocks from recovery.
-    pub fn init_blocks(&self, blocks: BTreeMap<u128, BlockIndexEntry>) {
+    pub fn init_blocks(&self, blocks: BTreeMap<HilbertKey, BlockIndexEntry>) {
         self.view.init_blocks(blocks);
     }
 

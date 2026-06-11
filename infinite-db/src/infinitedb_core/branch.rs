@@ -5,7 +5,7 @@ use super::address::RevisionId;
 use super::snapshot::SnapshotId;
 
 /// Stable identifier for a branch.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Encode, Decode)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, Encode, Decode)]
 pub struct BranchId(pub u64);
 
 impl BranchId {

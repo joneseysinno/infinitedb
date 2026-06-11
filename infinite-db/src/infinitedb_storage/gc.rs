@@ -45,6 +45,9 @@ pub fn apply_retention(records: Vec<Record>, policy: &RetentionPolicy) -> Vec<Re
     records
         .into_iter()
         .filter(|r| {
+            if policy.version_horizon > RevisionId::ZERO && r.revision < policy.version_horizon {
+                return false;
+            }
             // Drop tombstones older than the horizon.
             if r.tombstone && policy.tombstone_horizon > RevisionId::ZERO {
                 return r.revision >= policy.tombstone_horizon;
@@ -80,6 +83,7 @@ mod tests {
     use crate::infinitedb_core::{
         address::{Address, DimensionVector, RevisionId, SpaceId},
         block::Record,
+        hilbert_key::CachedHilbertKey,
     };
 
     fn make_record(rev: u64, tombstone: bool) -> Record {
@@ -88,7 +92,7 @@ mod tests {
             revision: RevisionId(rev),
             data: vec![],
             tombstone,
-            hilbert_key: 0,
+            hilbert_key: CachedHilbertKey::UNSET,
         }
     }
 
@@ -107,6 +111,22 @@ mod tests {
         // Only tombstone at rev 5 and the live record survive.
         assert_eq!(kept.len(), 2);
         assert!(kept.iter().all(|r| !r.tombstone || r.revision.0 >= 5));
+    }
+
+    #[test]
+    fn prunes_old_versions() {
+        let records = vec![
+            make_record(1, false),
+            make_record(3, false),
+            make_record(5, false),
+        ];
+        let policy = RetentionPolicy {
+            tombstone_horizon: RevisionId::ZERO,
+            version_horizon: RevisionId(3),
+        };
+        let kept = apply_retention(records, &policy);
+        assert_eq!(kept.len(), 2);
+        assert!(kept.iter().all(|r| r.revision.0 >= 3));
     }
 
     #[test]

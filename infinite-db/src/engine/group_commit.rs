@@ -109,17 +109,24 @@ pub fn commit_group_to_hot_segment(
         return Ok(());
     }
 
-    let revisions: Vec<u64> = group.jobs.iter().map(|j| j.revision.0).collect();
+    let revisions: Vec<crate::infinitedb_core::address::RevisionId> =
+        group.jobs.iter().map(|j| j.revision).collect();
     for entry in group.jobs.iter().map(WriteJob::entry) {
         let added = hot.append_frame(entry)?;
         hot.track_appended_bytes(added);
     }
-    hot.sync_group()?;
+    if let Err(e) = hot.sync_group() {
+        let msg = e.to_string();
+        for rev in &revisions {
+            watermark.retire_failed(*rev, &msg);
+        }
+        return Err(e);
+    }
 
     let records = group.into_records();
     live_tail.extend_chunk(records);
-    for rev in revisions {
-        watermark.retire(rev);
+    for rev in &revisions {
+        watermark.retire(*rev);
     }
     group_commits.fetch_add(1, Ordering::Relaxed);
     Ok(())

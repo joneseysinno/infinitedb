@@ -12,14 +12,14 @@ use crate::infinitedb_core::{
 
 /// Concurrent snapshot index (space_id → snapshot).
 pub struct SnapshotStore {
-    by_space: RwLock<BTreeMap<u64, Arc<Snapshot>>>,
+    by_space: RwLock<BTreeMap<SpaceId, Arc<Snapshot>>>,
 }
 
 impl SnapshotStore {
     pub fn new(initial: BTreeMap<u64, Snapshot>) -> Self {
         let mapped = initial
             .into_iter()
-            .map(|(k, v)| (k, Arc::new(v)))
+            .map(|(k, v)| (SpaceId(k), Arc::new(v)))
             .collect();
         Self {
             by_space: RwLock::new(mapped),
@@ -27,12 +27,12 @@ impl SnapshotStore {
     }
 
     pub fn get(&self, space: SpaceId) -> Option<Arc<Snapshot>> {
-        self.by_space.read().get(&space.0).cloned()
+        self.by_space.read().get(&space).cloned()
     }
 
     pub fn publish(&self, space: SpaceId, snapshot: Snapshot) -> Arc<Snapshot> {
         let arc = Arc::new(snapshot);
-        self.by_space.write().insert(space.0, arc.clone());
+        self.by_space.write().insert(space, arc.clone());
         arc
     }
 
@@ -42,16 +42,16 @@ impl SnapshotStore {
     {
         let mut guard = self.by_space.write();
         let snap = guard
-            .entry(space.0)
+            .entry(space)
             .or_insert_with(|| Arc::new(Snapshot::root(crate::infinitedb_core::snapshot::SnapshotId(1), space)));
         let mut updated = (**snap).clone();
         f(&mut updated);
         let arc = Arc::new(updated);
-        guard.insert(space.0, arc.clone());
+        guard.insert(space, arc.clone());
         arc
     }
 
-    pub fn all(&self) -> BTreeMap<u64, Arc<Snapshot>> {
+    pub fn all(&self) -> BTreeMap<SpaceId, Arc<Snapshot>> {
         self.by_space.read().clone()
     }
 }

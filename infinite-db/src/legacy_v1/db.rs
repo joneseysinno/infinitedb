@@ -40,6 +40,8 @@ use crate::infinitedb_core::{
     adapter::{AdapterEndpoint, KindLabel, SpaceBinding},
     address::{Address, DimensionVector, RevisionId, SpaceId},
     block::{Block, BlockId, Record},
+    checksum::Checksum,
+    hilbert_key::{CachedHilbertKey, HilbertKey},
     branch::{Branch, BranchId, BranchRegistry},
     endpoint_index::{
         decode_hyperedge_id, endpoint_index_point, endpoint_lookup_prefix,
@@ -409,7 +411,7 @@ impl LegacyDb {
             revision: rev,
             data,
             tombstone: false,
-            hilbert_key: 0,
+            hilbert_key: CachedHilbertKey::UNSET,
         });
         if !self.defer_auto_flush && self.buffer.len() >= self.flush_threshold {
             self.flush(space)?;
@@ -436,7 +438,7 @@ impl LegacyDb {
             revision: rev,
             data: vec![],
             tombstone: true,
-            hilbert_key: 0,
+            hilbert_key: CachedHilbertKey::UNSET,
         });
         Ok(rev)
     }
@@ -492,7 +494,7 @@ impl LegacyDb {
             revision: rev,
             data: vec![],
             tombstone: true,
-            hilbert_key: 0,
+            hilbert_key: CachedHilbertKey::UNSET,
         });
         if edge.is_some() && self.uses_centroid_keying(space) {
             self.tombstone_edge_locator(space, id)?;
@@ -690,7 +692,7 @@ impl LegacyDb {
             revision: rev,
             data,
             tombstone: false,
-            hilbert_key: 0,
+            hilbert_key: CachedHilbertKey::UNSET,
         });
         if !self.defer_auto_flush && self.buffer.len() >= self.flush_threshold {
             self.flush(space)?;
@@ -844,7 +846,7 @@ impl LegacyDb {
             records,
             min_revision: min_rev,
             max_revision: max_rev,
-            checksum: [0u8; 32],
+            checksum: Checksum::ZERO,
         };
         block.checksum = compute_checksum(&block)?;
 
@@ -862,16 +864,20 @@ impl LegacyDb {
         // Records are sorted by Hilbert key, so the first/last give the block's
         // key interval used for range pruning. Compute before borrowing the
         // snapshot mutably below.
-        let hilbert_min = block
-            .records
-            .first()
-            .map(|r| self.space_key(space, &r.address.point))
-            .unwrap_or(0);
-        let hilbert_max = block
-            .records
-            .last()
-            .map(|r| self.space_key(space, &r.address.point))
-            .unwrap_or(hilbert_min);
+        let hilbert_min = HilbertKey(
+            block
+                .records
+                .first()
+                .map(|r| self.space_key(space, &r.address.point))
+                .unwrap_or(0),
+        );
+        let hilbert_max = HilbertKey(
+            block
+                .records
+                .last()
+                .map(|r| self.space_key(space, &r.address.point))
+                .unwrap_or(hilbert_min.raw()),
+        );
 
         // Advance the space's active snapshot.
         let snapshot = self.snapshots.entry(space.0).or_insert_with(|| {
@@ -1072,7 +1078,9 @@ impl LegacyDb {
                     snapshot
                         .blocks
                         .iter()
-                        .filter(|(min_key, entry)| **min_key <= hi && entry.max_key >= lo)
+                        .filter(|(min_key, entry)| {
+                            **min_key <= HilbertKey(hi) && entry.max_key >= HilbertKey(lo)
+                        })
                         .map(|(_, entry)| entry.block_id)
                         .collect()
                 }
@@ -1236,6 +1244,7 @@ impl LegacyDb {
         let result = compact(
             input_blocks,
             config,
+            None,
             snapshot.id,
             || self.alloc_block_id(),
         );
@@ -1253,16 +1262,20 @@ impl LegacyDb {
         let mut updated = Snapshot::root(snapshot.id, space);
         updated.revision = snapshot.revision;
         for block in &new_blocks {
-            let min_key = block
-                .records
-                .first()
-                .map(|r| self.space_key(space, &r.address.point))
-                .unwrap_or(0);
-            let max_key = block
-                .records
-                .last()
-                .map(|r| self.space_key(space, &r.address.point))
-                .unwrap_or(min_key);
+            let min_key = HilbertKey(
+                block
+                    .records
+                    .first()
+                    .map(|r| self.space_key(space, &r.address.point))
+                    .unwrap_or(0),
+            );
+            let max_key = HilbertKey(
+                block
+                    .records
+                    .last()
+                    .map(|r| self.space_key(space, &r.address.point))
+                    .unwrap_or(min_key.raw()),
+            );
             updated.blocks.insert(
                 min_key,
                 BlockIndexEntry {
@@ -1433,10 +1446,10 @@ impl LegacyDb {
     fn apply_wal_entry(&mut self, entry: WalEntry) -> io::Result<()> {
         match entry {
             WalEntry::Write { address, revision, data } => {
-                self.buffer.push(Record { address, revision, data, tombstone: false, hilbert_key: 0 });
+                self.buffer.push(Record { address, revision, data, tombstone: false, hilbert_key: CachedHilbertKey::UNSET });
             }
             WalEntry::Tombstone { address, revision } => {
-                self.buffer.push(Record { address, revision, data: vec![], tombstone: true, hilbert_key: 0 });
+                self.buffer.push(Record { address, revision, data: vec![], tombstone: true, hilbert_key: CachedHilbertKey::UNSET });
             }
             WalEntry::BlockSealed { block_id, space, snapshot } => {
                 self.reconcile_sealed_block(block_id, space, snapshot)?;
@@ -1468,16 +1481,20 @@ impl LegacyDb {
             Err(_) => return Ok(()),
         };
 
-        let min_key = block
-            .records
-            .first()
-            .map(|r| self.space_key(space, &r.address.point))
-            .unwrap_or(0);
-        let max_key = block
-            .records
-            .last()
-            .map(|r| self.space_key(space, &r.address.point))
-            .unwrap_or(min_key);
+        let min_key = HilbertKey(
+            block
+                .records
+                .first()
+                .map(|r| self.space_key(space, &r.address.point))
+                .unwrap_or(0),
+        );
+        let max_key = HilbertKey(
+            block
+                .records
+                .last()
+                .map(|r| self.space_key(space, &r.address.point))
+                .unwrap_or(min_key.raw()),
+        );
         let block_max_rev = block.max_revision;
 
         let sealed: std::collections::HashSet<(Vec<u32>, u64)> = block
@@ -1687,7 +1704,8 @@ fn default_meta() -> MetaTuple {
 }
 
 fn hyperedge_point(id: HyperedgeId) -> DimensionVector {
-    DimensionVector::new(vec![(id.0 >> 32) as u32, (id.0 & 0xFFFF_FFFF) as u32])
+    use crate::infinitedb_core::coords::hyperedge_id_point;
+    DimensionVector::new(hyperedge_id_point(id.0).to_vec())
 }
 
 /// Reserved space mapping `(edge space, HyperedgeId)` → stored centroid point.
@@ -1697,12 +1715,8 @@ const HYPEREDGE_LOCATOR_DIMS: usize = 4;
 
 /// Deterministic locator key for an `(edge space, edge id)` pair.
 pub(super) fn locator_point(space: SpaceId, id: HyperedgeId) -> DimensionVector {
-    DimensionVector::new(vec![
-        (space.0 >> 32) as u32,
-        (space.0 & 0xFFFF_FFFF) as u32,
-        (id.0 >> 32) as u32,
-        (id.0 & 0xFFFF_FFFF) as u32,
-    ])
+    use crate::infinitedb_core::coords::hyperedge_locator_point;
+    DimensionVector::new(hyperedge_locator_point(space, id.0).to_vec())
 }
 
 /// Centroid-based storage point for a hyperedge: `[centroid…, id_hi, id_lo]`.
@@ -1803,8 +1817,8 @@ mod tests {
         let (min_key, entry) = snapshot.blocks.iter().next().unwrap();
         let ka = hilbert_key_standard(&p_lo);
         let kb = hilbert_key_standard(&p_hi);
-        assert_eq!(*min_key, ka.min(kb));
-        assert_eq!(entry.max_key, ka.max(kb));
+        assert_eq!(*min_key, HilbertKey(ka.min(kb)));
+        assert_eq!(entry.max_key, HilbertKey(ka.max(kb)));
     }
 
     #[test]
@@ -1903,7 +1917,7 @@ mod tests {
                 revision: rev,
                 data: vec![5],
                 tombstone: false,
-            hilbert_key: 0,
+            hilbert_key: CachedHilbertKey::UNSET,
             };
             let mut block = Block {
                 id: block_id,
@@ -1911,7 +1925,7 @@ mod tests {
                 records: vec![record],
                 min_revision: rev,
                 max_revision: rev,
-                checksum: [0u8; 32],
+                checksum: Checksum::ZERO,
             };
             block.checksum = compute_checksum(&block).unwrap();
             db.store.write_block(&block).unwrap();

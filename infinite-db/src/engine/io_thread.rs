@@ -13,6 +13,9 @@ use parking_lot::RwLock;
 use crate::infinitedb_core::{
     address::{RevisionId, SpaceId},
     block::{Block, BlockId},
+    checksum::Checksum,
+    hilbert_key::HilbertKey,
+    record_identity::RecordIdentityKey,
     snapshot::BlockIndexEntry,
     space::SpaceRegistry,
 };
@@ -22,9 +25,11 @@ use crate::infinitedb_storage::{
     wal::WalReader,
 };
 
-use super::compactor::maybe_compact_after_seal;
+use super::branch_overlay::BranchOverlayStore;
+use super::compactor::{maybe_compact_after_seal, CompactionPolicyOverrides};
 use super::group_commit::{commit_group_to_hot_segment, drain_write_group, migrate_staging_to_hot, WriteGroup};
 use super::live_tail::LiveTailView;
+use super::query::prepare_records_for_seal;
 use super::snapshot_store::SnapshotStore;
 use super::watermark::RevisionWatermark;
 use super::write_queue::{IoCommand, WriteQueueSender};
@@ -88,12 +93,16 @@ impl IoThreadHandle {
         rx: Receiver<IoCommand>,
         config: IoThreadConfig,
         watermark: Arc<RevisionWatermark>,
+        compaction_overrides: CompactionPolicyOverrides,
+        branch_overlays: Option<Arc<BranchOverlayStore>>,
     ) -> Self {
         let direct_writes = Arc::new(AtomicU64::new(0));
         let staged_writes = Arc::new(AtomicU64::new(0));
         let direct_clone = Arc::clone(&direct_writes);
         let staged_clone = Arc::clone(&staged_writes);
         let watermark_clone = Arc::clone(&watermark);
+        let overrides_clone = Arc::clone(&compaction_overrides);
+        let overlays_clone = branch_overlays;
 
         let join = thread::Builder::new()
             .name("infinitedb-io".into())
@@ -108,6 +117,8 @@ impl IoThreadHandle {
                     rx,
                     config,
                     watermark_clone,
+                    overrides_clone,
+                    overlays_clone,
                     direct_clone,
                     staged_clone,
                 )
@@ -148,6 +159,8 @@ pub fn open_io_pipeline(
     next_block_id: Arc<AtomicU64>,
     config: IoThreadConfig,
     watermark: Arc<RevisionWatermark>,
+    compaction_overrides: CompactionPolicyOverrides,
+    branch_overlays: Option<Arc<BranchOverlayStore>>,
 ) -> (WriteQueueSender, IoThreadHandle) {
     let (tx, rx) = WriteQueueSender::new(config.write_queue_capacity);
     let handle = IoThreadHandle::spawn(
@@ -160,6 +173,8 @@ pub fn open_io_pipeline(
         rx,
         config,
         watermark,
+        compaction_overrides,
+        branch_overlays,
     );
     (tx, handle)
 }
@@ -172,10 +187,12 @@ struct IoState {
     spaces: Arc<RwLock<SpaceRegistry>>,
     next_block_id: Arc<AtomicU64>,
     config: IoThreadConfig,
-    hot: HashMap<u64, HotSegment>,
-    hot_record_counts: HashMap<u64, usize>,
-    hot_committed_bytes: HashMap<u64, u64>,
+    hot: HashMap<SpaceId, HotSegment>,
+    hot_record_counts: HashMap<SpaceId, usize>,
+    hot_committed_bytes: HashMap<SpaceId, u64>,
     watermark: Arc<RevisionWatermark>,
+    compaction_overrides: CompactionPolicyOverrides,
+    branch_overlays: Option<Arc<BranchOverlayStore>>,
     pending_error: Option<io::Error>,
 }
 
@@ -189,6 +206,8 @@ fn run_io_loop(
     rx: Receiver<IoCommand>,
     config: IoThreadConfig,
     watermark: Arc<RevisionWatermark>,
+    compaction_overrides: CompactionPolicyOverrides,
+    branch_overlays: Option<Arc<BranchOverlayStore>>,
     group_commits: Arc<AtomicU64>,
     _staged_writes: Arc<AtomicU64>,
 ) -> io::Result<()> {
@@ -205,6 +224,8 @@ fn run_io_loop(
         hot_record_counts: HashMap::new(),
         hot_committed_bytes: HashMap::new(),
         watermark: Arc::clone(&watermark),
+        compaction_overrides,
+        branch_overlays,
         pending_error: None,
     };
 
@@ -213,12 +234,12 @@ fn run_io_loop(
         let entries = reader.entries()?;
         for entry in entries {
             if let Some(record) = wal_entry_to_record(entry.clone()) {
-                let space_id = record.address.space.0;
+                let space = record.address.space;
                 let hot = state
                     .hot
-                    .entry(space_id)
-                    .or_insert_with(|| HotSegment::open(root.clone(), space_id).expect("open hot"));
-                let rev = record.revision.0;
+                    .entry(space)
+                    .or_insert_with(|| HotSegment::open(root.clone(), space.0).expect("open hot"));
+                let rev = record.revision;
                 migrate_staging_to_hot(hot, std::slice::from_ref(&entry))?;
                 state.live_tail.append(record);
                 watermark.retire(rev);
@@ -233,19 +254,20 @@ fn run_io_loop(
             let entry = entry?;
             let name = entry.file_name().to_string_lossy().to_string();
             if let Some(stem) = name.strip_suffix(".seg") {
-                if let Ok(space_id) = stem.parse::<u64>() {
-                    let mut seg = HotSegment::open(state.root.clone(), space_id)?;
+                if let Ok(space_raw) = stem.parse::<u64>() {
+                    let space = SpaceId(space_raw);
+                    let mut seg = HotSegment::open(state.root.clone(), space_raw)?;
                     let records = seg.read_all_records()?;
-                    state.hot_record_counts.insert(space_id, records.len());
+                    state.hot_record_counts.insert(space, records.len());
                     state
                         .hot_committed_bytes
-                        .insert(space_id, seg.committed_bytes());
+                        .insert(space, seg.committed_bytes());
                     for record in records {
-                        let rev = record.revision.0;
+                        let rev = record.revision;
                         state.live_tail.append(record);
                         watermark.retire(rev);
                     }
-                    state.hot.insert(space_id, seg);
+                    state.hot.insert(space, seg);
                 }
             }
         }
@@ -291,22 +313,22 @@ fn commit_write_group(
     state: &mut IoState,
     group: WriteGroup,
     group_commits: &AtomicU64,
-) -> io::Result<Vec<u64>> {
+) -> io::Result<Vec<SpaceId>> {
     if group.is_empty() {
         return Ok(Vec::new());
     }
 
-    let mut by_space: HashMap<u64, WriteGroup> = HashMap::new();
+    let mut by_space: HashMap<SpaceId, WriteGroup> = HashMap::new();
     for job in group.jobs {
         by_space.entry(job.space_id()).or_default().jobs.push(job);
     }
 
-    let affected: Vec<u64> = by_space.keys().copied().collect();
-    for (space_id, space_group) in by_space {
+    let affected: Vec<SpaceId> = by_space.keys().copied().collect();
+    for (space, space_group) in by_space {
         let hot = state
             .hot
-            .entry(space_id)
-            .or_insert_with(|| HotSegment::open(state.root.clone(), space_id).expect("open hot"));
+            .entry(space)
+            .or_insert_with(|| HotSegment::open(state.root.clone(), space.0).expect("open hot"));
         let frame_bytes = space_group.frame_bytes;
         let record_count = space_group.jobs.len();
         match commit_group_to_hot_segment(
@@ -317,8 +339,8 @@ fn commit_write_group(
             group_commits,
         ) {
             Ok(()) => {
-                *state.hot_record_counts.entry(space_id).or_insert(0) += record_count;
-                *state.hot_committed_bytes.entry(space_id).or_insert(0) += frame_bytes as u64;
+                *state.hot_record_counts.entry(space).or_insert(0) += record_count;
+                *state.hot_committed_bytes.entry(space).or_insert(0) += frame_bytes as u64;
             }
             Err(e) => {
                 state.pending_error = Some(e);
@@ -343,10 +365,10 @@ fn handle_barrier(
                 .unwrap_or(Ok(()));
             let _ = done.send(result);
         }
-        IoCommand::Flush { space_id, done } => {
+        IoCommand::Flush { space, done } => {
             let result = match state.pending_error.take() {
                 Some(e) => Err(e),
-                None => seal_space(state, space_id),
+                None => seal_space(state, space),
             };
             let _ = done.send(result);
         }
@@ -357,41 +379,47 @@ fn handle_barrier(
     Ok(())
 }
 
-fn maybe_auto_seal(state: &mut IoState, space_id: u64) -> io::Result<()> {
-    let count = state.hot_record_counts.get(&space_id).copied().unwrap_or(0);
-    let bytes = state.hot_committed_bytes.get(&space_id).copied().unwrap_or(0);
+fn maybe_auto_seal(state: &mut IoState, space: SpaceId) -> io::Result<()> {
+    let count = state.hot_record_counts.get(&space).copied().unwrap_or(0);
+    let bytes = state.hot_committed_bytes.get(&space).copied().unwrap_or(0);
     if count >= state.config.hot_segment_seal_threshold
         || bytes >= state.config.hot_segment_seal_bytes as u64
     {
-        seal_space(state, space_id)?;
+        seal_space(state, space)?;
     }
     Ok(())
 }
 
-fn seal_space(state: &mut IoState, space_id: u64) -> io::Result<()> {
+fn seal_space(state: &mut IoState, space: SpaceId) -> io::Result<()> {
     let view = state.live_tail.load_view();
     let mut records: Vec<_> = view
         .tail_iter()
-        .filter(|r| r.address.space.0 == space_id)
+        .filter(|r| r.address.space == space)
         .cloned()
         .collect();
     if records.is_empty() {
         return Ok(());
     }
 
-    records.sort_by_key(|r| (r.hilbert_key, r.revision.0));
+    let spaces = state.spaces.read();
+    prepare_records_for_seal(&spaces, &mut records);
 
     let min_rev = records.iter().map(|r| r.revision).min().unwrap_or(RevisionId::ZERO);
     let max_rev = records.iter().map(|r| r.revision).max().unwrap_or(RevisionId::ZERO);
     let block_id = BlockId(state.next_block_id.fetch_add(1, Ordering::Relaxed));
-    let space = SpaceId(space_id);
 
-    let hilbert_min = records.first().map(|r| r.hilbert_key).unwrap_or(0);
-    let hilbert_max = records.last().map(|r| r.hilbert_key).unwrap_or(hilbert_min);
+    let hilbert_min = records
+        .first()
+        .and_then(|r| r.hilbert_key.get())
+        .unwrap_or(HilbertKey::ZERO);
+    let hilbert_max = records
+        .last()
+        .and_then(|r| r.hilbert_key.get())
+        .unwrap_or(hilbert_min);
 
-    let sealed: HashSet<(Vec<u32>, u64)> = records
+    let sealed: HashSet<RecordIdentityKey> = records
         .iter()
-        .map(|r| (r.address.point.coords.clone(), r.revision.0))
+        .map(RecordIdentityKey::from_record)
         .collect();
 
     let mut block = Block {
@@ -400,7 +428,7 @@ fn seal_space(state: &mut IoState, space_id: u64) -> io::Result<()> {
         records,
         min_revision: min_rev,
         max_revision: max_rev,
-        checksum: [0u8; 32],
+        checksum: Checksum::ZERO,
     };
     block.checksum = compute_checksum(&block)?;
     state.store.write_block(&block)?;
@@ -418,11 +446,11 @@ fn seal_space(state: &mut IoState, space_id: u64) -> io::Result<()> {
         }
     });
 
-    if let Some(hot) = state.hot.get_mut(&space_id) {
+    if let Some(hot) = state.hot.get_mut(&space) {
         hot.reset()?;
     }
-    state.hot_record_counts.insert(space_id, 0);
-    state.hot_committed_bytes.insert(space_id, hot_header_len());
+    state.hot_record_counts.insert(space, 0);
+    state.hot_committed_bytes.insert(space, hot_header_len());
 
     maybe_compact_after_seal(
         &state.store,
@@ -432,6 +460,8 @@ fn seal_space(state: &mut IoState, space_id: u64) -> io::Result<()> {
         &state.next_block_id,
         space,
         None,
+        Some(&state.compaction_overrides),
+        state.branch_overlays.as_deref(),
     )?;
 
     Ok(())

@@ -6,6 +6,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use crate::infinitedb_core::{
     address::{DimensionVector, RevisionId, SpaceId},
     block::Record,
+    hilbert_key::{CachedHilbertKey, HilbertKey},
+    record_identity::AddressKey,
     snapshot::BlockIndexEntry,
     space::SpaceRegistry,
 };
@@ -15,7 +17,7 @@ use crate::infinitedb_index::range_decompose::{
     block_overlaps_intervals, decompose_bbox, key_in_intervals, KeyInterval,
 };
 
-use super::hilbert_shard::hilbert_shard_id;
+use super::hilbert_shard::{hilbert_shard_id, ShardRef};
 use crate::infinitedb_storage::nvme::BlockStore;
 
 use crate::infinitedb_core::branch::BranchId;
@@ -27,19 +29,19 @@ use super::snapshot_store::SnapshotStore;
 use super::space_live_tails::SpaceLiveTails;
 
 /// Return the cached Hilbert key on `record`, or compute it when unset (legacy blocks).
-pub fn record_hilbert_key(spaces: &SpaceRegistry, record: &Record) -> u128 {
-    if record.hilbert_key != 0 {
-        record.hilbert_key
+pub fn record_hilbert_key(spaces: &SpaceRegistry, record: &Record) -> HilbertKey {
+    if let Some(k) = record.hilbert_key.get() {
+        k
     } else {
-        space_key(spaces, record.address.space, &record.address.point)
+        HilbertKey(space_key(spaces, record.address.space, &record.address.point))
     }
 }
 
-fn record_hilbert_key_uncached(record: &Record) -> u128 {
-    if record.hilbert_key != 0 {
-        record.hilbert_key
+fn record_hilbert_key_uncached(record: &Record) -> HilbertKey {
+    if let Some(k) = record.hilbert_key.get() {
+        k
     } else {
-        hilbert_key_standard(&record.address.point)
+        HilbertKey(hilbert_key_standard(&record.address.point))
     }
 }
 
@@ -52,24 +54,42 @@ pub fn space_key(spaces: &SpaceRegistry, space: SpaceId, point: &DimensionVector
     }
 }
 
+/// Ensure `record` carries a cached Hilbert key, computing from coordinates when unset.
+pub fn ensure_record_hilbert_key(spaces: &SpaceRegistry, record: &mut Record) -> HilbertKey {
+    if let Some(k) = record.hilbert_key.get() {
+        return k;
+    }
+    let k = HilbertKey(space_key(spaces, record.address.space, &record.address.point));
+    record.hilbert_key = CachedHilbertKey::set(k);
+    k
+}
+
+/// Resolve Hilbert keys and sort records for block seal.
+pub fn prepare_records_for_seal(spaces: &SpaceRegistry, records: &mut [Record]) {
+    for record in records.iter_mut() {
+        ensure_record_hilbert_key(spaces, record);
+    }
+    records.sort_by_key(|r| (r.hilbert_key.get().unwrap(), r.revision));
+}
+
 fn live_tail_for_space(
     space: SpaceId,
     live_tail: Option<&LiveTailView>,
     space_live_tails: Option<&SpaceLiveTails>,
     hilbert_live_tails: Option<&HilbertLiveTails>,
-    shard_filter: Option<(u32, u32)>,
+    shard_filter: Option<ShardRef>,
 ) -> Vec<Record> {
     if let Some(hilbert) = hilbert_live_tails {
-        let views = hilbert.views_for_space(space.0);
+        let views = hilbert.views_for_space(space);
         if !views.is_empty() {
             let mut records = Vec::new();
             for view in views {
-                if let Some((shard_id, shard_bits)) = shard_filter {
+                if let Some(shard) = shard_filter {
                     let has_records = view.tail_iter().any(|r| {
-                        hilbert_shard_id(record_hilbert_key_uncached(r), shard_bits) == shard_id
+                        shard.contains_key(record_hilbert_key_uncached(r))
                     });
                     let has_blocks = view.blocks.iter().any(|(min_key, _)| {
-                        hilbert_shard_id(*min_key, shard_bits) == shard_id
+                        shard.contains_key(*min_key)
                     });
                     if !has_records && !has_blocks {
                         continue;
@@ -85,7 +105,7 @@ fn live_tail_for_space(
     }
     if let Some(tails) = space_live_tails {
         return tails
-            .get(space.0)
+            .get(space)
             .map(|t| t.snapshot())
             .unwrap_or_default();
     }
@@ -100,8 +120,25 @@ fn live_tail_for_space(
 #[derive(Clone, Copy)]
 enum KeyFilter<'a> {
     All,
-    Single(u128, u128),
+    Single(HilbertKey, HilbertKey),
     Intervals(&'a [KeyInterval]),
+}
+
+fn block_entries_from_snapshot(
+    snapshot: &crate::infinitedb_core::snapshot::Snapshot,
+    key_filter: KeyFilter<'_>,
+) -> Vec<(HilbertKey, BlockIndexEntry)> {
+    let overlaps = |min_key: HilbertKey, max_key: HilbertKey| match key_filter {
+        KeyFilter::All => true,
+        KeyFilter::Single(lo, hi) => min_key <= hi && max_key >= lo,
+        KeyFilter::Intervals(intervals) => block_overlaps_intervals(min_key, max_key, intervals),
+    };
+    snapshot
+        .blocks
+        .iter()
+        .filter(|(min_key, entry)| overlaps(**min_key, entry.max_key))
+        .map(|(k, e)| (*k, e.clone()))
+        .collect()
 }
 
 fn block_entries_for_space(
@@ -111,24 +148,24 @@ fn block_entries_for_space(
     live_tail: Option<&LiveTailView>,
     space_live_tails: Option<&SpaceLiveTails>,
     hilbert_live_tails: Option<&HilbertLiveTails>,
-    shard_filter: Option<(u32, u32)>,
-) -> Vec<(u128, BlockIndexEntry)> {
-    let overlaps = |min_key: u128, max_key: u128| match key_filter {
+    shard_filter: Option<ShardRef>,
+) -> Vec<(HilbertKey, BlockIndexEntry)> {
+    let overlaps = |min_key: HilbertKey, max_key: HilbertKey| match key_filter {
         KeyFilter::All => true,
         KeyFilter::Single(lo, hi) => min_key <= hi && max_key >= lo,
         KeyFilter::Intervals(intervals) => block_overlaps_intervals(min_key, max_key, intervals),
     };
 
     if let Some(hilbert) = hilbert_live_tails {
-        let views = hilbert.views_for_space(space.0);
+        let views = hilbert.views_for_space(space);
         if !views.is_empty() {
             let mut entries = Vec::new();
             for view in views {
-                if let Some((shard_id, shard_bits)) = shard_filter {
+                if let Some(shard) = shard_filter {
                     let shard_match = view.blocks.iter().any(|(min_key, _)| {
-                        hilbert_shard_id(*min_key, shard_bits) == shard_id
+                        shard.contains_key(*min_key)
                     }) || view.tail_iter().any(|r| {
-                        hilbert_shard_id(record_hilbert_key_uncached(r), shard_bits) == shard_id
+                        shard.contains_key(record_hilbert_key_uncached(r))
                     });
                     if !shard_match {
                         continue;
@@ -144,7 +181,7 @@ fn block_entries_for_space(
         }
     }
     if let Some(tails) = space_live_tails {
-        if let Some(tail) = tails.get(space.0) {
+        if let Some(tail) = tails.get(space) {
             let view = tail.load_view();
             return view
                 .blocks
@@ -189,7 +226,7 @@ fn record_matches_filter(
     }
 }
 
-/// Apply latest-wins visibility per address coordinate.
+/// Apply latest-wins visibility per address identity.
 ///
 /// An address is visible iff its highest revision at or below `rev_ceiling` is a
 /// live record; that record is the one returned. When `include_tombstones` is true,
@@ -203,18 +240,18 @@ fn resolve_visibility(
         return candidates;
     }
 
-    let mut latest: HashMap<Vec<u32>, Record> = HashMap::new();
+    let mut latest: HashMap<AddressKey, Record> = HashMap::new();
     for record in candidates {
         if record.revision > rev_ceiling {
             continue;
         }
-        let coords = record.address.point.coords.clone();
-        let replace = match latest.get(&coords) {
+        let key = AddressKey::from_record(&record);
+        let replace = match latest.get(&key) {
             None => true,
             Some(existing) => record.revision > existing.revision,
         };
         if replace {
-            latest.insert(coords, record);
+            latest.insert(key, record);
         }
     }
 
@@ -248,33 +285,69 @@ pub fn query_inner(
 
     let key_filter = match key_range {
         None => KeyFilter::All,
-        Some((lo, hi)) => KeyFilter::Single(lo, hi),
+        Some((lo, hi)) => KeyFilter::Single(HilbertKey(lo), HilbertKey(hi)),
     };
 
-    let mut tail = live_tail_for_space(
-        space,
-        live_tail,
-        space_live_tails,
-        hilbert_live_tails,
-        None,
-    );
-    if let (Some(overlays), Some(branch)) = (branch_overlays, branch_id) {
-        if branch != BranchId::MAIN {
-            tail.extend(overlays.live_records(branch, space));
+    let on_branch = branch_id.is_some_and(|b| b != BranchId::MAIN);
+
+    let tail = if on_branch {
+        match (branch_overlays, branch_id) {
+            (Some(overlays), Some(branch)) => overlays.live_records(branch, space),
+            _ => Vec::new(),
         }
-    }
+    } else {
+        live_tail_for_space(
+            space,
+            live_tail,
+            space_live_tails,
+            hilbert_live_tails,
+            None,
+        )
+    };
 
     let mut candidates: Vec<Record> = Vec::new();
 
-    let block_entries = block_entries_for_space(
-        space,
-        snapshots,
-        key_filter,
-        live_tail,
-        space_live_tails,
-        hilbert_live_tails,
-        None,
-    );
+    let block_entries = if let (Some(overlays), Some(branch)) = (branch_overlays, branch_id) {
+        if branch != BranchId::MAIN {
+            let mut entries = overlays
+                .base_snapshot(branch, space)
+                .map(|base| block_entries_from_snapshot(base.as_ref(), key_filter))
+                .unwrap_or_default();
+            for (min_key, entry) in overlays.sealed_blocks(branch, space) {
+                let overlaps = match key_filter {
+                    KeyFilter::All => true,
+                    KeyFilter::Single(lo, hi) => min_key <= hi && entry.max_key >= lo,
+                    KeyFilter::Intervals(intervals) => {
+                        block_overlaps_intervals(min_key, entry.max_key, intervals)
+                    }
+                };
+                if overlaps {
+                    entries.push((min_key, entry));
+                }
+            }
+            entries
+        } else {
+            block_entries_for_space(
+                space,
+                snapshots,
+                key_filter,
+                live_tail,
+                space_live_tails,
+                hilbert_live_tails,
+                None,
+            )
+        }
+    } else {
+        block_entries_for_space(
+            space,
+            snapshots,
+            key_filter,
+            live_tail,
+            space_live_tails,
+            hilbert_live_tails,
+            None,
+        )
+    };
     for (_, entry) in block_entries {
         let block = store.read_block_shared(entry.block_id)?;
         for record in block.records.iter() {
@@ -321,48 +394,84 @@ pub fn query_bbox(
         .get(space)
         .map(|c| c.bits_per_dim)
         .unwrap_or(8);
-    let shard_bits = spaces.get(space).map(|c| c.shard_bits);
+    let shard_bits = Some(ShardRef::shard_bits_for_space(spaces, space));
     let intervals = decompose_bbox(&min, &max, bits);
     let rev_ceiling = as_of.unwrap_or_else(|| RevisionId(revision.load(Ordering::Acquire)));
 
     let shard_filter = shard_bits.map(|sb| {
         let mut shard_ids = std::collections::BTreeSet::new();
         for interval in &intervals {
-            shard_ids.insert(hilbert_shard_id(interval.lo, sb));
-            shard_ids.insert(hilbert_shard_id(interval.hi, sb));
+            shard_ids.insert(hilbert_shard_id(interval.lo.raw(), sb));
+            shard_ids.insert(hilbert_shard_id(interval.hi.raw(), sb));
         }
         shard_ids
     });
 
-    let mut tail = live_tail_for_space(
-        space,
-        live_tail,
-        space_live_tails,
-        hilbert_live_tails,
-        None,
-    );
-    if let (Some(overlays), Some(branch)) = (branch_overlays, branch_id) {
-        if branch != BranchId::MAIN {
-            tail.extend(overlays.live_records(branch, space));
+    let on_branch = branch_id.is_some_and(|b| b != BranchId::MAIN);
+    let key_filter = KeyFilter::Intervals(&intervals);
+
+    let tail = if on_branch {
+        match (branch_overlays, branch_id) {
+            (Some(overlays), Some(branch)) => overlays.live_records(branch, space),
+            _ => Vec::new(),
         }
-    }
+    } else {
+        live_tail_for_space(
+            space,
+            live_tail,
+            space_live_tails,
+            hilbert_live_tails,
+            None,
+        )
+    };
 
     let mut candidates = Vec::new();
-    let block_entries = block_entries_for_space(
-        space,
-        snapshots,
-        KeyFilter::Intervals(&intervals),
-        live_tail,
-        space_live_tails,
-        hilbert_live_tails,
-        shard_bits.map(|sb| {
-            let first = intervals
-                .first()
-                .map(|i| hilbert_shard_id(i.lo, sb))
-                .unwrap_or(0);
-            (first, sb)
-        }),
-    );
+    let block_entries = if let (Some(overlays), Some(branch)) = (branch_overlays, branch_id) {
+        if branch != BranchId::MAIN {
+            let mut entries = overlays
+                .base_snapshot(branch, space)
+                .map(|base| block_entries_from_snapshot(base.as_ref(), key_filter))
+                .unwrap_or_default();
+            for (min_key, entry) in overlays.sealed_blocks(branch, space) {
+                if block_overlaps_intervals(min_key, entry.max_key, &intervals) {
+                    entries.push((min_key, entry));
+                }
+            }
+            entries
+        } else {
+            block_entries_for_space(
+                space,
+                snapshots,
+                key_filter,
+                live_tail,
+                space_live_tails,
+                hilbert_live_tails,
+                shard_bits.map(|sb| {
+                    let first = intervals
+                        .first()
+                        .map(|i| hilbert_shard_id(i.lo.raw(), sb))
+                        .unwrap_or(0);
+                    ShardRef::new(first, sb)
+                }),
+            )
+        }
+    } else {
+        block_entries_for_space(
+            space,
+            snapshots,
+            key_filter,
+            live_tail,
+            space_live_tails,
+            hilbert_live_tails,
+            shard_bits.map(|sb| {
+                let first = intervals
+                    .first()
+                    .map(|i| hilbert_shard_id(i.lo.raw(), sb))
+                    .unwrap_or(0);
+                ShardRef::new(first, sb)
+            }),
+        )
+    };
     for (_, entry) in block_entries {
         let block = store.read_block_shared(entry.block_id)?;
         for record in block.records.iter() {
@@ -380,8 +489,8 @@ pub fn query_bbox(
             continue;
         }
         if let Some(ref shards) = shard_filter {
-            let sb = spaces.get(space).map(|c| c.shard_bits).unwrap_or(4);
-            let sid = hilbert_shard_id(record_hilbert_key(spaces, &record), sb);
+            let sb = ShardRef::shard_bits_for_space(spaces, space);
+            let sid = hilbert_shard_id(record_hilbert_key(spaces, &record).raw(), sb);
             if !shards.contains(&sid) {
                 continue;
             }
@@ -401,6 +510,6 @@ pub fn snapshots_map_for_persist(snapshots: &SnapshotStore) -> BTreeMap<u64, cra
     snapshots
         .all()
         .into_iter()
-        .map(|(k, v)| (k, (*v).clone()))
+        .map(|(k, v)| (k.0, (*v).clone()))
         .collect()
 }

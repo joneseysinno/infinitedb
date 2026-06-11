@@ -85,8 +85,7 @@ fn enqueue_batch_cross_space() {
     use infinite_db::WriteJob;
     use infinite_db::infinitedb_storage::wal::WalEntry;
 
-    let rev1 = infinite_db::infinitedb_core::address::RevisionId(1);
-    let rev2 = infinite_db::infinitedb_core::address::RevisionId(2);
+    let (rev1, rev2) = db.allocate_revisions(2);
 
     let jobs = vec![
         WriteJob {
@@ -97,7 +96,7 @@ fn enqueue_batch_cross_space() {
                 revision: rev1,
                 data: vec![1],
             },
-            hilbert_key: 0,
+            hilbert_key: infinite_db::infinitedb_core::hilbert_key::HilbertKey::ZERO,
         },
         WriteJob {
             branch_id: BranchId::MAIN,
@@ -107,7 +106,7 @@ fn enqueue_batch_cross_space() {
                 revision: rev2,
                 data: vec![2],
             },
-            hilbert_key: 0,
+            hilbert_key: infinite_db::infinitedb_core::hilbert_key::HilbertKey::ZERO,
         },
     ];
 

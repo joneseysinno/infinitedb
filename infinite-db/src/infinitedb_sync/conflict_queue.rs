@@ -11,6 +11,7 @@ use crate::infinitedb_core::{
     address::RevisionId,
     block::Record,
     branch::BranchId,
+    hilbert_key::CachedHilbertKey,
     merge::MergeConflict,
 };
 
@@ -133,7 +134,7 @@ pub fn resolution_record(conflict: &MergeConflict, data: Vec<u8>, revision: Revi
         revision,
         data,
         tombstone: false,
-        hilbert_key: 0,
+        hilbert_key: CachedHilbertKey::UNSET,
     }
 }
 
@@ -144,6 +145,6 @@ pub fn resolution_tombstone(conflict: &MergeConflict, revision: RevisionId) -> R
         revision,
         data: vec![],
         tombstone: true,
-        hilbert_key: 0,
+        hilbert_key: CachedHilbertKey::UNSET,
     }
 }

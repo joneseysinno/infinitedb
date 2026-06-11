@@ -13,6 +13,9 @@ use parking_lot::RwLock;
 use crate::infinitedb_core::{
     address::{RevisionId, SpaceId},
     block::{Block, BlockId},
+    checksum::Checksum,
+    hilbert_key::HilbertKey,
+    record_identity::RecordIdentityKey,
     snapshot::BlockIndexEntry,
     space::SpaceRegistry,
 };
@@ -22,9 +25,11 @@ use crate::infinitedb_storage::{
     wal::WalReader,
 };
 
-use super::compactor::maybe_compact_after_seal;
+use super::branch_overlay::BranchOverlayStore;
+use super::compactor::{maybe_compact_after_seal, CompactionPolicyOverrides};
 use super::group_commit::{commit_group_to_hot_segment, drain_write_group, migrate_staging_to_hot, WriteGroup};
-use super::hilbert_shard::hilbert_shard_id;
+use super::hilbert_shard::ShardRef;
+use super::query::prepare_records_for_seal;
 use super::io_thread::IoThreadConfig;
 use super::live_tail::LiveTailView;
 use super::snapshot_store::SnapshotStore;
@@ -48,14 +53,18 @@ impl SpaceIoHandle {
         next_block_id: Arc<AtomicU64>,
         rx: Receiver<IoCommand>,
         config: IoThreadConfig,
-        shard_filter: Option<(u32, u32)>,
+        shard_filter: Option<ShardRef>,
         watermark: Arc<RevisionWatermark>,
+        compaction_overrides: CompactionPolicyOverrides,
+        branch_overlays: Option<Arc<BranchOverlayStore>>,
     ) -> Self {
         let direct_writes = Arc::new(AtomicU64::new(0));
         let staged_writes = Arc::new(AtomicU64::new(0));
         let direct_clone = Arc::clone(&direct_writes);
         let staged_clone = Arc::clone(&staged_writes);
         let watermark_clone = Arc::clone(&watermark);
+        let overrides_clone = Arc::clone(&compaction_overrides);
+        let overlays_clone = branch_overlays;
 
         let name = format!("infinitedb-io-{space_id}");
         let join = thread::Builder::new()
@@ -73,6 +82,8 @@ impl SpaceIoHandle {
                     config,
                     shard_filter,
                     watermark_clone,
+                    overrides_clone,
+                    overlays_clone,
                     direct_clone,
                     staged_clone,
                 )
@@ -113,8 +124,10 @@ pub fn open_space_pipeline(
     spaces: Arc<RwLock<SpaceRegistry>>,
     next_block_id: Arc<AtomicU64>,
     config: IoThreadConfig,
-    shard_filter: Option<(u32, u32)>,
+    shard_filter: Option<ShardRef>,
     watermark: Arc<RevisionWatermark>,
+    compaction_overrides: CompactionPolicyOverrides,
+    branch_overlays: Option<Arc<BranchOverlayStore>>,
 ) -> (WriteQueueSender, SpaceIoHandle) {
     let (tx, rx) = WriteQueueSender::new(config.write_queue_capacity);
     let handle = SpaceIoHandle::spawn(
@@ -129,6 +142,8 @@ pub fn open_space_pipeline(
         config,
         shard_filter,
         watermark,
+        compaction_overrides,
+        branch_overlays,
     );
     (tx, handle)
 }
@@ -145,8 +160,10 @@ struct SpaceIoState {
     hot: HotSegment,
     hot_record_count: usize,
     hot_committed_bytes: u64,
-    shard_filter: Option<(u32, u32)>,
+    shard_filter: Option<ShardRef>,
     watermark: Arc<RevisionWatermark>,
+    compaction_overrides: CompactionPolicyOverrides,
+    branch_overlays: Option<Arc<BranchOverlayStore>>,
     pending_error: Option<io::Error>,
 }
 
@@ -160,8 +177,10 @@ fn run_space_io_loop(
     next_block_id: Arc<AtomicU64>,
     rx: Receiver<IoCommand>,
     config: IoThreadConfig,
-    shard_filter: Option<(u32, u32)>,
+    shard_filter: Option<ShardRef>,
     watermark: Arc<RevisionWatermark>,
+    compaction_overrides: CompactionPolicyOverrides,
+    branch_overlays: Option<Arc<BranchOverlayStore>>,
     group_commits: Arc<AtomicU64>,
     _staged_writes: Arc<AtomicU64>,
 ) -> io::Result<()> {
@@ -180,6 +199,8 @@ fn run_space_io_loop(
         hot_committed_bytes: 0,
         shard_filter,
         watermark: Arc::clone(&watermark),
+        compaction_overrides,
+        branch_overlays,
         pending_error: None,
     };
 
@@ -190,7 +211,7 @@ fn run_space_io_loop(
         let entries = reader.entries()?;
         for entry in entries {
             if let Some(record) = wal_entry_to_record(entry.clone()) {
-                let rev = record.revision.0;
+                let rev = record.revision;
                 migrate_staging_to_hot(&mut state.hot, std::slice::from_ref(&entry))?;
                 live_tail.append(record);
                 watermark.retire(rev);
@@ -203,7 +224,7 @@ fn run_space_io_loop(
     state.hot_record_count = records.len();
     state.hot_committed_bytes = state.hot.committed_bytes();
     for record in records {
-        let rev = record.revision.0;
+        let rev = record.revision;
         live_tail.append(record);
         watermark.retire(rev);
     }
@@ -279,8 +300,8 @@ fn handle_space_barrier(state: &mut SpaceIoState, cmd: IoCommand) -> io::Result<
                 .unwrap_or(Ok(()));
             let _ = done.send(result);
         }
-        IoCommand::Flush { space_id, done } => {
-            debug_assert_eq!(space_id, state.space_id);
+        IoCommand::Flush { space, done } => {
+            debug_assert_eq!(space.0, state.space_id);
             let result = match state.pending_error.take() {
                 Some(e) => Err(e),
                 None => seal_space(state),
@@ -309,19 +330,28 @@ fn seal_space(state: &mut SpaceIoState) -> io::Result<()> {
         return Ok(());
     }
 
-    records.sort_by_key(|r| (r.hilbert_key, r.revision.0));
+    {
+        let spaces = state.spaces.read();
+        prepare_records_for_seal(&spaces, &mut records);
+    }
 
     let min_rev = records.iter().map(|r| r.revision).min().unwrap_or(RevisionId::ZERO);
     let max_rev = records.iter().map(|r| r.revision).max().unwrap_or(RevisionId::ZERO);
     let block_id = BlockId(state.next_block_id.fetch_add(1, Ordering::Relaxed));
     let space = SpaceId(state.space_id);
 
-    let hilbert_min = records.first().map(|r| r.hilbert_key).unwrap_or(0);
-    let hilbert_max = records.last().map(|r| r.hilbert_key).unwrap_or(hilbert_min);
+    let hilbert_min = records
+        .first()
+        .and_then(|r| r.hilbert_key.get())
+        .unwrap_or(HilbertKey::ZERO);
+    let hilbert_max = records
+        .last()
+        .and_then(|r| r.hilbert_key.get())
+        .unwrap_or(hilbert_min);
 
-    let sealed: HashSet<(Vec<u32>, u64)> = records
+    let sealed: HashSet<RecordIdentityKey> = records
         .iter()
-        .map(|r| (r.address.point.coords.clone(), r.revision.0))
+        .map(RecordIdentityKey::from_record)
         .collect();
 
     let mut block = Block {
@@ -330,7 +360,7 @@ fn seal_space(state: &mut SpaceIoState) -> io::Result<()> {
         records,
         min_revision: min_rev,
         max_revision: max_rev,
-        checksum: [0u8; 32],
+        checksum: Checksum::ZERO,
     };
     block.checksum = compute_checksum(&block)?;
     state.store.write_block(&block)?;
@@ -361,6 +391,8 @@ fn seal_space(state: &mut SpaceIoState) -> io::Result<()> {
         &state.next_block_id,
         space,
         state.shard_filter,
+        Some(&state.compaction_overrides),
+        state.branch_overlays.as_deref(),
     )?;
 
     Ok(())
@@ -370,18 +402,18 @@ pub fn bootstrap_live_tail_blocks(
     live_tail: &LiveTailView,
     snapshots: &SnapshotStore,
     space_id: u64,
-    shard_filter: Option<(u32, u32)>,
+    shard_filter: Option<ShardRef>,
 ) {
     let space = SpaceId(space_id);
     let Some(snap) = snapshots.get(space) else {
         return;
     };
-    let blocks: BTreeMap<u128, BlockIndexEntry> = snap
+    let blocks: BTreeMap<HilbertKey, BlockIndexEntry> = snap
         .blocks
         .iter()
         .filter(|(min_key, _)| match shard_filter {
             None => true,
-            Some((shard_id, shard_bits)) => hilbert_shard_id(**min_key, shard_bits) == shard_id,
+            Some(shard) => shard.contains_key(**min_key),
         })
         .map(|(k, v)| (*k, v.clone()))
         .collect();

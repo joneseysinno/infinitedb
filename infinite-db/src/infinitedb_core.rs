@@ -36,3 +36,13 @@ pub mod kind_catalog;
 pub mod snapshot;
 /// Space registration and configuration.
 pub mod space;
+/// Named database counter persistence.
+pub mod persisted_counters;
+/// Hilbert key newtype and cached-key state.
+pub mod hilbert_key;
+/// Blake3 checksum newtype.
+pub mod checksum;
+/// Record/address identity keys for grouping.
+pub mod record_identity;
+/// Legacy coordinate packing codecs.
+pub mod coords;

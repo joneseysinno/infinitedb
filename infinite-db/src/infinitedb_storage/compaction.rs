@@ -12,11 +12,12 @@
 
 use std::collections::BTreeMap;
 use crate::infinitedb_core::{
-    address::RevisionId,
+    address::{RevisionId, SpaceId},
     block::{Block, BlockId, Record},
+    checksum::Checksum,
     snapshot::SnapshotId,
-    address::SpaceId,
 };
+use super::gc::{apply_retention, RetentionPolicy};
 
 /// Configuration for a compaction run.
 #[derive(Debug, Clone)]
@@ -53,6 +54,7 @@ pub struct CompactionResult {
 pub fn compact<F>(
     input_blocks: Vec<Block>,
     config: &CompactionConfig,
+    retention: Option<&RetentionPolicy>,
     _snapshot: SnapshotId,
     mut next_block_id: F,
 ) -> CompactionResult
@@ -80,6 +82,10 @@ where
             .then_with(|| a.revision.cmp(&b.revision))
     });
 
+    if let Some(policy) = retention {
+        all = apply_retention(all, policy);
+    }
+
     // Optionally deduplicate: keep only the latest revision per address.
     let records: Vec<Record> = if config.retain_history {
         all
@@ -104,7 +110,7 @@ where
                 records: chunk,
                 min_revision: min_rev,
                 max_revision: max_rev,
-                checksum: [0u8; 32], // computed by nvme::compute_checksum before writing
+                checksum: Checksum::ZERO, // computed by nvme::compute_checksum before writing
             }
         })
         .collect();
@@ -118,6 +124,7 @@ mod tests {
     use crate::infinitedb_core::{
         address::{Address, DimensionVector, RevisionId, SpaceId},
         block::Record,
+        hilbert_key::CachedHilbertKey,
         snapshot::SnapshotId,
     };
 
@@ -127,7 +134,7 @@ mod tests {
             revision: RevisionId(rev),
             data: vec![],
             tombstone,
-            hilbert_key: 0,
+            hilbert_key: CachedHilbertKey::UNSET,
         }
     }
 
@@ -138,7 +145,7 @@ mod tests {
             min_revision: RevisionId(0),
             max_revision: RevisionId(99),
             records,
-            checksum: [0u8; 32],
+            checksum: Checksum::ZERO,
         }
     }
 
@@ -152,6 +159,7 @@ mod tests {
         let result = compact(
             blocks,
             &CompactionConfig::default(),
+            None,
             SnapshotId(1),
             || { let id = BlockId(next_id); next_id += 1; id },
         );
@@ -171,6 +179,7 @@ mod tests {
         let result = compact(
             blocks,
             &config,
+            None,
             SnapshotId(1),
             || { let id = BlockId(next_id); next_id += 1; id },
         );

@@ -9,6 +9,8 @@ use arc_swap::ArcSwap;
 use crate::infinitedb_core::{
     address::RevisionId,
     block::Record,
+    hilbert_key::HilbertKey,
+    record_identity::RecordIdentityKey,
     snapshot::BlockIndexEntry,
 };
 
@@ -19,7 +21,7 @@ pub type TailChunk = Arc<Vec<Record>>;
 #[derive(Debug, Clone)]
 pub struct ShardView {
     /// Sealed blocks contributed by this shard (Hilbert min key → index entry).
-    pub blocks: Arc<BTreeMap<u128, BlockIndexEntry>>,
+    pub blocks: Arc<BTreeMap<HilbertKey, BlockIndexEntry>>,
     /// Append-only chunks of records not yet sealed into a block.
     pub tail_chunks: Arc<Vec<TailChunk>>,
 }
@@ -110,16 +112,16 @@ impl ShardViewHandle {
     /// Publish a new block and truncated tail in one swap.
     pub fn seal(
         &self,
-        block_min_key: u128,
+        block_min_key: HilbertKey,
         entry: BlockIndexEntry,
-        sealed: &HashSet<(Vec<u32>, u64)>,
+        sealed: &HashSet<RecordIdentityKey>,
     ) {
         let current = self.view.load();
         let mut blocks = current.blocks.as_ref().clone();
         blocks.insert(block_min_key, entry);
         let remainder: Vec<Record> = current
             .tail_iter()
-            .filter(|r| !sealed.contains(&(r.address.point.coords.clone(), r.revision.0)))
+            .filter(|r| !sealed.contains(&RecordIdentityKey::from_record(r)))
             .cloned()
             .collect();
         let chunks = if remainder.is_empty() {
@@ -155,7 +157,7 @@ impl ShardViewHandle {
     }
 
     /// Initialize blocks from recovery (tail unchanged).
-    pub fn init_blocks(&self, blocks: BTreeMap<u128, BlockIndexEntry>) {
+    pub fn init_blocks(&self, blocks: BTreeMap<HilbertKey, BlockIndexEntry>) {
         let current = self.view.load();
         self.publish(ShardView {
             blocks: Arc::new(blocks),

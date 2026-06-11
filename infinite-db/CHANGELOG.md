@@ -6,11 +6,24 @@
 
 - `InfiniteDb::insert_many` / `insert_many_on_branch` bulk write API with per-shard `WriteBatch` routing.
 - `InfiniteDb::compact(space)` manual compaction trigger.
+- `InfiniteDb::compact_with(space, policy)` and per-space `CompactionPolicy` on `SpaceConfig` (keep-all default).
+- `InfiniteDb::allocate_revisions(count)` for advanced `enqueue_batch` callers.
+- `InfiniteDb::failed_revisions()` for observing abandoned writes after I/O failure.
 - Hilbert bounding-box key decomposition (`range_decompose`) for tighter `query_bbox` pruning.
 - Branch overlay durability via append-only `overlay.log` with replay on open.
+- Post-compaction block-file GC (`safe_to_delete`) with branch-base snapshot pinning.
+- `branch_bases.bin` persists fork-base snapshots for branch queries across reopen.
 
 ### Changed
 
+- Phase 3 type hygiene: engine APIs use `SpaceId`/`BranchId`/`RevisionId` newtypes (disk boundaries still use raw `u64` where needed); `HilbertKey`/`CachedHilbertKey` replace raw `u128` hilbert fields; `Checksum` wraps block digests; `ShardRef` replaces `(shard_id, shard_bits)` tuples; `AddressKey`/`RecordIdentityKey` drive visibility and seal deduplication; `RevisionWatermark` tracks `BTreeSet<RevisionId>` with `predecessor()`-based stable ceiling.
+- Auto-compaction defaults to `retain_history: true`; use `CompactionPolicy::LatestOnly` to opt into history-dropping compaction.
+- `RevisionWatermark` owns allocation; `enqueue_batch` requires watermark-allocated revisions.
+- Branch writes register and retire revisions through the same watermark lifecycle as main.
+- Branch overlay batch append with cached WAL writers (one fsync per batch).
+- `counters.bin` migrates to named `PersistedCounters` struct on next `persist_meta`.
+- Merge/import/converge apply paths batch through `allocate_n` + `enqueue_batch`.
+- Branch queries read sealed data from fork-base snapshots (not current main index).
 - Default queries return exactly one record per address (latest revision wins at the query ceiling). Use `Query::include_tombstones()` for full revision history.
 - Per-shard atomic read views (`ShardView`) pair sealed blocks and live tail so readers never observe seal-window duplicates.
 - `ReadTxn` pins at `stable_revision()` (not allocation `revision()`); added `InfiniteDb::stable_revision()` for repeatable reads.

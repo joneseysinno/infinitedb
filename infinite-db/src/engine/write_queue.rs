@@ -5,9 +5,10 @@ use std::io;
 use crossbeam_channel::{bounded, Receiver, Sender};
 
 use crate::infinitedb_core::{
-    address::RevisionId,
+    address::{RevisionId, SpaceId},
     block::Record,
     branch::BranchId,
+    hilbert_key::{CachedHilbertKey, HilbertKey},
 };
 use crate::infinitedb_storage::wal::WalEntry;
 
@@ -20,12 +21,12 @@ pub struct WriteJob {
     pub branch_id: BranchId,
     pub revision: RevisionId,
     pub entry: WalEntry,
-    pub hilbert_key: u128,
+    pub hilbert_key: HilbertKey,
 }
 
 impl WriteJob {
     /// Main-branch write job.
-    pub fn main(revision: RevisionId, entry: WalEntry, hilbert_key: u128) -> Self {
+    pub fn main(revision: RevisionId, entry: WalEntry, hilbert_key: HilbertKey) -> Self {
         Self {
             branch_id: BranchId::MAIN,
             revision,
@@ -46,14 +47,14 @@ impl WriteJob {
                 revision,
                 data,
                 tombstone: false,
-                hilbert_key: self.hilbert_key,
+                hilbert_key: CachedHilbertKey::set(self.hilbert_key),
             },
             WalEntry::Tombstone { address, revision } => Record {
                 address,
                 revision,
                 data: vec![],
                 tombstone: true,
-                hilbert_key: self.hilbert_key,
+                hilbert_key: CachedHilbertKey::set(self.hilbert_key),
             },
             other => panic!("unsupported WAL entry in write job: {other:?}"),
         }
@@ -65,12 +66,12 @@ impl WriteJob {
     }
 
     /// Space id for routing.
-    pub fn space_id(&self) -> u64 {
+    pub fn space_id(&self) -> SpaceId {
         match &self.entry {
             WalEntry::Write { address, .. } | WalEntry::Tombstone { address, .. } => {
-                address.space.0
+                address.space
             }
-            _ => 0,
+            _ => SpaceId(0),
         }
     }
 }
@@ -87,7 +88,7 @@ pub enum IoCommand {
     },
     /// Seal hot segments for a space into a block.
     Flush {
-        space_id: u64,
+        space: SpaceId,
         done: crossbeam_channel::Sender<io::Result<()>>,
     },
     Shutdown,
@@ -141,9 +142,9 @@ impl WriteQueueSender {
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "I/O thread stopped"))
     }
 
-    pub fn request_flush(&self, space_id: u64) -> io::Result<()> {
+    pub fn request_flush(&self, space: SpaceId) -> io::Result<()> {
         let (done_tx, done_rx) = bounded(1);
-        self.post_flush(space_id, done_tx)?;
+        self.post_flush(space, done_tx)?;
         done_rx
             .recv()
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "I/O thread stopped"))?
@@ -152,14 +153,11 @@ impl WriteQueueSender {
     /// Post a flush without waiting (parallel fan-out).
     pub fn post_flush(
         &self,
-        space_id: u64,
+        space: SpaceId,
         done: crossbeam_channel::Sender<io::Result<()>>,
     ) -> io::Result<()> {
         self.tx
-            .send(IoCommand::Flush {
-                space_id,
-                done,
-            })
+            .send(IoCommand::Flush { space, done })
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "I/O thread stopped"))
     }
 

@@ -440,7 +440,7 @@ dependencies = [
 
 [[package]]
 name = "infinite-db"
-version = "0.3.0"
+version = "0.3.2"
 dependencies = [
  "arc-swap",
  "bincode",

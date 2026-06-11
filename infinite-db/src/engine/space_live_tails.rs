@@ -4,11 +4,13 @@ use std::sync::Arc;
 
 use dashmap::DashMap;
 
+use crate::infinitedb_core::address::SpaceId;
+
 use super::live_tail::LiveTailView;
 
 /// One [`LiveTailView`] per space for parallel I/O isolation.
 pub struct SpaceLiveTails {
-    tails: DashMap<u64, Arc<LiveTailView>>,
+    tails: DashMap<SpaceId, Arc<LiveTailView>>,
 }
 
 impl SpaceLiveTails {
@@ -18,7 +20,7 @@ impl SpaceLiveTails {
         }
     }
 
-    pub fn get_or_create(&self, space_id: u64) -> Arc<LiveTailView> {
+    pub fn get_or_create(&self, space_id: SpaceId) -> Arc<LiveTailView> {
         if let Some(t) = self.tails.get(&space_id) {
             return Arc::clone(t.value());
         }
@@ -27,7 +29,7 @@ impl SpaceLiveTails {
         tail
     }
 
-    pub fn get(&self, space_id: u64) -> Option<Arc<LiveTailView>> {
+    pub fn get(&self, space_id: SpaceId) -> Option<Arc<LiveTailView>> {
         self.tails.get(&space_id).map(|e| Arc::clone(e.value()))
     }
 

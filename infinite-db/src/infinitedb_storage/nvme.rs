@@ -25,7 +25,10 @@ use bincode::{config::standard, decode_from_slice, encode_to_vec};
 use blake3::Hasher;
 use parking_lot::RwLock;
 
-use crate::infinitedb_core::block::{Block, BlockId};
+use crate::infinitedb_core::{
+    block::{Block, BlockId},
+    checksum::Checksum,
+};
 
 // ---------------------------------------------------------------------------
 // LRU block cache
@@ -227,12 +230,12 @@ impl BlockStore {
     }
 }
 
-pub fn compute_checksum(block: &Block) -> io::Result<[u8; 32]> {
+pub fn compute_checksum(block: &Block) -> io::Result<Checksum> {
     let payload = encode_to_vec(&block.records, standard())
         .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
     let mut h = Hasher::new();
     h.update(&payload);
-    Ok(*h.finalize().as_bytes())
+    Ok(Checksum(*h.finalize().as_bytes()))
 }
 
 fn verify_checksum(block: &Block) -> Result<(), String> {

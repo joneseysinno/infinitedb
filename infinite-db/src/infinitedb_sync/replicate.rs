@@ -10,6 +10,7 @@ use crate::infinitedb_core::{
     block::Record,
     branch::BranchId,
     merge::MergeStrategy,
+    record_identity::AddressKey,
 };
 use crate::InfiniteDb;
 
@@ -24,9 +25,9 @@ pub struct BranchSyncState {
 }
 
 fn latest_per_address(mut records: Vec<Record>) -> Vec<Record> {
-    let mut map: HashMap<Vec<u32>, Record> = HashMap::new();
+    let mut map: HashMap<AddressKey, Record> = HashMap::new();
     for record in records.drain(..) {
-        let key = record.address.point.coords.clone();
+        let key = AddressKey::from_record(&record);
         map.entry(key)
             .and_modify(|existing| {
                 if record.revision > existing.revision {
@@ -81,22 +82,10 @@ pub fn import_branch_overlay(
 ) -> Result<BranchId, String> {
     remote.sync().map_err(|e| e.to_string())?;
     let branch = local.create_branch(name, BranchId::MAIN)?;
-    for record in remote.branch_overlays.all_live_records(remote_branch) {
-        if record.tombstone {
-            local
-                .delete_on_branch(branch, record.address.space, record.address.point)
-                .map_err(|e| e.to_string())?;
-        } else {
-            local
-                .insert_on_branch(
-                    branch,
-                    record.address.space,
-                    record.address.point,
-                    record.data,
-                )
-                .map_err(|e| e.to_string())?;
-        }
-    }
+    let records = remote.branch_overlays.all_live_records(remote_branch);
+    local
+        .apply_records_on_branch(branch, records)
+        .map_err(|e| e.to_string())?;
     Ok(branch)
 }
 
@@ -122,15 +111,19 @@ pub fn converge_main_records(
             })
             .or_insert(r);
     }
+    let mut rows: Vec<(DimensionVector, Vec<u8>)> = Vec::new();
     for record in remote_records {
         let coords = record.address.point.coords.clone();
         let insert = match local_latest.get(&coords) {
             None => true,
             Some(existing) => record.revision > existing.revision,
         };
-        if insert {
-            local.insert(space, DimensionVector::new(coords), record.data)?;
+        if insert && !record.tombstone {
+            rows.push((DimensionVector::new(coords), record.data));
         }
+    }
+    if !rows.is_empty() {
+        local.insert_many(space, rows)?;
     }
     local.sync()
 }

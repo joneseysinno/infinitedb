@@ -7,12 +7,20 @@ use std::{
     fs::{File, OpenOptions},
     io::{self, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
+    sync::atomic::{AtomicBool, Ordering},
 };
+
+/// Test-only: when set, the next [`HotSegment::sync_group`] fails.
+#[doc(hidden)]
+pub static TEST_FAIL_SYNC_GROUP: AtomicBool = AtomicBool::new(false);
 
 use bincode::{config::standard, decode_from_slice, encode_to_vec};
 use blake3::Hasher;
 
-use crate::infinitedb_core::block::Record;
+use crate::infinitedb_core::{
+    block::Record,
+    hilbert_key::CachedHilbertKey,
+};
 use crate::infinitedb_storage::wal::WalEntry;
 
 /// Header prepended to each hot segment file.
@@ -97,6 +105,12 @@ impl HotSegment {
 
     /// Fsync the segment and commit the length header once for a write group.
     pub fn sync_group(&mut self) -> io::Result<()> {
+        if TEST_FAIL_SYNC_GROUP.swap(false, Ordering::SeqCst) {
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                "injected hot segment fsync failure",
+            ));
+        }
         self.file.sync_all()?;
         self.write_committed_len_header()
     }
@@ -192,14 +206,14 @@ pub fn wal_entry_to_record(entry: WalEntry) -> Option<Record> {
             revision,
             data,
             tombstone: false,
-            hilbert_key: 0,
+            hilbert_key: CachedHilbertKey::UNSET,
         }),
         WalEntry::Tombstone { address, revision } => Some(Record {
             address,
             revision,
             data: vec![],
             tombstone: true,
-            hilbert_key: 0,
+            hilbert_key: CachedHilbertKey::UNSET,
         }),
         _ => None,
     }

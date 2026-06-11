@@ -2,7 +2,7 @@ use bincode::{Decode, Encode};
 use serde::{Deserialize, Serialize};
 
 /// Identifies a logical space (a named dataset/dimension space).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Encode, Decode)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, Encode, Decode)]
 pub struct SpaceId(pub u64);
 
 /// Monotonically increasing logical clock tick.
@@ -17,6 +17,14 @@ impl RevisionId {
     /// Return the next logical revision.
     pub fn next(self) -> RevisionId {
         RevisionId(self.0 + 1)
+    }
+
+    /// Predecessor in allocation order (`ZERO` maps to itself).
+    ///
+    /// Comparisons are valid on [`RevisionId`]; raw arithmetic is reserved for
+    /// the watermark allocator and persistence boundaries.
+    pub fn predecessor(self) -> RevisionId {
+        RevisionId(self.0.saturating_sub(1))
     }
 }
 

@@ -65,12 +65,11 @@ impl Delta {
     /// The caller is responsible for writing `added_blocks` to the `BlockStore`
     /// and deleting `removed_block_ids` via GC after the new snapshot is durable.
     pub fn apply(&self, snapshot: &Snapshot) -> Snapshot {
-        use std::collections::BTreeMap;
         use crate::infinitedb_core::snapshot::BlockIndexEntry;
         use crate::infinitedb_index::hilbert_key_standard;
 
         // Start from a clone of the current snapshot.
-        let mut blocks: BTreeMap<u128, BlockIndexEntry> = snapshot.blocks.clone();
+        let mut blocks = snapshot.blocks.clone();
 
         // Remove blocks that the remote no longer has.
         blocks.retain(|_, e| !self.removed_block_ids.contains(&e.block_id));
@@ -81,16 +80,21 @@ impl Delta {
         // This must match the keying used by `flush` (see `db.rs`) or range
         // pruning over synced blocks would be incorrect.
         for block in &self.added_blocks {
-            let min_key = block
-                .records
-                .first()
-                .map(|r| hilbert_key_standard(&r.address.point))
-                .unwrap_or(0);
-            let max_key = block
-                .records
-                .last()
-                .map(|r| hilbert_key_standard(&r.address.point))
-                .unwrap_or(min_key);
+            use crate::infinitedb_core::hilbert_key::HilbertKey;
+            let min_key = HilbertKey(
+                block
+                    .records
+                    .first()
+                    .map(|r| hilbert_key_standard(&r.address.point))
+                    .unwrap_or(0),
+            );
+            let max_key = HilbertKey(
+                block
+                    .records
+                    .last()
+                    .map(|r| hilbert_key_standard(&r.address.point))
+                    .unwrap_or(min_key.raw()),
+            );
             blocks.insert(min_key, BlockIndexEntry { block_id: block.id, max_key });
         }
 
@@ -119,8 +123,13 @@ mod tests {
         snapshot::{BlockIndexEntry, Snapshot, SnapshotId},
     };
 
+    use crate::infinitedb_core::{checksum::Checksum, hilbert_key::HilbertKey};
+
     fn entry(id: u64, max_key: u128) -> BlockIndexEntry {
-        BlockIndexEntry { block_id: BlockId(id), max_key }
+        BlockIndexEntry {
+            block_id: BlockId(id),
+            max_key: HilbertKey(max_key),
+        }
     }
 
     fn empty_snapshot(id: u64) -> Snapshot {
@@ -140,14 +149,14 @@ mod tests {
             records: vec![],
             min_revision: RevisionId::ZERO,
             max_revision: RevisionId::ZERO,
-            checksum: [0u8; 32],
+            checksum: Checksum::ZERO,
         }
     }
 
     #[test]
     fn delta_adds_new_blocks() {
         let mut source = empty_snapshot(2);
-        source.blocks.insert(10, entry(10, 10));
+        source.blocks.insert(HilbertKey(10), entry(10, 10));
         let target = empty_snapshot(1);
 
         let delta = Delta::compute(&source, &target, vec![make_block(10)]);
@@ -161,9 +170,9 @@ mod tests {
     #[test]
     fn empty_delta_when_in_sync() {
         let mut source = empty_snapshot(1);
-        source.blocks.insert(5, entry(5, 5));
+        source.blocks.insert(HilbertKey(5), entry(5, 5));
         let mut target = empty_snapshot(1);
-        target.blocks.insert(5, entry(5, 5));
+        target.blocks.insert(HilbertKey(5), entry(5, 5));
 
         let delta = Delta::compute(&source, &target, vec![]);
         assert!(delta.is_empty());
@@ -184,7 +193,7 @@ mod tests {
             revision: RevisionId(1),
             data: vec![1, 2, 3],
             tombstone: false,
-            hilbert_key: 0,
+            hilbert_key: crate::infinitedb_core::hilbert_key::CachedHilbertKey::UNSET,
         };
         let block = Block {
             id: BlockId(999),
@@ -192,7 +201,7 @@ mod tests {
             records: vec![record],
             min_revision: RevisionId(1),
             max_revision: RevisionId(1),
-            checksum: [0u8; 32],
+            checksum: Checksum::ZERO,
         };
 
         let delta = Delta {
@@ -207,10 +216,11 @@ mod tests {
         let expected_key = hilbert_key_standard(&first_point);
 
         // The map key must be the Hilbert minimum, not the raw block ID.
-        assert!(updated.blocks.contains_key(&expected_key));
-        assert!(!updated.blocks.contains_key(&(BlockId(999).0 as u128)));
+        let expected = HilbertKey(expected_key);
+        assert!(updated.blocks.contains_key(&expected));
+        assert!(!updated.blocks.contains_key(&HilbertKey(BlockId(999).0 as u128)));
         assert_eq!(
-            updated.blocks.get(&expected_key).map(|e| e.block_id),
+            updated.blocks.get(&expected).map(|e| e.block_id),
             Some(BlockId(999))
         );
     }

@@ -8,7 +8,8 @@ use std::sync::Arc;
 use bincode::{config::standard, decode_from_slice, encode_to_vec};
 use parking_lot::{Mutex, RwLock};
 
-use crate::engine::branch_overlay::BranchOverlayStore;
+use crate::engine::branch_overlay::{BranchOverlayStore, OverlayKey};
+use crate::engine::compactor::CompactionPolicyOverrides;
 use crate::engine::coordinator::SpaceCoordinator;
 use crate::engine::hilbert_coordinator::HilbertCoordinator;
 use crate::engine::hilbert_live_tails::HilbertLiveTails;
@@ -18,14 +19,16 @@ use crate::engine::merge::merge_branches;
 use crate::engine::query::{query_bbox, query_inner, snapshots_map_for_persist, space_key};
 use crate::engine::snapshot_store::SnapshotStore;
 use crate::engine::space_live_tails::SpaceLiveTails;
-use crate::engine::watermark::RevisionWatermark;
+use crate::engine::watermark::{FailedRevision, RevisionWatermark};
 use crate::engine::write_queue::{WriteJob, WriteQueueSender};
 use crate::infinitedb_core::{
     address::{Address, DimensionVector, RevisionId, SpaceId},
     block::Record,
     branch::{Branch, BranchId, BranchRegistry},
+    hilbert_key::HilbertKey,
     merge::{MergeConflict, MergeResult, MergeStrategy},
-    space::{SpaceConfig, SpaceRegistry},
+    persisted_counters::PersistedCounters,
+    space::{CompactionPolicy, SpaceConfig, SpaceRegistry},
     snapshot::SnapshotId,
 };
 use crate::infinitedb_storage::{
@@ -89,6 +92,7 @@ pub struct InfiniteDb {
     pub(crate) snapshots: Arc<SnapshotStore>,
     pub(crate) revision: Arc<AtomicU64>,
     watermark: Arc<RevisionWatermark>,
+    compaction_overrides: CompactionPolicyOverrides,
     next_block_id: Arc<AtomicU64>,
     next_snapshot_id: Arc<AtomicU64>,
     next_branch_id: Arc<AtomicU64>,
@@ -141,6 +145,15 @@ impl InfiniteDb {
         if format_version == FORMAT_VERSION_V4 {
             branch_overlays.replay_all(&root)?;
         }
+        if let Ok(bytes) = store.read_meta("branch_bases.bin") {
+            if let Ok((bases, _)) = decode_from_slice::<
+                std::collections::BTreeMap<(u64, u64), crate::infinitedb_core::snapshot::Snapshot>,
+                _,
+            >(&bytes, standard())
+            {
+                branch_overlays.import_bases(bases);
+            }
+        }
         #[cfg(feature = "sync")]
         let conflicts = Arc::new(crate::infinitedb_sync::conflict_queue::ConflictQueue::open(&root)?);
 
@@ -150,8 +163,10 @@ impl InfiniteDb {
         let spaces = Arc::new(RwLock::new(spaces));
         let branches = Arc::new(RwLock::new(branches));
         let snapshots = Arc::new(SnapshotStore::new(snapshots));
-        let revision = Arc::new(AtomicU64::new(next_rev));
-        let watermark = Arc::new(RevisionWatermark::new(Arc::clone(&revision)));
+        let watermark = Arc::new(RevisionWatermark::new(next_rev));
+        let revision = watermark.allocation_counter();
+        let compaction_overrides: CompactionPolicyOverrides =
+            Arc::new(Mutex::new(std::collections::HashMap::new()));
         let next_block_id = Arc::new(AtomicU64::new(next_block));
         let next_snapshot_id = Arc::new(AtomicU64::new(next_snap));
         let next_branch_id = Arc::new(AtomicU64::new(next_branch));
@@ -177,6 +192,7 @@ impl InfiniteDb {
                 Arc::clone(&next_block_id),
                 options.io_thread.clone(),
                 Arc::clone(&watermark),
+                Arc::clone(&compaction_overrides),
             );
             coordinator.bootstrap_registered_spaces()?;
             coordinator.sync_all()?;
@@ -190,6 +206,8 @@ impl InfiniteDb {
                 Arc::clone(&next_block_id),
                 options.io_thread.clone(),
                 Arc::clone(&watermark),
+                Arc::clone(&compaction_overrides),
+                Some(Arc::clone(&branch_overlays)),
             );
             coordinator.bootstrap_registered_spaces()?;
             coordinator.sync_all()?;
@@ -205,6 +223,8 @@ impl InfiniteDb {
                 Arc::clone(&next_block_id),
                 options.io_thread.clone(),
                 Arc::clone(&watermark),
+                Arc::clone(&compaction_overrides),
+                Some(Arc::clone(&branch_overlays)),
             );
             WriteBackend::V2 {
                 queue,
@@ -222,6 +242,7 @@ impl InfiniteDb {
             snapshots,
             revision,
             watermark,
+            compaction_overrides,
             next_block_id,
             next_snapshot_id,
             next_branch_id,
@@ -299,7 +320,7 @@ impl InfiniteDb {
     ) -> io::Result<RevisionId> {
         let rev = self.next_revision();
         let address = Address::new(space, point.clone());
-        let hilbert_key = space_key(&self.spaces.read(), space, &point);
+        let hilbert_key = HilbertKey(space_key(&self.spaces.read(), space, &point));
         let entry = WalEntry::Write {
             address,
             revision: rev,
@@ -329,7 +350,7 @@ impl InfiniteDb {
     ) -> io::Result<RevisionId> {
         let rev = self.next_revision();
         let address = Address::new(space, point.clone());
-        let hilbert_key = space_key(&self.spaces.read(), space, &point);
+        let hilbert_key = HilbertKey(space_key(&self.spaces.read(), space, &point));
         let entry = WalEntry::Tombstone {
             address,
             revision: rev,
@@ -373,6 +394,9 @@ impl InfiniteDb {
     }
 
     /// Three-way merge `source` into `target` (usually `main`).
+    ///
+    /// Applied records receive **fresh global revisions** (the merge is a new
+    /// commit, not a replay of source revision ids).
     pub fn merge_branch(
         &self,
         target: BranchId,
@@ -401,18 +425,7 @@ impl InfiniteDb {
             return Ok(result);
         }
         let applied = std::mem::take(&mut result.applied_records);
-        for record in applied {
-            if record.tombstone {
-                self.delete_on_branch(target, record.address.space, record.address.point)?;
-            } else {
-                self.insert_on_branch(
-                    target,
-                    record.address.space,
-                    record.address.point,
-                    record.data,
-                )?;
-            }
-        }
+        self.apply_records_on_branch(target, applied)?;
         self.branch_overlays.clear_branch(source, &self.root)?;
         self.sync()?;
         Ok(result)
@@ -450,30 +463,47 @@ impl InfiniteDb {
 
     /// Enqueue writes across multiple spaces (ordered by space id).
     ///
-    /// Caller-supplied [`WriteJob::revision`] values must not exceed the global
-    /// revision counter; this method advances the counter to the maximum job revision.
+    /// Every [`WriteJob::revision`] must have been allocated through
+    /// [`RevisionWatermark::allocate`] or [`RevisionWatermark::allocate_n`]
+    /// (via `insert`, `insert_many`, etc.) so the revision is already
+    /// registered as outstanding.
     pub fn enqueue_batch(&self, jobs: Vec<WriteJob>) -> io::Result<()> {
-        for job in &jobs {
-            self.revision
-                .fetch_max(job.revision.0, Ordering::Relaxed);
-        }
         let mut main_jobs = Vec::with_capacity(jobs.len());
+        let mut branch_batches: std::collections::BTreeMap<OverlayKey, Vec<Record>> =
+            std::collections::BTreeMap::new();
         for job in jobs {
             if job.branch_id != BranchId::MAIN {
                 let branch_id = job.branch_id;
                 let record = job.into_record();
-                let space = record.address.space;
-                self.branch_overlays
-                    .append_with_durability(branch_id, space, record, &self.root)?;
+                let key = OverlayKey::new(branch_id, record.address.space);
+                branch_batches.entry(key).or_default().push(record);
             } else {
-                self.watermark.register(job.revision.0);
                 main_jobs.push(job);
+            }
+        }
+        for (key, records) in branch_batches {
+            let revs: Vec<RevisionId> = records.iter().map(|r| r.revision).collect();
+            let result = self.branch_overlays.append_batch_with_durability(
+                key.branch_id,
+                key.space_id,
+                records,
+                &self.root,
+            );
+            if let Err(ref e) = result {
+                for rev in &revs {
+                    self.watermark.retire_failed(*rev, e.to_string());
+                }
+                return result;
+            }
+            for rev in revs {
+                self.watermark.retire(rev);
             }
         }
         if main_jobs.is_empty() {
             return Ok(());
         }
-        match &self.backend {
+        let main_revs: Vec<RevisionId> = main_jobs.iter().map(|j| j.revision).collect();
+        let result = match &self.backend {
             WriteBackend::V4 { coordinator } => coordinator.enqueue_batch(main_jobs),
             WriteBackend::V3 { coordinator } => coordinator.enqueue_batch(main_jobs),
             WriteBackend::V2 { queue, .. } => {
@@ -482,7 +512,13 @@ impl InfiniteDb {
                 }
                 Ok(())
             }
+        };
+        if let Err(ref e) = result {
+            for rev in &main_revs {
+                self.watermark.retire_failed(*rev, e.to_string());
+            }
         }
+        result
     }
 
     /// Query all live records in `space` on `main`, optionally capped at `as_of`.
@@ -540,9 +576,9 @@ impl InfiniteDb {
     /// Flush pending writes for one space to durable storage without syncing all spaces.
     pub fn flush(&self, space: SpaceId) -> io::Result<()> {
         match &self.backend {
-            WriteBackend::V4 { coordinator } => coordinator.flush_space(space.0)?,
-            WriteBackend::V3 { coordinator } => coordinator.flush_space(space.0)?,
-            WriteBackend::V2 { queue, .. } => queue.request_flush(space.0)?,
+            WriteBackend::V4 { coordinator } => coordinator.flush_space(space)?,
+            WriteBackend::V3 { coordinator } => coordinator.flush_space(space)?,
+            WriteBackend::V2 { queue, .. } => queue.request_flush(space)?,
         }
         self.persist_meta()
     }
@@ -555,6 +591,13 @@ impl InfiniteDb {
             WriteBackend::V2 { queue, .. } => queue.request_sync()?,
         }
         self.persist_meta()
+    }
+
+    /// Allocate a contiguous revision range for custom [`WriteJob`] batches.
+    ///
+    /// Revisions are registered as outstanding until the write path retires them.
+    pub fn allocate_revisions(&self, count: u64) -> (RevisionId, RevisionId) {
+        self.watermark.allocate_n(count)
     }
 
     /// Allocation high-water mark: highest revision id handed to a writer.
@@ -645,14 +688,13 @@ impl InfiniteDb {
         }
         const CHUNK: usize = 4096;
         let count = rows.len() as u64;
-        let first = RevisionId(self.revision.fetch_add(count, Ordering::Relaxed) + 1);
-        let last = RevisionId(first.0 + count - 1);
+        let (first, last) = self.watermark.allocate_n(count);
         let mut jobs = Vec::with_capacity(rows.len().min(CHUNK));
         let spaces = self.spaces.read();
         for (idx, (point, data)) in rows.into_iter().enumerate() {
             let rev = RevisionId(first.0 + idx as u64);
             let address = Address::new(space, point.clone());
-            let hilbert_key = space_key(&spaces, space, &point);
+            let hilbert_key = HilbertKey(space_key(&spaces, space, &point));
             let entry = WalEntry::Write {
                 address,
                 revision: rev,
@@ -676,35 +718,111 @@ impl InfiniteDb {
         Ok((first, last))
     }
 
-    /// Manually compact small blocks in `space`.
+    /// Manually compact small blocks in `space` using the space's configured policy.
     pub fn compact(&self, space: SpaceId) -> io::Result<()> {
-        self.sync()?;
-        match &self.backend {
-            WriteBackend::V4 { coordinator } => coordinator.compact_space(space.0),
-            WriteBackend::V3 { coordinator } => coordinator.compact_space(space.0),
-            WriteBackend::V2 { .. } => Ok(()),
+        self.compact_with(space, None)
+    }
+
+    /// Manually compact `space`, optionally overriding the configured compaction policy.
+    pub fn compact_with(
+        &self,
+        space: SpaceId,
+        policy: Option<CompactionPolicy>,
+    ) -> io::Result<()> {
+        if let Some(p) = policy {
+            self.compaction_overrides.lock().insert(space, p);
         }
+        let result = (|| {
+            self.sync()?;
+            match &self.backend {
+                WriteBackend::V4 { coordinator } => coordinator.compact_space(space),
+                WriteBackend::V3 { coordinator } => coordinator.compact_space(space),
+                WriteBackend::V2 { .. } => Ok(()),
+            }
+        })();
+        self.compaction_overrides.lock().remove(&space);
+        result
     }
 
     fn enqueue(&self, job: WriteJob) -> io::Result<()> {
+        let rev = job.revision;
         if job.branch_id != BranchId::MAIN {
             let branch_id = job.branch_id;
             let record = job.into_record();
             let space = record.address.space;
-            self.branch_overlays
-                .append_with_durability(branch_id, space, record, &self.root)?;
+            if let Err(e) = self.branch_overlays.append_batch_with_durability(
+                branch_id,
+                space,
+                vec![record],
+                &self.root,
+            ) {
+                self.watermark.retire_failed(rev, e.to_string());
+                return Err(e);
+            }
+            self.watermark.retire(rev);
             return Ok(());
         }
-        self.watermark.register(job.revision.0);
-        match &self.backend {
+        let result = match &self.backend {
             WriteBackend::V4 { coordinator } => coordinator.enqueue_write(job),
             WriteBackend::V3 { coordinator } => coordinator.enqueue_write(job),
             WriteBackend::V2 { queue, .. } => queue.enqueue_write(job),
+        };
+        if let Err(ref e) = result {
+            self.watermark.retire_failed(rev, e.to_string());
         }
+        result
+    }
+
+    /// Revisions abandoned due to I/O failures since the last call (drained).
+    pub fn failed_revisions(&self) -> Vec<FailedRevision> {
+        self.watermark.take_failed()
     }
 
     fn next_revision(&self) -> RevisionId {
-        RevisionId(self.revision.fetch_add(1, Ordering::Relaxed) + 1)
+        self.watermark.allocate()
+    }
+
+    /// Apply many records on a branch through one allocation and batch enqueue.
+    pub(crate) fn apply_records_on_branch(
+        &self,
+        branch: BranchId,
+        records: Vec<Record>,
+    ) -> io::Result<()> {
+        if records.is_empty() {
+            return Ok(());
+        }
+        let count = records.len() as u64;
+        let (first, _) = self.watermark.allocate_n(count);
+        let spaces = self.spaces.read();
+        let mut jobs = Vec::with_capacity(records.len());
+        for (idx, record) in records.into_iter().enumerate() {
+            let revision = RevisionId(first.0 + idx as u64);
+            let hilbert_key = if let Some(k) = record.hilbert_key.get() {
+                k
+            } else {
+                HilbertKey(space_key(&spaces, record.address.space, &record.address.point))
+            };
+            let entry = if record.tombstone {
+                WalEntry::Tombstone {
+                    address: record.address.clone(),
+                    revision,
+                }
+            } else {
+                WalEntry::Write {
+                    address: record.address.clone(),
+                    revision,
+                    data: record.data,
+                }
+            };
+            jobs.push(WriteJob {
+                branch_id: branch,
+                revision,
+                entry,
+                hilbert_key,
+            });
+        }
+        drop(spaces);
+        self.enqueue_batch(jobs)
     }
 
     fn persist_meta(&self) -> io::Result<()> {
@@ -721,15 +839,20 @@ impl InfiniteDb {
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
         self.store.write_meta("snapshots.bin", &snapshots_bytes)?;
 
-        let counters: [u64; 4] = [
-            self.revision.load(Ordering::Relaxed),
+        let counters = PersistedCounters::new(
+            self.watermark.revision(),
             self.next_block_id.load(Ordering::Relaxed),
             self.next_snapshot_id.load(Ordering::Relaxed),
             self.next_branch_id.load(Ordering::Relaxed),
-        ];
+        );
         let counters_bytes = encode_to_vec(&counters, standard())
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
         self.store.write_meta("counters.bin", &counters_bytes)?;
+
+        let branch_bases = self.branch_overlays.export_bases();
+        let branch_bases_bytes = encode_to_vec(&branch_bases, standard())
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        self.store.write_meta("branch_bases.bin", &branch_bases_bytes)?;
         Ok(())
     }
 }
@@ -764,14 +887,12 @@ type MetaTuple = (
 
 fn load_meta(store: &BlockStore) -> Option<MetaTuple> {
     let counters_bytes = store.read_meta("counters.bin").ok()?;
-    let (revision, next_block, next_snapshot, next_branch) =
-        match decode_from_slice::<[u64; 4], _>(&counters_bytes, standard()) {
-            Ok((c, _)) => (c[0], c[1], c[2], c[3]),
-            Err(_) => {
-                let (c, _): ([u64; 3], _) = decode_from_slice(&counters_bytes, standard()).ok()?;
-                (c[0], c[1], c[2], 2)
-            }
-        };
+    let counters =
+        crate::infinitedb_core::persisted_counters::decode_counters(&counters_bytes).ok()?;
+    let revision = counters.revision;
+    let next_block = counters.next_block;
+    let next_snapshot = counters.next_snapshot;
+    let next_branch = counters.next_branch;
 
     let spaces_bytes = store.read_meta("spaces.bin").ok()?;
     let (spaces, _): (SpaceRegistry, _) = decode_from_slice(&spaces_bytes, standard()).ok()?;

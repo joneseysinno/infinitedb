@@ -1,6 +1,8 @@
 use bincode::{Decode, Encode};
 use serde::{Deserialize, Serialize};
 use super::address::{Address, RevisionId, SpaceId};
+use super::checksum::Checksum;
+use super::hilbert_key::CachedHilbertKey;
 
 /// Stable identifier for a block on disk.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Encode, Decode)]
@@ -17,9 +19,9 @@ pub struct Record {
     pub data: Vec<u8>,
     /// Marks this revision as a logical deletion.
     pub tombstone: bool,
-    /// Hilbert key computed once at insert; zero means recompute from coordinates.
+    /// Hilbert key computed once at insert; unset means recompute from coordinates.
     #[serde(default)]
-    pub hilbert_key: u128,
+    pub hilbert_key: CachedHilbertKey,
 }
 
 /// An immutable, sorted collection of records sharing a contiguous Hilbert
@@ -35,7 +37,7 @@ pub struct Block {
     pub min_revision: RevisionId,
     pub max_revision: RevisionId,
     /// Blake3 checksum of the serialized records for integrity verification.
-    pub checksum: [u8; 32],
+    pub checksum: Checksum,
 }
 
 impl Block {

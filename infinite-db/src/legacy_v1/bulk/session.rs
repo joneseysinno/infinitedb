@@ -6,6 +6,7 @@ use std::io;
 use crate::infinitedb_core::{
     address::{Address, DimensionVector, RevisionId, SpaceId},
     block::Record,
+    hilbert_key::CachedHilbertKey,
 };
 use crate::infinitedb_storage::wal::{WalDurability, WalEntry, WalWriter};
 
@@ -123,7 +124,7 @@ impl<'a> BulkSessionCore<'a> {
                 revision: rev,
                 data,
                 tombstone: false,
-                hilbert_key: 0,
+                hilbert_key: CachedHilbertKey::UNSET,
             },
         )?;
         self.touch_space(space);
@@ -149,7 +150,7 @@ impl<'a> BulkSessionCore<'a> {
                 revision: rev,
                 data: vec![],
                 tombstone: true,
-                hilbert_key: 0,
+                hilbert_key: CachedHilbertKey::UNSET,
             },
         )?;
         self.touch_space(space);

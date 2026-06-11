@@ -1,5 +1,6 @@
 //! Storage engine internals (query path, I/O thread, live tail).
 
+pub mod block_gc;
 pub mod branch_overlay;
 pub mod compactor;
 pub mod coordinator;

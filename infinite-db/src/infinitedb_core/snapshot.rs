@@ -3,6 +3,7 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 use super::address::{Address, RevisionId, SpaceId};
 use super::block::BlockId;
+use super::hilbert_key::HilbertKey;
 
 /// Stable identifier for a snapshot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Encode, Decode)]
@@ -18,7 +19,7 @@ pub struct BlockIndexEntry {
     /// The block this entry points at.
     pub block_id: BlockId,
     /// The Hilbert key of the block's last (highest) record.
-    pub max_key: u128,
+    pub max_key: HilbertKey,
 }
 
 /// Immutable snapshot value minted at meaningful boundaries (branch creation,
@@ -39,7 +40,7 @@ pub struct Snapshot {
     /// Ordered map of blocks visible at this revision.
     /// Key is the block's minimum Hilbert address for range routing; the value
     /// carries the block ID and its maximum Hilbert address.
-    pub blocks: BTreeMap<u128, BlockIndexEntry>,
+    pub blocks: BTreeMap<HilbertKey, BlockIndexEntry>,
 }
 
 impl Snapshot {

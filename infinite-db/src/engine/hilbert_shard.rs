@@ -2,10 +2,33 @@
 
 use crate::infinitedb_core::{
     address::{DimensionVector, SpaceId},
+    hilbert_key::HilbertKey,
     space::SpaceRegistry,
 };
 
 use super::query::space_key;
+
+/// Hilbert shard membership for pruning (distinct from [`ShardKey`] routing).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ShardRef {
+    pub shard_id: u32,
+    pub shard_bits: u32,
+}
+
+impl ShardRef {
+    pub fn new(shard_id: u32, shard_bits: u32) -> Self {
+        Self { shard_id, shard_bits }
+    }
+
+    /// True when `key` belongs to this shard.
+    pub fn contains_key(self, key: HilbertKey) -> bool {
+        hilbert_shard_id(key.raw(), self.shard_bits) == self.shard_id
+    }
+
+    pub fn shard_bits_for_space(spaces: &SpaceRegistry, space: SpaceId) -> u32 {
+        spaces.get(space).map(|c| c.shard_bits).unwrap_or(DEFAULT_SHARD_BITS)
+    }
+}
 
 /// Default Hilbert shard bits when a space config omits an explicit value.
 pub const DEFAULT_SHARD_BITS: u32 = 4;
@@ -35,15 +58,15 @@ pub fn shard_for_point(
     hilbert_shard_id(key, shard_bits)
 }
 
-/// Composite key for `(space_id, hilbert_shard_id)` maps.
+/// Composite key for `(space, hilbert_shard_id)` coordinator and live-tail maps.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct ShardKey {
-    pub space_id: u64,
+    pub space_id: SpaceId,
     pub shard_id: u32,
 }
 
 impl ShardKey {
-    pub fn new(space_id: u64, shard_id: u32) -> Self {
+    pub fn new(space_id: SpaceId, shard_id: u32) -> Self {
         Self { space_id, shard_id }
     }
 }

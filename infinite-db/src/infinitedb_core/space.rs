@@ -1,7 +1,27 @@
 use std::collections::HashMap;
 use bincode::{Decode, Encode};
 use serde::{Deserialize, Serialize};
-use super::address::SpaceId;
+use super::address::{RevisionId, SpaceId};
+
+/// History retention mode for compaction in a space.
+#[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode, PartialEq, Eq)]
+pub enum CompactionPolicy {
+    /// Keep all revisions (default).
+    KeepAll,
+    /// Drop revisions older than the configured horizons during compaction.
+    RetentionWindow {
+        version_horizon: RevisionId,
+        tombstone_horizon: RevisionId,
+    },
+    /// Latest revision per address only (destructive).
+    LatestOnly,
+}
+
+impl Default for CompactionPolicy {
+    fn default() -> Self {
+        Self::KeepAll
+    }
+}
 
 /// Configuration for a registered space.
 #[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode)]
@@ -28,6 +48,9 @@ pub struct SpaceConfig {
     /// `shard_id = hilbert_key >> (128 - shard_bits)`. Default `4` → 16 shards.
     /// `0` disables intra-space sharding (single I/O thread per space).
     pub shard_bits: u32,
+    /// Compaction history retention for this space.
+    #[serde(default)]
+    pub compaction_policy: CompactionPolicy,
 }
 
 impl SpaceConfig {
@@ -40,6 +63,7 @@ impl SpaceConfig {
             bits_per_dim: 8,
             centroid_keying: false,
             shard_bits: 4,
+            compaction_policy: CompactionPolicy::default(),
         }
     }
 
@@ -58,6 +82,12 @@ impl SpaceConfig {
     /// Override Hilbert range shard count (`2^shard_bits` I/O threads per space).
     pub fn with_shard_bits(mut self, shard_bits: u32) -> Self {
         self.shard_bits = shard_bits;
+        self
+    }
+
+    /// Override compaction history retention for this space.
+    pub fn with_compaction_policy(mut self, policy: CompactionPolicy) -> Self {
+        self.compaction_policy = policy;
         self
     }
 }
