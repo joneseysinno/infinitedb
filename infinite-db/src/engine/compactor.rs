@@ -8,10 +8,13 @@ use parking_lot::{Mutex, RwLock};
 
 use crate::infinitedb_core::{
     address::SpaceId,
+    endpoint_index::ENDPOINT_INDEX_SPACE,
     hilbert_key::HilbertKey,
     snapshot::{BlockIndexEntry, SnapshotId},
     space::{CompactionPolicy, SpaceRegistry},
 };
+
+use super::endpoint_index_migrate::expand_endpoint_index_records_for_compaction;
 use crate::infinitedb_storage::{
     compaction::{compact, CompactionConfig},
     gc::RetentionPolicy,
@@ -110,6 +113,18 @@ pub fn maybe_compact_after_seal(
     let mut input_blocks = Vec::new();
     for (_, entry) in &candidates {
         input_blocks.push(store.read_block(entry.block_id)?);
+    }
+
+    if space == ENDPOINT_INDEX_SPACE {
+        let registry = spaces.read();
+        for block in &mut input_blocks {
+            let records = std::mem::take(&mut block.records);
+            block.records = expand_endpoint_index_records_for_compaction(
+                records,
+                &registry,
+                &|_| None,
+            );
+        }
     }
 
     let snap_id = snapshots

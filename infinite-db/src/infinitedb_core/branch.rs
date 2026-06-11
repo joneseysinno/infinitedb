@@ -77,7 +77,7 @@ impl BranchRegistry {
 }
 
 /// Errors returned by branch registry operations.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum BranchError {
     /// A branch with the same name already exists.
     DuplicateName(String),

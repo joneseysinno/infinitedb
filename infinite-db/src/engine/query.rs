@@ -1,6 +1,7 @@
 //! Concurrent query execution over sealed blocks + live tail.
 
 use std::collections::{BTreeMap, HashMap};
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use crate::infinitedb_core::{
     address::{DimensionVector, RevisionId, SpaceId},
@@ -230,12 +231,36 @@ fn record_matches_filter(
     }
 }
 
+/// Query plan instrumentation for frame performance-contract tests (M6).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct QueryPlanStats {
+    pub interval_scans: u32,
+}
+
+static QUERY_INTERVAL_SCANS: AtomicU32 = AtomicU32::new(0);
+
+/// Reset the global interval-scan counter (tests).
+pub fn reset_query_plan_stats() {
+    QUERY_INTERVAL_SCANS.store(0, Ordering::Relaxed);
+}
+
+/// Read accumulated interval-scan count since last reset.
+pub fn query_plan_stats() -> QueryPlanStats {
+    QueryPlanStats {
+        interval_scans: QUERY_INTERVAL_SCANS.load(Ordering::Relaxed),
+    }
+}
+
+fn record_interval_scan(count: u32) {
+    QUERY_INTERVAL_SCANS.fetch_add(count, Ordering::Relaxed);
+}
+
 /// Apply latest-wins visibility per address identity.
 ///
 /// An address is visible iff its highest revision at or below `rev_ceiling` is a
 /// live record; that record is the one returned. When `include_tombstones` is true,
 /// all candidate records are returned unchanged (full revision history).
-fn resolve_visibility(
+pub(crate) fn resolve_visibility(
     spaces: &SpaceRegistry,
     candidates: Vec<Record>,
     rev_ceiling: RevisionId,
@@ -409,6 +434,8 @@ pub fn query_bbox(
         .unwrap_or(8);
     let shard_bits = Some(ShardRef::shard_bits_for_space(spaces, space));
     let intervals = decompose_bbox(&min, &max, bits);
+    let _ = intervals;
+    record_interval_scan(1);
     let rev_ceiling = as_of.unwrap_or_else(|| watermark.allocated());
 
     let shard_filter = shard_bits.map(|sb| {

@@ -79,6 +79,10 @@ impl HilbertCoordinator {
         &self.live_tails
     }
 
+    pub fn live_tails_arc(&self) -> Arc<HilbertLiveTails> {
+        Arc::clone(&self.live_tails)
+    }
+
     pub fn branch_overlays(&self) -> &BranchOverlayStore {
         &self.branch_overlays
     }

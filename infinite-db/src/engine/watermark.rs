@@ -23,6 +23,27 @@ pub struct RevisionRange {
 }
 
 impl RevisionRange {
+    /// Empty range placeholder.
+    pub fn empty() -> Self {
+        Self {
+            first: RevisionId::ZERO,
+            last: RevisionId::ZERO,
+        }
+    }
+
+    /// Single-revision range.
+    pub fn single(rev: RevisionId) -> Self {
+        Self {
+            first: rev,
+            last: rev,
+        }
+    }
+
+    /// Inclusive range from `first` through `last`.
+    pub fn new(first: RevisionId, last: RevisionId) -> Self {
+        Self { first, last }
+    }
+
     /// First revision in the range (inclusive).
     pub fn first(self) -> RevisionId {
         self.first

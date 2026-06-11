@@ -1,5 +1,5 @@
 use super::address::{DimensionVector, SpaceId};
-use super::hyperedge::{EndpointRef, EndpointRole, HyperedgeKind};
+use super::hyperedge::{EndpointPolarity, EndpointRef, EndpointRole, HyperedgeKind};
 use super::signal::SignalKind;
 
 /// Trait for upstream domain types that map to kind labels.
@@ -80,6 +80,7 @@ pub struct AdapterEndpoint {
     pub role: String,
     pub space: SpaceId,
     pub node: DimensionVector,
+    pub polarity: EndpointPolarity,
 }
 
 impl AdapterEndpoint {
@@ -88,7 +89,13 @@ impl AdapterEndpoint {
             role: role.role_label().to_string(),
             space,
             node,
+            polarity: EndpointPolarity::Neutral,
         }
+    }
+
+    pub fn with_polarity(mut self, polarity: EndpointPolarity) -> Self {
+        self.polarity = polarity;
+        self
     }
 }
 
@@ -98,6 +105,7 @@ impl From<AdapterEndpoint> for EndpointRef {
             role: EndpointRole::new(value.role),
             space: value.space,
             node: value.node,
+            polarity: value.polarity,
         }
     }
 }

@@ -1,11 +1,22 @@
 use std::collections::HashMap;
 
+use super::hyperedge::Directionality;
+
 /// Action to take when an unknown label is encountered.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UnknownKindPolicy {
     AllowUnknown,
     WarnUnknown,
     RejectUnknown,
+}
+
+/// Directionality policy registered for an edge kind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DirectionalityPolicy {
+    ObligateDirected,
+    ObligateUndirected,
+    #[default]
+    Free,
 }
 
 /// Metadata for a registered kind/role label.
@@ -15,6 +26,7 @@ pub struct KindDefinition {
     pub description: Option<String>,
     pub owner: Option<String>,
     pub version: Option<String>,
+    pub directionality: DirectionalityPolicy,
 }
 
 impl KindDefinition {
@@ -24,7 +36,13 @@ impl KindDefinition {
             description: None,
             owner: None,
             version: None,
+            directionality: DirectionalityPolicy::Free,
         }
+    }
+
+    pub fn with_directionality(mut self, directionality: DirectionalityPolicy) -> Self {
+        self.directionality = directionality;
+        self
     }
 }
 
@@ -71,6 +89,45 @@ impl KindCatalog {
         self.validate_known(label, &self.endpoint_roles, LabelType::EndpointRole)
     }
 
+    /// Validate edge directionality against a registered kind policy.
+    ///
+    /// Unknown kinds: under `AllowUnknown`/`WarnUnknown`, directionality validation
+    /// is skipped; under `RejectUnknown`, the unknown-label error fires first.
+    pub fn validate_edge_directionality(
+        &self,
+        kind_label: &str,
+        edge_directionality: Directionality,
+    ) -> Result<(), CatalogError> {
+        let Some(def) = self.edge_kinds.get(kind_label) else {
+            return self.validate_edge_kind(kind_label);
+        };
+        match def.directionality {
+            DirectionalityPolicy::Free => Ok(()),
+            DirectionalityPolicy::ObligateDirected => {
+                if edge_directionality != Directionality::Directed {
+                    Err(CatalogError::DirectionalityMismatch {
+                        label: kind_label.to_string(),
+                        required: DirectionalityPolicy::ObligateDirected,
+                        actual: edge_directionality,
+                    })
+                } else {
+                    Ok(())
+                }
+            }
+            DirectionalityPolicy::ObligateUndirected => {
+                if edge_directionality != Directionality::Undirected {
+                    Err(CatalogError::DirectionalityMismatch {
+                        label: kind_label.to_string(),
+                        required: DirectionalityPolicy::ObligateUndirected,
+                        actual: edge_directionality,
+                    })
+                } else {
+                    Ok(())
+                }
+            }
+        }
+    }
+
     fn validate_known(
         &self,
         label: &str,
@@ -114,6 +171,11 @@ impl LabelType {
 #[derive(Debug)]
 pub enum CatalogError {
     UnknownLabel { label_type: LabelType, label: String },
+    DirectionalityMismatch {
+        label: String,
+        required: DirectionalityPolicy,
+        actual: Directionality,
+    },
 }
 
 impl std::fmt::Display for CatalogError {
@@ -122,6 +184,15 @@ impl std::fmt::Display for CatalogError {
             CatalogError::UnknownLabel { label_type, label } => {
                 write!(f, "unknown {} '{}'", label_type.as_str(), label)
             }
+            CatalogError::DirectionalityMismatch {
+                label,
+                required,
+                actual,
+            } => write!(
+                f,
+                "directionality mismatch for kind '{}': required {:?}, got {:?}",
+                label, required, actual
+            ),
         }
     }
 }
@@ -132,10 +203,51 @@ impl std::error::Error for CatalogError {}
 mod tests {
     use super::*;
 
+    fn catalog_with_directed_kind() -> KindCatalog {
+        let mut c = KindCatalog::new(UnknownKindPolicy::RejectUnknown);
+        c.register_edge_kind(
+            KindDefinition::new("beam.bears_on")
+                .with_directionality(DirectionalityPolicy::ObligateDirected),
+        );
+        c
+    }
+
     #[test]
     fn reject_policy_errors_for_unknown_kind() {
         let catalog = KindCatalog::new(UnknownKindPolicy::RejectUnknown);
         let err = catalog.validate_edge_kind("beam.bears_on").unwrap_err();
         assert!(err.to_string().contains("unknown edge kind"));
+    }
+
+    #[test]
+    fn oblig_directed_rejects_undirected() {
+        let c = catalog_with_directed_kind();
+        let err = c
+            .validate_edge_directionality("beam.bears_on", Directionality::Undirected)
+            .unwrap_err();
+        assert!(matches!(err, CatalogError::DirectionalityMismatch { .. }));
+    }
+
+    #[test]
+    fn oblig_directed_accepts_directed() {
+        let c = catalog_with_directed_kind();
+        c.validate_edge_directionality("beam.bears_on", Directionality::Directed)
+            .unwrap();
+    }
+
+    #[test]
+    fn unknown_kind_skips_directionality_under_allow() {
+        let c = KindCatalog::new(UnknownKindPolicy::AllowUnknown);
+        c.validate_edge_directionality("unknown", Directionality::Directed)
+            .unwrap();
+    }
+
+    #[test]
+    fn unknown_kind_reject_fires_before_directionality() {
+        let c = KindCatalog::new(UnknownKindPolicy::RejectUnknown);
+        let err = c
+            .validate_edge_directionality("unknown", Directionality::Directed)
+            .unwrap_err();
+        assert!(matches!(err, CatalogError::UnknownLabel { .. }));
     }
 }

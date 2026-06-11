@@ -1,10 +1,21 @@
 //! Storage engine internals (query path, I/O thread, live tail).
 
+pub mod error;
+pub mod error_record;
+pub mod frame;
+pub mod flow_vector;
+pub mod staleness_closure;
+pub mod derivation;
+pub mod import;
+pub mod judgment;
 pub mod block_gc;
 pub mod branch_overlay;
 pub mod compactor;
+pub mod endpoint_index_migrate;
 pub mod coordinator;
 pub mod group_commit;
+pub mod hypergraph;
+pub mod traversal;
 pub mod hilbert_coordinator;
 pub mod hilbert_live_tails;
 pub mod hilbert_shard;

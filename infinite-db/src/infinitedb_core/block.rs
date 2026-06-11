@@ -59,11 +59,3 @@ impl Block {
             .filter(|r| !r.tombstone)
     }
 }
-
-/// A named grouping of blocks within a space — analogous to a table.
-/// A Relation does not own blocks; the storage layer maps block IDs to files.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Relation {
-    pub name: String,
-    pub space: SpaceId,
-}

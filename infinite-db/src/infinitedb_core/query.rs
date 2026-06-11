@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use super::address::{DimensionVector, RevisionId, SpaceId};
+use super::hyperedge::EndpointPolarity;
 use super::snapshot::SnapshotId;
 
 /// An axis-aligned bounding box in N-dimensional space.
@@ -15,6 +16,25 @@ impl SpatialRange {
     pub fn new(min: DimensionVector, max: DimensionVector) -> Self {
         assert_eq!(min.dims(), max.dims(), "Range bounds must have equal dimensions");
         Self { min, max }
+    }
+}
+
+/// Read-side options for derived-index queries (M4).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct QueryOptions {
+    /// When true, skip delta-merge over un-derived assertions (bounded staleness).
+    pub index_only: bool,
+}
+
+impl Default for QueryOptions {
+    fn default() -> Self {
+        Self { index_only: false }
+    }
+}
+
+impl QueryOptions {
+    pub fn index_only() -> Self {
+        Self { index_only: true }
     }
 }
 
@@ -79,5 +99,32 @@ impl Query {
             DimensionVector::new(min),
             DimensionVector::new(max),
         ))
+    }
+}
+
+/// Direction filter for incidence queries.
+///
+/// With M2 endpoint-index layout (`V2PolarityDim`), direction is pinned in the
+/// index coordinate range. V1-layout rows still post-filter until lazy rewrite.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum DirectionFilter {
+    #[default]
+    Any,
+    /// Endpoint appears as head.
+    Incoming,
+    /// Endpoint appears as tail.
+    Outgoing,
+    /// Endpoint appears as neutral only.
+    NeutralOnly,
+}
+
+impl DirectionFilter {
+    pub fn matches(self, polarity: EndpointPolarity) -> bool {
+        match self {
+            DirectionFilter::Any => true,
+            DirectionFilter::Incoming => polarity == EndpointPolarity::Head,
+            DirectionFilter::Outgoing => polarity == EndpointPolarity::Tail,
+            DirectionFilter::NeutralOnly => polarity == EndpointPolarity::Neutral,
+        }
     }
 }

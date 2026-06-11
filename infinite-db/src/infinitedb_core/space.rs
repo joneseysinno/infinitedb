@@ -23,6 +23,18 @@ impl Default for CompactionPolicy {
     }
 }
 
+/// Endpoint reverse-index coordinate layout (reserved `ENDPOINT_INDEX_SPACE` only).
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, Encode, Decode,
+)]
+pub enum EndpointIndexLayout {
+    /// M1 symmetric layout: no polarity coordinate dimension.
+    #[default]
+    V1Symmetric,
+    /// M2 layout: polarity dimension between endpoint coords and edge-id dimensions.
+    V2PolarityDim,
+}
+
 /// Configuration for a registered space.
 #[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode)]
 pub struct SpaceConfig {
@@ -37,12 +49,6 @@ pub struct SpaceConfig {
     /// at the same precision or `BTreeMap` ordering breaks. It is fixed when the
     /// space is registered and must satisfy `dims * bits_per_dim <= 128`.
     pub bits_per_dim: u32,
-    /// Experimental: key hyperedges in this space by the centroid of their
-    /// endpoints (for spatial locality) instead of by `HyperedgeId`.
-    ///
-    /// When enabled, the database maintains an id→point locator so edges remain
-    /// addressable by id. Defaults to `false`; only affects hyperedge spaces.
-    pub centroid_keying: bool,
     /// Hilbert range sharding within this space (format v4).
     ///
     /// `shard_id = hilbert_key >> (128 - shard_bits)`. Default `4` → 16 shards.
@@ -51,6 +57,15 @@ pub struct SpaceConfig {
     /// Compaction history retention for this space.
     #[serde(default)]
     pub compaction_policy: CompactionPolicy,
+    /// Endpoint index layout version (meaningful only for `ENDPOINT_INDEX_SPACE`).
+    #[serde(default)]
+    pub endpoint_index_layout: EndpointIndexLayout,
+    /// Companion space for operation-level error records (M5).
+    #[serde(default)]
+    pub error_space: Option<SpaceId>,
+    /// When true, do not auto-register a companion error space on registration.
+    #[serde(default)]
+    pub skip_error_space: bool,
 }
 
 impl SpaceConfig {
@@ -61,21 +76,17 @@ impl SpaceConfig {
             name: name.into(),
             dims,
             bits_per_dim: 8,
-            centroid_keying: false,
             shard_bits: 4,
             compaction_policy: CompactionPolicy::default(),
+            endpoint_index_layout: EndpointIndexLayout::default(),
+            error_space: None,
+            skip_error_space: false,
         }
     }
 
     /// Override the Hilbert precision (bits per dimension) for this space.
     pub fn with_bits_per_dim(mut self, bits_per_dim: u32) -> Self {
         self.bits_per_dim = bits_per_dim;
-        self
-    }
-
-    /// Enable experimental centroid-based hyperedge keying for this space.
-    pub fn with_centroid_keying(mut self) -> Self {
-        self.centroid_keying = true;
         self
     }
 
@@ -89,6 +100,29 @@ impl SpaceConfig {
     pub fn with_compaction_policy(mut self, policy: CompactionPolicy) -> Self {
         self.compaction_policy = policy;
         self
+    }
+
+    /// Override endpoint index layout (reserved index space).
+    pub fn with_endpoint_index_layout(mut self, layout: EndpointIndexLayout) -> Self {
+        self.endpoint_index_layout = layout;
+        self
+    }
+
+    /// Link an existing companion error space.
+    pub fn with_error_space(mut self, error_space: SpaceId) -> Self {
+        self.error_space = Some(error_space);
+        self
+    }
+
+    /// Disable auto-registration of a companion error space.
+    pub fn without_error_space(mut self) -> Self {
+        self.skip_error_space = true;
+        self
+    }
+
+    /// Companion error space id, if configured.
+    pub fn companion_error_space(&self) -> Option<SpaceId> {
+        self.error_space
     }
 }
 
@@ -134,6 +168,16 @@ impl SpaceRegistry {
         self.spaces.keys().copied().collect()
     }
 
+    /// Companion error space for a data space, if linked.
+    pub fn error_space_for(&self, data_space: SpaceId) -> Option<SpaceId> {
+        self.get(data_space)?.error_space
+    }
+
+    /// Derive a companion error space id from a data space id.
+    pub fn derive_error_space_id(data_space: SpaceId) -> SpaceId {
+        SpaceId(data_space.0 ^ 0xE000_0000_0000_0000)
+    }
+
     /// Remove a space and return its previous configuration, if it existed.
     pub fn remove(&mut self, id: SpaceId) -> Option<SpaceConfig> {
         if let Some(config) = self.spaces.remove(&id) {
@@ -143,10 +187,27 @@ impl SpaceRegistry {
             None
         }
     }
+
+    /// Replace an existing space configuration (e.g. endpoint index layout upgrade).
+    pub fn update(&mut self, config: SpaceConfig) -> Result<(), SpaceError> {
+        let existing = self
+            .spaces
+            .get(&config.id)
+            .ok_or(SpaceError::NotFound(config.id))?;
+        if existing.name != config.name && self.names.contains_key(&config.name) {
+            return Err(SpaceError::DuplicateName(config.name));
+        }
+        if existing.name != config.name {
+            self.names.remove(&existing.name);
+            self.names.insert(config.name.clone(), config.id);
+        }
+        self.spaces.insert(config.id, config);
+        Ok(())
+    }
 }
 
 /// Errors returned by space registry operations.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum SpaceError {
     /// The provided `SpaceId` is already registered.
     DuplicateId(SpaceId),

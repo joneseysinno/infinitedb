@@ -75,6 +75,10 @@ impl SpaceCoordinator {
         &self.live_tails
     }
 
+    pub fn live_tails_arc(&self) -> Arc<SpaceLiveTails> {
+        Arc::clone(&self.live_tails)
+    }
+
     pub fn ensure_space(&self, space: SpaceId) -> io::Result<()> {
         if self.shards.contains_key(&space) {
             return Ok(());

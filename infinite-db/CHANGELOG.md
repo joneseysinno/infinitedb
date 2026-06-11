@@ -4,7 +4,33 @@
 
 ### Added
 
-- `InfiniteDb::insert_many` / `insert_many_on_branch` bulk write API with per-shard `WriteBatch` routing.
+- **Milestone 7 — flow-vector lane and staleness closures:** `FlowVector`, `FlowVectorSubscriber`, `FLOW_VECTOR_INDEX_SPACE`; `ComputationProvenance` / Hyperedge V4 codec; `query_flow_vectors_in_region`, `query_flow_vector_for_edge`, `check_hyperedge_freshness`, `query_stale_downstream`; delta-merge reads for flow-vector index lag.
+- Integration tests: `tests/hypergraph_m7.rs`.
+
+- **Milestone 6 — frame-resolution query API:** `FrameDefinition`, `register_frame`, `query_hyperedges_in_frame`, `query_hyperedges_for_endpoint_in_frame`, `traverse_in_frame`; overlay policies (`Suppress`, `Annotate`, `SelectContested`); `QueryPlanStats` performance instrumentation.
+- Integration tests: `tests/hypergraph_m6.rs`.
+
+- **Milestone 5 — provenance, judgments, error records:** `AuthoringFrameProvenance` / Hyperedge V3 codec; `register_arbiter_stream`, `assert_judgment`, judgment index queries; per-space companion error spaces; `persist_operation_errors`, `query_operation_errors`, `resolve_operation_error`; `diagnose_assertion` helpers.
+- Integration tests: `tests/hypergraph_m5.rs`.
+
+- **Milestone 4 — derivation bus:** async endpoint-index derivation; `DerivationBus`, per-subscriber watermarks, delta-merge reads (`QueryOptions::index_only`), `sync_derivation`, `derivation_stats`, `DerivationBackpressurePolicy`.
+- `StorageError`, `EngineError`, `project_api_error`; `register_space` / `create_branch` return `EngineError`.
+- Bulk hyperedge import: `begin_hyperedge_import`, `commit_hyperedge_import`, `ImportErrorLog`, `ImportBudget`.
+- Integration tests: `tests/hypergraph_m4.rs`.
+
+- **Milestone 3 — directional traversal:** `TraversalDirection`, `TraversalMode`, `TraversalResult` with wave-front levels; `InfiniteDb::traverse_hypergraph`, `check_hypergraph_acyclic`; reachability BFS and opt-in B-connectivity mode.
+- Integration tests: `tests/hypergraph_m3.rs`.
+
+- **Milestone 2 — polarity-dimension endpoint index:** `EndpointIndexLayout`, V2 index coordinate encoding, dual-layout reads, `compact_endpoint_index` lazy rewrite.
+- `InfiniteDb::count_incident_edges_for_endpoint`, `count_incident_edges_for_endpoint_directed`.
+- `InfiniteDb::upgrade_endpoint_index_layout`, `compact_endpoint_index`.
+- Integration tests: `tests/hypergraph_m2.rs`.
+
+- **Milestone 1 — directed hypergraph on CRCW:** `EndpointPolarity`, `Directionality`, versioned `hyperedge_codec`, catalog `DirectionalityPolicy`, `engine/hypergraph` write path.
+- `InfiniteDb::insert_hyperedge`, `delete_hyperedge`, `insert_hyperedge_typed`, `query_hyperedges`, `query_hyperedges_for_endpoint`, `query_hyperedges_for_endpoint_directed`.
+- `DirectionFilter` for directional incidence queries (index-resident under M2 layout; V1-layout fallback post-filter until lazy rewrite).
+- Integration tests: `tests/hypergraph_m1.rs`.
+- `MILESTONES.md` roadmap (M1–M7) linked to design document.
 - `InfiniteDb::compact(space)` manual compaction trigger.
 - `InfiniteDb::compact_with(space, policy)` and per-space `CompactionPolicy` on `SpaceConfig` (keep-all default).
 - `InfiniteDb::allocate_revisions(count)` for advanced `enqueue_batch` callers.
@@ -22,10 +48,18 @@
 - `InfiniteDb::failed_revisions()` is non-destructive; use `take_failed_revisions()` to explicitly drain the failure log.
 - `RevisionWatermark` allocation+registration race: counter and outstanding set now update under one lock, so `stable_revision()` never observes an allocated-but-unregistered revision (fixes non-repeatable `ReadTxn` pins).
 
+### Removed
+
+- Internal `legacy_v1` engine and `legacy-v1` feature flag.
+- `centroid_keying`, `coords` locator helpers, `InfiniteSchema`, `block::Relation`.
+
 ### Changed
 
+- Main-branch hyperedge writes commit assertions synchronously; endpoint index rows derive on the background bus (branch writes remain synchronous).
+- `sync()` flushes the derivation bus before `sync_all()`.
+- `ConflictQueue::push` / `remove` propagate persistence failures.
+- Server `WriteHyperedge` / `DeleteHyperedge` route through hypergraph validation and endpoint index maintenance.
 - `InfiniteDb::revision()` and `stable_revision()` return `RevisionId` (was `u64`).
-- `InfiniteDb::allocate_revisions(count)` returns `RevisionRange` (was `(RevisionId, RevisionId)`).
 - Phase 3 type hygiene: engine APIs use `SpaceId`/`BranchId`/`RevisionId` newtypes (disk boundaries still use raw `u64` where needed); `HilbertKey`/`CachedHilbertKey` replace raw `u128` hilbert fields; `Checksum` wraps block digests; `ShardRef` replaces `(shard_id, shard_bits)` tuples; `AddressKey`/`RecordIdentityKey` drive visibility and seal deduplication; `RevisionWatermark` tracks `BTreeSet<RevisionId>` with `predecessor()`-based stable ceiling.
 - Auto-compaction defaults to `retain_history: true`; use `CompactionPolicy::LatestOnly` to opt into history-dropping compaction.
 - `RevisionWatermark` owns allocation; `enqueue_batch` requires watermark-allocated revisions.

@@ -10,7 +10,7 @@
 
 /// Addressing primitives (`Address`, `SpaceId`, `DimensionVector`).
 pub mod address;
-/// Block-level storage records and relations.
+/// Block-level storage records.
 pub mod block;
 /// Branching model and branch registry.
 pub mod branch;
@@ -18,12 +18,12 @@ pub mod branch;
 pub mod merge;
 /// Query descriptor types.
 pub mod query;
-/// Schema trait implemented by storable record types.
-pub mod schema;
 /// Upstream adapter traits and conversions.
 pub mod adapter;
 /// Hyperedge relationship primitives.
 pub mod hyperedge;
+/// Versioned hyperedge payload codec.
+pub mod hyperedge_codec;
 /// Reverse endpoint index for hyperedge lookups.
 pub mod endpoint_index;
 /// Cross-space hypergraph traversal.
@@ -44,5 +44,26 @@ pub mod hilbert_key;
 pub mod checksum;
 /// Record/address identity keys for grouping.
 pub mod record_identity;
-/// Legacy coordinate packing codecs.
-pub mod coords;
+/// Authoring-frame provenance on testimony (M5).
+pub mod provenance;
+/// Operation-level error records (M5).
+pub mod error_record;
+pub mod error_record_codec;
+pub mod error_kind_catalog;
+/// Judgment testimony conventions (M5).
+pub mod judgment;
+pub mod judgment_codec;
+pub mod judgment_index;
+/// Pure staleness diagnosis helpers (M5).
+pub mod staleness;
+/// Named durable frame definitions (M6).
+pub mod frame;
+/// Frame query request types (M6).
+pub mod frame_query;
+/// Flow-vector displacement and quantization (M7).
+pub mod flow_vector;
+pub mod flow_vector_index;
+/// Computation input lineage (M7).
+pub mod computation;
+/// Structural staleness via input pins (M7).
+pub mod staleness_closure;

@@ -1,6 +1,6 @@
 [package]
 name = "infinite-db"
-version = "0.3.3"
+version = "0.4.0"
 authors = ["Jonesey's Innovation"]
 edition = "2024"
 rust-version = "1.85"
@@ -19,8 +19,6 @@ all-features = true
 [features]
 default = ["embedded"]
 embedded = []
-# Internal v1 WAL engine (reference only; not for new code).
-legacy-v1 = ["embedded"]
 server = ["embedded", "dep:tokio"]
 sync = ["server"]
 
@@ -48,6 +46,31 @@ parking_lot = "0.12"
 tokio = { version = "1", features = ["full"] }
 tempfile = "3"
 criterion = "0.5"
+
+[[test]]
+name = "hypergraph_m1"
+path = "tests/hypergraph_m1.rs"
+required-features = ["embedded"]
+
+[[test]]
+name = "hypergraph_m4"
+path = "tests/hypergraph_m4.rs"
+required-features = ["embedded"]
+
+[[test]]
+name = "hypergraph_m5"
+path = "tests/hypergraph_m5.rs"
+required-features = ["embedded"]
+
+[[test]]
+name = "hypergraph_m6"
+path = "tests/hypergraph_m6.rs"
+required-features = ["embedded"]
+
+[[test]]
+name = "hypergraph_m7"
+path = "tests/hypergraph_m7.rs"
+required-features = ["embedded"]
 
 [[test]]
 name = "concurrent_db"

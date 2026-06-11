@@ -38,7 +38,7 @@ impl FormatVersion {
         Self(FORMAT_VERSION_V2)
     }
 
-    /// Original v1 WAL layout (requires `legacy-v1` feature).
+    /// Original on-disk format v1 WAL layout (opening no longer supported).
     pub fn v1() -> Self {
         Self(FORMAT_VERSION_V1)
     }

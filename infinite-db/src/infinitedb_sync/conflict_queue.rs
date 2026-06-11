@@ -14,6 +14,7 @@ use crate::infinitedb_core::{
     hilbert_key::CachedHilbertKey,
     merge::MergeConflict,
 };
+use crate::infinitedb_storage::error::StorageError;
 
 /// One unresolved merge conflict awaiting operator resolution.
 #[derive(Debug, Clone, Encode, Decode)]
@@ -52,7 +53,12 @@ impl ConflictQueue {
         })
     }
 
-    pub fn push(&self, target: BranchId, source: BranchId, conflict: MergeConflict) -> u64 {
+    pub fn push(
+        &self,
+        target: BranchId,
+        source: BranchId,
+        conflict: MergeConflict,
+    ) -> Result<u64, StorageError> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         self.entries.lock().push(StoredConflict {
             id,
@@ -60,8 +66,8 @@ impl ConflictQueue {
             source,
             conflict,
         });
-        let _ = self.persist();
-        id
+        self.persist()?;
+        Ok(id)
     }
 
     pub fn push_all(
@@ -69,7 +75,7 @@ impl ConflictQueue {
         target: BranchId,
         source: BranchId,
         conflicts: Vec<MergeConflict>,
-    ) -> Vec<u64> {
+    ) -> Result<Vec<u64>, StorageError> {
         conflicts
             .into_iter()
             .map(|c| self.push(target, source, c))
@@ -102,28 +108,37 @@ impl ConflictQueue {
         Ok(removed)
     }
 
-    pub fn remove(&self, id: u64) -> Option<StoredConflict> {
+    pub fn remove(&self, id: u64) -> Result<Option<StoredConflict>, StorageError> {
         let mut guard = self.entries.lock();
-        let pos = guard.iter().position(|c| c.id == id)?;
+        let pos = match guard.iter().position(|c| c.id == id) {
+            Some(p) => p,
+            None => return Ok(None),
+        };
         let removed = guard.remove(pos);
         drop(guard);
-        let _ = self.persist();
-        Some(removed)
+        self.persist()?;
+        Ok(Some(removed))
     }
 
     pub fn len(&self) -> usize {
         self.entries.lock().len()
     }
 
-    fn persist(&self) -> io::Result<()> {
+    fn persist(&self) -> Result<(), StorageError> {
         if let Some(parent) = self.path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let bytes = encode_to_vec(&*self.entries.lock(), standard())
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        let bytes = encode_to_vec(&*self.entries.lock(), standard()).map_err(|e| {
+            StorageError::Io {
+                kind: io::ErrorKind::Other,
+                message: e.to_string(),
+                path: Some(self.path.clone()),
+            }
+        })?;
         let tmp = self.path.with_extension("tmp");
-        std::fs::write(&tmp, &bytes)?;
+        std::fs::write(&tmp, &bytes).map_err(|e| StorageError::from_io(e, Some(tmp.clone())))?;
         std::fs::rename(&tmp, &self.path)
+            .map_err(|e| StorageError::from_io(e, Some(self.path.clone())))
     }
 }
 

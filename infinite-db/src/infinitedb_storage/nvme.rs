@@ -166,7 +166,7 @@ impl BlockStore {
         Ok(arc)
     }
 
-    /// Legacy owned read for v1 WAL layout (requires `legacy-v1` feature).
+    /// Owned read of a block (clones the shared cache entry).
     pub fn read_block(&self, id: BlockId) -> io::Result<Block> {
         Ok((*self.read_block_shared(id)?).clone())
     }

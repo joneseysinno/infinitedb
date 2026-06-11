@@ -14,15 +14,13 @@
 //! - `embedded` (default) — [`InfiniteDb`], storage engine
 //! - `server` — TCP API (`embedded` + tokio)
 //! - `sync` — replication, conflict queue, branch merge helpers (`server`)
-//! - `legacy-v1` — internal v1 WAL engine (compile-only reference; not exposed in the public API)
 //!
 //! ## Migrating from 0.2.0
 //!
-//! 0.3.0 replaces the single-threaded WAL [`InfiniteDb`] with a CRCW engine. Bulk write APIs
-//! (`insert_records_bulk`, hyperedge/signal bulk import) are no longer public. Hyperedge and
-//! signal types remain in [`infinitedb_core`] for upstream modeling; use record-level
-//! [`InfiniteDb::insert`] / [`InfiniteDb::query`] or stay on crate 0.2.0 if you need the old
-//! bulk surface. See the crate README and `CHANGELOG.md` for the full breaking-change list.
+//! 0.3.0 replaces the single-threaded WAL [`InfiniteDb`] with a CRCW engine. Bulk session APIs
+//! from 0.2.0 are removed; hypergraph write/query APIs are restored in Milestone 1.
+//! Hyperedge and signal types remain in [`infinitedb_core`]; use [`InfiniteDb::insert_hyperedge`]
+//! or record-level [`InfiniteDb::insert`] / [`InfiniteDb::query`]. See `README.md` and `CHANGELOG.md`.
 //!
 //! ## Semantic Vocabulary
 //! - `Space`: named N-dimensional dataset with fixed dimensionality.
@@ -62,12 +60,45 @@ pub mod infinitedb_sync;
 pub use concurrent::{InfiniteDb, IoStats, OpenOptions, ReadTxn, RevisionRange};
 
 #[cfg(feature = "embedded")]
+pub use engine::derivation::{DerivationBackpressurePolicy, DerivationStats};
+#[cfg(feature = "embedded")]
+pub use engine::error::EngineError;
+#[cfg(feature = "embedded")]
+pub use engine::import::{
+    HyperedgeImportResult, HyperedgeImportSession, ImportBudget, ImportErrorClass,
+    ImportErrorEntry, ImportErrorLog,
+};
+#[cfg(feature = "embedded")]
+pub use engine::frame::{AttachedJudgment, FrameResolvedHyperedge, FrameTraversalResult};
+#[cfg(feature = "embedded")]
+pub use infinitedb_core::{
+    error_record::{ErrorKind, OperationErrorRecord, OperationRevisionRange},
+    frame::{
+        AssertionScope, FrameDefinition, FrameRegisterRequest, JudgmentOverlayLayer, OverlayPolicy,
+        TestimonySource, VerdictFilter,
+    },
+    frame_query::{FrameQuery, FrameQueryOptions},
+    judgment::{ArbiterId, ArbiterStream, JudgmentId, JudgmentRecord, JudgmentVerdict, SubjectPin},
+    provenance::{AuthoringFrameProvenance, FrameId},
+    computation::ComputationProvenance,
+    flow_vector::{FlowVector, FlowVectorQuantization, QuantizedDirection},
+    flow_vector_index::FLOW_VECTOR_INDEX_SPACE,
+    staleness::{consulted_from_frame, diagnose_assertion, ConsultedFrame, StalenessDiagnosis},
+    staleness_closure::{FreshnessReport, FreshnessStatus, InputFreshness, StaleTarget},
+    traversal::FrameTraversalSpec,
+};
+#[cfg(feature = "embedded")]
+pub use infinitedb_core::flow_vector::FlowVectorRecord;
+#[cfg(feature = "embedded")]
+pub use infinitedb_core::query::QueryOptions;
+
+#[cfg(feature = "embedded")]
 pub use infinitedb_storage::format::{
     FormatVersion, FORMAT_VERSION_V2, FORMAT_VERSION_V3, FORMAT_VERSION_V4,
 };
 
 #[cfg(feature = "server")]
-pub use infinitedb_server::api::{handle_request, ApiError, Request, Response, WireConflict};
+pub use infinitedb_server::api::{handle_request, project_api_error, ApiError, Request, Response, WireConflict};
 
 #[cfg(feature = "server")]
 pub use infinitedb_server::runtime::{admin_grants, client_roundtrip, Server, ServerConfig};
@@ -110,5 +141,3 @@ pub use infinitedb_storage::wal::WalDurability;
 mod concurrent;
 #[cfg(feature = "embedded")]
 mod engine;
-#[cfg(all(feature = "embedded", feature = "legacy-v1"))]
-mod legacy_v1;

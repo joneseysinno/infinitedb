@@ -15,3 +15,5 @@ pub mod nvme;
 pub mod compaction;
 /// Retention policy and garbage collection helpers.
 pub mod gc;
+/// Storage-layer error types.
+pub mod error;

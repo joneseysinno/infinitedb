@@ -18,6 +18,7 @@ use crate::infinitedb_core::{
     signal::SignalSample,
     snapshot::SnapshotId,
 };
+use crate::engine::error::EngineError;
 use crate::infinitedb_server::session::Session;
 use crate::InfiniteDb;
 
@@ -123,6 +124,44 @@ pub enum Response {
     Error(ApiError),
 }
 
+/// Project an engine error to the wire contract — the single deliberate information-loss point.
+pub fn project_api_error(err: EngineError) -> ApiError {
+    match err {
+        EngineError::SpaceNotFound(id) => ApiError::SpaceNotFound(id),
+        EngineError::InvalidHyperedge(e) => ApiError::InvalidRequest(format!("{e:?}")),
+        EngineError::InvalidSpaceConfig { message }
+        | EngineError::BranchExists(_)
+        | EngineError::BranchNotFound(_)
+        | EngineError::RegistrySpace(crate::infinitedb_core::space::SpaceError::DuplicateId(_))
+        | EngineError::RegistrySpace(crate::infinitedb_core::space::SpaceError::DuplicateName(_))
+        | EngineError::RegistryBranch(
+            crate::infinitedb_core::branch::BranchError::DuplicateName(_),
+        )
+        | EngineError::RegistryBranch(crate::infinitedb_core::branch::BranchError::NotFound(_))
+        | EngineError::EndpointIndexMissing
+        | EngineError::ErrorSpaceMissing(_)
+        | EngineError::InvalidJudgment(_)
+        | EngineError::InvalidProvenance(_)
+        | EngineError::ArbiterStreamExists(_)
+        | EngineError::ArbiterStreamNotFound(_)
+        | EngineError::FrameExists(_)
+        | EngineError::FrameNotFound(_)
+        | EngineError::InvalidFrame(_)
+        | EngineError::InvalidComputation(_) => ApiError::InvalidRequest(err.to_string()),
+        EngineError::DerivationBackpressure { .. } => {
+            ApiError::InvalidRequest(err.to_string())
+        }
+        EngineError::ErrorKindCatalog(_) => ApiError::InvalidRequest(err.to_string()),
+        EngineError::Storage(_)
+        | EngineError::RegistrySpace(_)
+        | EngineError::RegistryBranch(_)
+        | EngineError::WatermarkViolation { .. }
+        | EngineError::ErrorRecordEncode { .. }
+        | EngineError::ErrorRecordDecode { .. }
+        | EngineError::Other { .. } => ApiError::Internal(err.to_string()),
+    }
+}
+
 /// Structured errors returned to the client.
 #[derive(Debug, Encode, Decode)]
 pub enum ApiError {
@@ -195,15 +234,7 @@ pub fn handle_request(db: &InfiniteDb, session: &Session, request: Request) -> R
             if !session.can_write(space) {
                 return Response::Error(ApiError::Unauthorised);
             }
-            let point = DimensionVector::new(vec![
-                (edge.id.0 >> 32) as u32,
-                (edge.id.0 & 0xFFFF_FFFF) as u32,
-            ]);
-            let data = match bincode::encode_to_vec(edge, bincode::config::standard()) {
-                Ok(v) => v,
-                Err(e) => return Response::Error(ApiError::InvalidRequest(e.to_string())),
-            };
-            match db.insert_on_branch(session.branch, space, point, data) {
+            match db.insert_hyperedge_on_branch(session.branch, space, edge) {
                 Ok(rev) => Response::WriteAck { revision: rev },
                 Err(e) => Response::Error(ApiError::Internal(e.to_string())),
             }
@@ -213,11 +244,7 @@ pub fn handle_request(db: &InfiniteDb, session: &Session, request: Request) -> R
             if !session.can_write(space) {
                 return Response::Error(ApiError::Unauthorised);
             }
-            let point = DimensionVector::new(vec![
-                (edge_id.0 >> 32) as u32,
-                (edge_id.0 & 0xFFFF_FFFF) as u32,
-            ]);
-            match db.delete_on_branch(session.branch, space, point) {
+            match db.delete_hyperedge_on_branch(session.branch, space, edge_id) {
                 Ok(rev) => Response::WriteAck { revision: rev },
                 Err(e) => Response::Error(ApiError::Internal(e.to_string())),
             }
@@ -252,7 +279,7 @@ pub fn handle_request(db: &InfiniteDb, session: &Session, request: Request) -> R
             }
             match db.create_branch(&name, from_branch) {
                 Ok(id) => Response::BranchCreated { branch: id },
-                Err(e) => Response::Error(ApiError::Internal(e)),
+                Err(e) => Response::Error(project_api_error(e)),
             }
         }
 
@@ -273,8 +300,13 @@ pub fn handle_request(db: &InfiniteDb, session: &Session, request: Request) -> R
                 Ok(mut result) => {
                     #[cfg(feature = "sync")]
                     if strategy == MergeStrategy::Interactive && !result.conflicts.is_empty() {
-                        db.conflicts()
-                            .push_all(target, source, std::mem::take(&mut result.conflicts));
+                        if let Err(e) = db.conflicts().push_all(
+                            target,
+                            source,
+                            std::mem::take(&mut result.conflicts),
+                        ) {
+                            return Response::Error(project_api_error(e.into()));
+                        }
                     }
                     Response::MergeComplete(result)
                 }
@@ -320,8 +352,15 @@ pub fn handle_request(db: &InfiniteDb, session: &Session, request: Request) -> R
                 ) {
                     return Response::Error(ApiError::Internal(e.to_string()));
                 }
-                let _ = db.conflicts().remove(id);
-                return Response::ConflictResolved { id };
+                match db.conflicts().remove(id) {
+                    Ok(Some(_)) => return Response::ConflictResolved { id },
+                    Ok(None) => {
+                        return Response::Error(ApiError::InvalidRequest(format!(
+                            "conflict {id} not found"
+                        )));
+                    }
+                    Err(e) => return Response::Error(project_api_error(e.into())),
+                }
             }
             #[cfg(not(feature = "sync"))]
             Response::Error(ApiError::Internal("sync disabled".into()))
@@ -400,9 +439,12 @@ where
             if !session.can_write(space) {
                 return Response::Error(ApiError::Unauthorised);
             }
-            let point = DimensionVector::new(vec![(edge.id.0 >> 32) as u32, (edge.id.0 & 0xFFFF_FFFF) as u32]);
+            if let Err(e) = edge.validate() {
+                return Response::Error(ApiError::InvalidRequest(format!("{:?}", e)));
+            }
+            let point = Hyperedge::storage_point(edge.id);
             let address = Address::new(space, point);
-            let data = match bincode::encode_to_vec(edge, bincode::config::standard()) {
+            let data = match crate::infinitedb_core::hyperedge_codec::encode_hyperedge(&edge) {
                 Ok(v) => v,
                 Err(e) => return Response::Error(ApiError::InvalidRequest(e.to_string())),
             };
@@ -416,7 +458,7 @@ where
             if !session.can_write(space) {
                 return Response::Error(ApiError::Unauthorised);
             }
-            let point = DimensionVector::new(vec![(edge_id.0 >> 32) as u32, (edge_id.0 & 0xFFFF_FFFF) as u32]);
+            let point = Hyperedge::storage_point(edge_id);
             let address = Address::new(space, point);
             match write(address, revision, vec![], true) {
                 Ok(rev) => Response::WriteAck { revision: rev },

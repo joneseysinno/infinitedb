@@ -1,5 +1,6 @@
 //! [`InfiniteDb`] — fire-and-forget writes with per-space I/O (v3) or global I/O (v2).
 
+use std::collections::HashMap;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -11,25 +12,94 @@ use parking_lot::{Mutex, RwLock};
 use crate::engine::branch_overlay::{BranchOverlayStore, OverlayKey};
 use crate::engine::compactor::CompactionPolicyOverrides;
 use crate::engine::coordinator::SpaceCoordinator;
+use crate::engine::derivation::{
+    AssertionEvent, DerivationBackpressurePolicy, DerivationBus, DerivationSink,
+    DerivationStats, EdgeLocatorSubscriber, EndpointIndexSubscriber, FlowVectorSubscriber,
+    WatermarkRegistry,
+};
+use crate::engine::flow_vector::{
+    default_flow_vector_quantization, edge_id_from_flow_vector_index_record,
+    prepare_flow_vector_derivation,
+};
+use crate::engine::staleness_closure::{forward_stale_closure, staleness_seed_endpoints};
+use crate::engine::error::{engine_to_io, EngineError};
+use crate::engine::error_record::{
+    decode_error_record_payload, operation_record_from_import, prepare_error_tombstone,
+    prepare_error_write, revision_range_from_engine,
+};
+use crate::engine::frame::{
+    apply_judgment_overlay, resolve_visibility_per_source, FrameResolvedHyperedge,
+    FrameTraversalResult,
+};
+use crate::engine::import::{HyperedgeImportResult, HyperedgeImportSession, ImportBudget};
+use crate::engine::judgment::{
+    decode_judgment_record, judgment_id_from_index_payload, prepare_judgment_writes,
+};
 use crate::engine::hilbert_coordinator::HilbertCoordinator;
 use crate::engine::hilbert_live_tails::HilbertLiveTails;
 use crate::engine::io_thread::{open_io_pipeline, IoStats, IoThreadConfig, IoThreadHandle};
 use crate::engine::live_tail::LiveTailView;
 use crate::engine::merge::merge_branches;
-use crate::engine::query::{query_bbox, query_inner, snapshots_map_for_persist, space_key};
+use crate::engine::query::{
+    query_bbox, query_inner, query_plan_stats, reset_query_plan_stats, snapshots_map_for_persist,
+    space_key, QueryPlanStats,
+};
 use crate::engine::snapshot_store::SnapshotStore;
 use crate::engine::space_live_tails::SpaceLiveTails;
 use crate::engine::watermark::{FailedRevision, RevisionRange, RevisionWatermark};
 use crate::engine::write_queue::{WriteJob, WriteQueueSender};
+use crate::engine::endpoint_index_migrate::edge_spaces_from_registry;
+use crate::engine::hypergraph::{
+    self, decode_edge_record, endpoint_index_space_config, filter_edges_by_direction,
+    incident_edge_ids_directed, incident_edge_degree, incident_edge_ids_from_records,
+    partition_incident_ids_by_layout, plan_v1_to_v2_index_rewrite, prepare_assertion_tombstone,
+    prepare_assertion_write, prepare_deletes, prepare_index_derivation, prepare_writes,
+    registry_index_layout, rows_to_records, HypergraphWriteRow,
+};
+use crate::engine::traversal::run_traversal;
 use crate::infinitedb_core::{
     address::{Address, DimensionVector, RevisionId, SpaceId},
+    adapter::{AdapterEndpoint, KindLabel},
     block::Record,
     branch::{Branch, BranchId, BranchRegistry},
-    hilbert_key::HilbertKey,
+    endpoint_index::{endpoint_index_layout_from_registry, ENDPOINT_INDEX_SPACE},
+    error_kind_catalog::ErrorKindCatalog,
+    error_record::{OperationErrorRecord, OperationRevisionRange},
+    judgment::{
+        ArbiterId, ArbiterStream, JudgmentId, JudgmentRecord, JudgmentValidationError,
+        SubjectIdentity, SubjectKind, SubjectPin,
+    },
+    computation::ComputationValidationError,
+    flow_vector::{
+        quantize_direction, FlowVectorRecord, QuantizedDirection,
+    },
+    flow_vector_index::{
+        direction_in_region, flow_vector_index_space_config, pad_flow_vector_index_bbox,
+        FLOW_VECTOR_INDEX_SPACE,
+    },
+    judgment_index::{
+        JUDGMENT_INDEX_SPACE, index_matches_subject_prefix, judgment_index_space_config,
+        subject_spatial_prefix,
+    },
+    staleness_closure::{check_computation_freshness, FreshnessReport, StaleTarget},
+    frame::{
+        flatten_assertion_scope, is_testimony_space, AssertionScope, FrameDefinition,
+        FrameRegisterRequest, FrameValidationError, JudgmentOverlayLayer, TestimonySource,
+    },
+    frame_query::{FrameQuery, FrameQueryOptions},
+    provenance::FrameId,
+    staleness::{consulted_from_frame, validate_authoring_provenance},
+    hilbert_key::{CachedHilbertKey, HilbertKey},
+    hyperedge::{EndpointRef, Hyperedge, HyperedgeId, HyperedgeKind},
+    kind_catalog::KindCatalog,
     merge::{MergeConflict, MergeResult, MergeStrategy},
     persisted_counters::PersistedCounters,
-    space::{CompactionPolicy, SpaceConfig, SpaceRegistry},
+    query::{DirectionFilter, QueryOptions},
+    space::{CompactionPolicy, EndpointIndexLayout, SpaceConfig, SpaceRegistry},
     snapshot::SnapshotId,
+    traversal::{
+        hypergraph_acyclic_for_kinds, FrameTraversalSpec, TraversalResult, TraversalSpec,
+    },
 };
 use crate::infinitedb_storage::{
     format::{FormatVersion, FORMAT_VERSION_V2, FORMAT_VERSION_V3, FORMAT_VERSION_V4},
@@ -46,6 +116,8 @@ pub struct OpenOptions {
     pub block_cache_bytes: usize,
     /// When `None`, new databases use format v4 (Hilbert shards + branches).
     pub format_version: Option<u32>,
+    /// Derivation bus backpressure thresholds (M4).
+    pub derivation: DerivationBackpressurePolicy,
 }
 
 impl Default for OpenOptions {
@@ -54,6 +126,7 @@ impl Default for OpenOptions {
             io_thread: IoThreadConfig::default(),
             block_cache_bytes: 10 * 1024 * 1024,
             format_version: None,
+            derivation: DerivationBackpressurePolicy::default(),
         }
     }
 }
@@ -65,12 +138,11 @@ impl OpenOptions {
     }
 }
 
-enum WriteBackend {
+pub(crate) enum WriteBackend {
     /// Format v2: single global I/O thread.
     V2 {
         queue: WriteQueueSender,
         io_handle: Mutex<IoThreadHandle>,
-        live_tail: Arc<LiveTailView>,
     },
     /// Format v3: one I/O thread per space.
     V3 {
@@ -98,7 +170,76 @@ pub struct InfiniteDb {
     pub(crate) branch_overlays: Arc<BranchOverlayStore>,
     #[cfg(feature = "sync")]
     conflicts: Arc<crate::infinitedb_sync::conflict_queue::ConflictQueue>,
-    backend: WriteBackend,
+    backend: Arc<Mutex<WriteBackend>>,
+    derivation: Arc<DerivationBus>,
+    arbiter_streams: Arc<RwLock<HashMap<ArbiterId, ArbiterStream>>>,
+    frames: Arc<RwLock<HashMap<FrameId, FrameDefinition>>>,
+    next_frame_id: Arc<AtomicU64>,
+    v2_live_tail: Option<Arc<LiveTailView>>,
+    v3_space_tails: Option<Arc<SpaceLiveTails>>,
+    v4_hilbert_tails: Option<Arc<HilbertLiveTails>>,
+}
+
+/// Applies derived index rows through the shared write backend.
+struct DbDerivationSink {
+    spaces: Arc<RwLock<SpaceRegistry>>,
+    backend: Arc<Mutex<WriteBackend>>,
+}
+
+impl DerivationSink for DbDerivationSink {
+    fn apply_derived_rows(
+        &self,
+        rows: Vec<HypergraphWriteRow>,
+        source_revision: RevisionId,
+    ) -> Result<(), EngineError> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let records = rows
+            .iter()
+            .map(|row| Record {
+                address: Address::new(row.space, row.point.clone()),
+                revision: source_revision,
+                data: row.data.clone(),
+                tombstone: row.tombstone,
+                hilbert_key: CachedHilbertKey::UNSET,
+            })
+            .collect::<Vec<_>>();
+        let spaces = self.spaces.read();
+        let mut jobs = Vec::with_capacity(records.len());
+        for record in records {
+            let hilbert_key = HilbertKey(space_key(
+                &spaces,
+                record.address.space,
+                &record.address.point,
+            ));
+            let entry = if record.tombstone {
+                WalEntry::Tombstone {
+                    address: record.address.clone(),
+                    revision: record.revision,
+                }
+            } else {
+                WalEntry::Write {
+                    address: record.address.clone(),
+                    revision: record.revision,
+                    data: record.data,
+                }
+            };
+            jobs.push(WriteJob::main(record.revision, entry, hilbert_key));
+        }
+        drop(spaces);
+        let mut backend = self.backend.lock();
+        match &mut *backend {
+            WriteBackend::V4 { coordinator } => coordinator.enqueue_batch(jobs)?,
+            WriteBackend::V3 { coordinator } => coordinator.enqueue_batch(jobs)?,
+            WriteBackend::V2 { queue, .. } => {
+                for job in jobs {
+                    queue.enqueue_write(job)?;
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 impl InfiniteDb {
@@ -180,58 +321,119 @@ impl InfiniteDb {
             });
         }
 
-        let backend = if format_version == FORMAT_VERSION_V4 {
-            let coordinator = HilbertCoordinator::new(
-                root.clone(),
-                Arc::clone(&store),
-                Arc::clone(&snapshots),
-                Arc::clone(&branch_overlays),
-                Arc::clone(&spaces),
-                Arc::clone(&next_block_id),
-                options.io_thread.clone(),
-                Arc::clone(&watermark),
-                Arc::clone(&compaction_overrides),
-            );
-            coordinator.bootstrap_registered_spaces()?;
-            coordinator.sync_all()?;
-            WriteBackend::V4 { coordinator }
-        } else if format_version == FORMAT_VERSION_V3 {
-            let coordinator = SpaceCoordinator::new(
-                root.clone(),
-                Arc::clone(&store),
-                Arc::clone(&snapshots),
-                Arc::clone(&spaces),
-                Arc::clone(&next_block_id),
-                options.io_thread.clone(),
-                Arc::clone(&watermark),
-                Arc::clone(&compaction_overrides),
-                Some(Arc::clone(&branch_overlays)),
-            );
-            coordinator.bootstrap_registered_spaces()?;
-            coordinator.sync_all()?;
-            WriteBackend::V3 { coordinator }
-        } else {
-            let live_tail = Arc::new(LiveTailView::new());
-            let (queue, io_handle) = open_io_pipeline(
-                root.clone(),
-                Arc::clone(&store),
-                Arc::clone(&snapshots),
-                Arc::clone(&live_tail),
-                Arc::clone(&spaces),
-                Arc::clone(&next_block_id),
-                options.io_thread.clone(),
-                Arc::clone(&watermark),
-                Arc::clone(&compaction_overrides),
-                Some(Arc::clone(&branch_overlays)),
-            );
-            WriteBackend::V2 {
-                queue,
-                io_handle: Mutex::new(io_handle),
-                live_tail,
-            }
-        };
+        let (backend, v2_live_tail, v3_space_tails, v4_hilbert_tails) =
+            if format_version == FORMAT_VERSION_V4 {
+                let coordinator = HilbertCoordinator::new(
+                    root.clone(),
+                    Arc::clone(&store),
+                    Arc::clone(&snapshots),
+                    Arc::clone(&branch_overlays),
+                    Arc::clone(&spaces),
+                    Arc::clone(&next_block_id),
+                    options.io_thread.clone(),
+                    Arc::clone(&watermark),
+                    Arc::clone(&compaction_overrides),
+                );
+                coordinator.bootstrap_registered_spaces()?;
+                coordinator.sync_all()?;
+                let tails = coordinator.live_tails_arc();
+                (
+                    WriteBackend::V4 { coordinator },
+                    None,
+                    None,
+                    Some(tails),
+                )
+            } else if format_version == FORMAT_VERSION_V3 {
+                let coordinator = SpaceCoordinator::new(
+                    root.clone(),
+                    Arc::clone(&store),
+                    Arc::clone(&snapshots),
+                    Arc::clone(&spaces),
+                    Arc::clone(&next_block_id),
+                    options.io_thread.clone(),
+                    Arc::clone(&watermark),
+                    Arc::clone(&compaction_overrides),
+                    Some(Arc::clone(&branch_overlays)),
+                );
+                coordinator.bootstrap_registered_spaces()?;
+                coordinator.sync_all()?;
+                let tails = coordinator.live_tails_arc();
+                (
+                    WriteBackend::V3 { coordinator },
+                    None,
+                    Some(tails),
+                    None,
+                )
+            } else {
+                let live_tail = Arc::new(LiveTailView::new());
+                let (queue, io_handle) = open_io_pipeline(
+                    root.clone(),
+                    Arc::clone(&store),
+                    Arc::clone(&snapshots),
+                    Arc::clone(&live_tail),
+                    Arc::clone(&spaces),
+                    Arc::clone(&next_block_id),
+                    options.io_thread.clone(),
+                    Arc::clone(&watermark),
+                    Arc::clone(&compaction_overrides),
+                    Some(Arc::clone(&branch_overlays)),
+                );
+                (
+                    WriteBackend::V2 {
+                        queue,
+                        io_handle: Mutex::new(io_handle),
+                    },
+                    Some(live_tail),
+                    None,
+                    None,
+                )
+            };
 
-        Ok(Self {
+        let backend = Arc::new(Mutex::new(backend));
+        let derivation_watermarks = Arc::new(WatermarkRegistry::new());
+        derivation_watermarks.register("endpoint_index", RevisionId::ZERO);
+        derivation_watermarks.register("edge_locator", RevisionId::ZERO);
+        derivation_watermarks.register("flow_vector_index", RevisionId::ZERO);
+        let subscribers: Vec<Box<dyn crate::engine::derivation::DerivationSubscriber>> = vec![
+            Box::new(EndpointIndexSubscriber::new(Arc::clone(&spaces))),
+            Box::new(EdgeLocatorSubscriber),
+            Box::new(FlowVectorSubscriber),
+        ];
+        let sink = Arc::new(DbDerivationSink {
+            spaces: Arc::clone(&spaces),
+            backend: Arc::clone(&backend),
+        });
+        let derivation = Arc::new(DerivationBus::new(
+            options.derivation.clone(),
+            Arc::clone(&derivation_watermarks),
+            subscribers,
+            sink,
+        ));
+
+        let arbiter_streams = Arc::new(RwLock::new(HashMap::new()));
+        if let Ok(bytes) = store.read_meta("arbiter_streams.bin") {
+            if let Ok((loaded, _)) =
+                decode_from_slice::<HashMap<ArbiterId, ArbiterStream>, _>(&bytes, standard())
+            {
+                *arbiter_streams.write() = loaded;
+            }
+        }
+
+        let frames = Arc::new(RwLock::new(HashMap::new()));
+        let mut next_frame = 1u64;
+        if let Ok(bytes) = store.read_meta("frames.bin") {
+            if let Ok((loaded, _)) =
+                decode_from_slice::<HashMap<FrameId, FrameDefinition>, _>(&bytes, standard())
+            {
+                for id in loaded.keys() {
+                    next_frame = next_frame.max(id.0.saturating_add(1));
+                }
+                *frames.write() = loaded;
+            }
+        }
+        let next_frame_id = Arc::new(AtomicU64::new(next_frame));
+
+        let db = Self {
             root,
             format_version,
             store,
@@ -247,7 +449,16 @@ impl InfiniteDb {
             #[cfg(feature = "sync")]
             conflicts,
             backend,
-        })
+            derivation,
+            arbiter_streams,
+            frames,
+            next_frame_id,
+            v2_live_tail,
+            v3_space_tails,
+            v4_hilbert_tails,
+        };
+        db.recover_derivation_on_open()?;
+        Ok(db)
     }
 
     /// Head snapshot pointer for `branch`.
@@ -272,29 +483,737 @@ impl InfiniteDb {
     }
 
     /// Register a new space and persist catalog metadata. Required before writes to that space.
-    pub fn register_space(&self, config: SpaceConfig) -> Result<(), String> {
+    ///
+    /// Unless [`SpaceConfig::without_error_space`] is set, auto-registers a companion
+    /// `{name}_errors` space for operation-level error records (M5).
+    pub fn register_space(&self, mut config: SpaceConfig) -> Result<(), EngineError> {
         if config.bits_per_dim == 0 {
-            return Err("bits_per_dim must be at least 1".to_string());
+            return Err(EngineError::InvalidSpaceConfig {
+                message: "bits_per_dim must be at least 1".into(),
+            });
         }
         if config.dims as u32 * config.bits_per_dim > 128 {
-            return Err(format!(
-                "dims * bits_per_dim must be <= 128 (got {} * {})",
-                config.dims, config.bits_per_dim
+            return Err(EngineError::InvalidSpaceConfig {
+                message: format!(
+                    "dims * bits_per_dim must be <= 128 (got {} * {})",
+                    config.dims, config.bits_per_dim
+                ),
+            });
+        }
+        let needs_error_space = !config.skip_error_space
+            && config.id != ENDPOINT_INDEX_SPACE
+            && config.id != JUDGMENT_INDEX_SPACE
+            && config.id != FLOW_VECTOR_INDEX_SPACE
+            && config.error_space.is_none();
+        let space_id = config.id.0;
+        if needs_error_space {
+            let err_id = SpaceRegistry::derive_error_space_id(config.id);
+            let mut registry = self.spaces.write();
+            if registry.get(err_id).is_none() {
+                let err_config = SpaceConfig::new(err_id, format!("{}_errors", config.name), 2)
+                    .without_error_space();
+                registry.register(err_config)?;
+                let err_dir = self.root.join("spaces").join(err_id.0.to_string());
+                std::fs::create_dir_all(&err_dir)?;
+            }
+            config.error_space = Some(err_id);
+            registry.register(config)?;
+        } else {
+            self.spaces.write().register(config)?;
+        }
+        let space_dir = self.root.join("spaces").join(space_id.to_string());
+        std::fs::create_dir_all(&space_dir)?;
+        self.persist_meta()?;
+        Ok(())
+    }
+
+    /// Companion error space for a registered data space (M5).
+    pub fn error_space_for(&self, data_space: SpaceId) -> Option<SpaceId> {
+        self.spaces.read().error_space_for(data_space)
+    }
+
+    pub(crate) fn ensure_endpoint_index_space(&self) -> Result<(), EngineError> {
+        if self.spaces.read().get(ENDPOINT_INDEX_SPACE).is_some() {
+            return Ok(());
+        }
+        self.register_space(endpoint_index_space_config())
+    }
+
+    fn ensure_judgment_index_space(&self) -> Result<(), EngineError> {
+        if self.spaces.read().get(JUDGMENT_INDEX_SPACE).is_some() {
+            return Ok(());
+        }
+        self.register_space(judgment_index_space_config())
+    }
+
+    fn ensure_flow_vector_index_space(&self) -> Result<(), EngineError> {
+        if self.spaces.read().get(FLOW_VECTOR_INDEX_SPACE).is_some() {
+            return Ok(());
+        }
+        self.register_space(flow_vector_index_space_config())
+    }
+
+    fn error_space_for_data(&self, data_space: SpaceId) -> Result<SpaceId, EngineError> {
+        self.spaces
+            .read()
+            .error_space_for(data_space)
+            .ok_or(EngineError::ErrorSpaceMissing(data_space))
+    }
+
+    /// Endpoint reverse-index layout for the reserved index space.
+    pub fn endpoint_index_layout(&self) -> EndpointIndexLayout {
+        endpoint_index_layout_from_registry(&self.spaces.read())
+    }
+
+    /// Upgrade the reserved endpoint index to M2 polarity-dimension layout (lazy rewrite via compaction).
+    pub fn upgrade_endpoint_index_layout(&self) -> Result<(), EngineError> {
+        self.ensure_endpoint_index_space()?;
+        let mut registry = self.spaces.write();
+        let config = registry
+            .get(ENDPOINT_INDEX_SPACE)
+            .cloned()
+            .ok_or(EngineError::EndpointIndexMissing)?;
+        let updated = config.with_endpoint_index_layout(EndpointIndexLayout::V2PolarityDim);
+        registry.update(updated)?;
+        drop(registry);
+        self.persist_meta()?;
+        Ok(())
+    }
+
+    /// Derivation bus observability (M4).
+    pub fn derivation_stats(&self) -> DerivationStats {
+        self.derivation.stats()
+    }
+
+    /// Block until background derivation catches up with submitted assertions.
+    pub fn sync_derivation(&self) {
+        self.derivation.flush();
+    }
+
+    /// Replay durable assertions with revision above derivation watermarks (crash recovery, M4).
+    fn recover_derivation_on_open(&self) -> io::Result<()> {
+        use std::collections::HashMap;
+
+        let watermark = self.derivation.min_watermark();
+        let edge_spaces = edge_spaces_from_registry(&self.spaces.read());
+        for space in edge_spaces {
+            let mut records = self.query_history_on_branch(BranchId::MAIN, space)?;
+            records.sort_by_key(|r| r.revision);
+            let mut live_edges: HashMap<HyperedgeId, Hyperedge> = HashMap::new();
+            for record in records {
+                if record.revision <= watermark {
+                    continue;
+                }
+                let Some(id) = Hyperedge::id_from_storage_point(&record.address.point) else {
+                    continue;
+                };
+                if Hyperedge::storage_point(id) != record.address.point {
+                    continue;
+                }
+                if record.tombstone {
+                    if let Some(edge) = live_edges.remove(&id) {
+                        self.derivation
+                            .submit(AssertionEvent::delete(
+                                space,
+                                edge,
+                                record.revision,
+                                BranchId::MAIN,
+                            ))
+                            .map_err(engine_to_io)?;
+                    }
+                } else if let Ok(edge) = decode_edge_record(&record.data) {
+                    if edge.id != id {
+                        continue;
+                    }
+                    live_edges.insert(edge.id, edge.clone());
+                    self.derivation
+                        .submit(AssertionEvent::upsert(
+                            space,
+                            edge,
+                            record.revision,
+                            BranchId::MAIN,
+                        ))
+                        .map_err(engine_to_io)?;
+                }
+            }
+        }
+        self.derivation.flush();
+        Ok(())
+    }
+
+    /// Full revision history for a space (used by derivation recovery).
+    fn query_history_on_branch(
+        &self,
+        branch: BranchId,
+        space: SpaceId,
+    ) -> io::Result<Vec<Record>> {
+        let ctx = self.query_ctx();
+        let branch_id = if branch == BranchId::MAIN {
+            None
+        } else {
+            Some(branch)
+        };
+        query_inner(
+            &self.store,
+            &self.snapshots,
+            ctx.live_tail,
+            ctx.space_tails,
+            &self.spaces.read(),
+            &self.watermark,
+            space,
+            None,
+            None,
+            true,
+            ctx.hilbert_tails,
+            Some(&self.branch_overlays),
+            branch_id,
+        )
+    }
+
+    fn check_derivation_backpressure(&self) -> Result<(), EngineError> {
+        self.derivation
+            .check_backpressure(self.watermark.allocated())
+    }
+
+    /// Insert or update a hyperedge assertion and maintain the endpoint index.
+    pub fn insert_hyperedge(&self, space: SpaceId, edge: Hyperedge) -> io::Result<RevisionId> {
+        self.insert_hyperedge_on_branch(BranchId::MAIN, space, edge)
+    }
+
+    /// Branch-aware hyperedge insert.
+    pub fn insert_hyperedge_on_branch(
+        &self,
+        branch: BranchId,
+        space: SpaceId,
+        mut edge: Hyperedge,
+    ) -> io::Result<RevisionId> {
+        edge.validate()
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("{:?}", e)))?;
+        self.ensure_endpoint_index_space()
+            .map_err(|e| engine_to_io(e))?;
+        self.ensure_flow_vector_index_space()
+            .map_err(|e| engine_to_io(e))?;
+        if branch == BranchId::MAIN {
+            self.check_derivation_backpressure()
+                .map_err(engine_to_io)?;
+            let rev = self.watermark.allocate();
+            if let Some(ref prov) = edge.authoring_frame {
+                validate_authoring_provenance(prov, rev)
+                    .map_err(|e| engine_to_io(EngineError::from(e)))?;
+            }
+            if let Some(ref comp) = edge.computation {
+                self.validate_computation_inputs(comp)
+                    .map_err(engine_to_io)?;
+            }
+            edge.valid_from = rev;
+            let row = prepare_assertion_write(space, &edge)?;
+            let records = rows_to_records(&[row], rev);
+            self.apply_records_on_branch(branch, records)?;
+            self.derivation.submit(AssertionEvent::upsert(
+                space,
+                edge,
+                rev,
+                branch,
+            ))
+            .map_err(engine_to_io)?;
+            Ok(rev)
+        } else {
+            let count = 1 + edge.endpoints.len();
+            let range = self.watermark.allocate_n(count as u64);
+            edge.valid_from = range.first();
+            let index_layout = registry_index_layout(&self.spaces.read());
+            let rows = prepare_writes(space, &edge, index_layout)?;
+            let records = rows_to_records(&rows, range.first());
+            self.apply_records_on_branch(branch, records)?;
+            Ok(range.first())
+        }
+    }
+
+    /// Adapter-friendly hyperedge write with optional catalog enforcement.
+    pub fn insert_hyperedge_typed<K: KindLabel>(
+        &self,
+        space: SpaceId,
+        id: HyperedgeId,
+        kind: K,
+        endpoints: Vec<AdapterEndpoint>,
+        directionality: crate::infinitedb_core::hyperedge::Directionality,
+        weight_milli: Option<i64>,
+        metadata: std::collections::BTreeMap<String, String>,
+        valid_to: Option<RevisionId>,
+        catalog: Option<&KindCatalog>,
+    ) -> io::Result<RevisionId> {
+        let kind_label = kind.label().to_string();
+        if let Some(catalog) = catalog {
+            catalog
+                .validate_edge_kind(&kind_label)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
+            for ep in &endpoints {
+                catalog
+                    .validate_endpoint_role(&ep.role)
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
+            }
+            catalog
+                .validate_edge_directionality(&kind_label, directionality)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
+        }
+        let edge = Hyperedge {
+            id,
+            kind: kind_label.into(),
+            endpoints: endpoints.into_iter().map(EndpointRef::from).collect(),
+            weight_milli,
+            metadata,
+            valid_from: RevisionId::ZERO,
+            valid_to,
+            directionality,
+            authoring_frame: None,
+            computation: None,
+        };
+        edge.validate()
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("{:?}", e)))?;
+        self.insert_hyperedge(space, edge)
+    }
+
+    /// Logically delete a hyperedge by id (payload + endpoint index rows).
+    pub fn delete_hyperedge(&self, space: SpaceId, id: HyperedgeId) -> io::Result<RevisionId> {
+        self.delete_hyperedge_on_branch(BranchId::MAIN, space, id)
+    }
+
+    /// Branch-aware hyperedge delete.
+    pub fn delete_hyperedge_on_branch(
+        &self,
+        branch: BranchId,
+        space: SpaceId,
+        id: HyperedgeId,
+    ) -> io::Result<RevisionId> {
+        self.ensure_endpoint_index_space()
+            .map_err(engine_to_io)?;
+        let edge = self.fetch_hyperedge_by_id_on_branch(branch, space, id, None)?;
+        if branch == BranchId::MAIN {
+            self.check_derivation_backpressure()
+                .map_err(engine_to_io)?;
+            let rev = self.watermark.allocate();
+            let row = if let Some(ref e) = edge {
+                prepare_assertion_tombstone(space, e.id)
+            } else {
+                prepare_assertion_tombstone(space, id)
+            };
+            let records = rows_to_records(&[row], rev);
+            self.apply_records_on_branch(branch, records)?;
+            if let Some(e) = edge {
+                self.derivation
+                    .submit(AssertionEvent::delete(space, e, rev, branch))
+                    .map_err(engine_to_io)?;
+            }
+            Ok(rev)
+        } else {
+            let index_layout = registry_index_layout(&self.spaces.read());
+            let rows = match edge {
+                Some(e) => prepare_deletes(space, &e, index_layout),
+                None => vec![prepare_assertion_tombstone(space, id)],
+            };
+            let count = rows.len() as u64;
+            let range = self.watermark.allocate_n(count);
+            let records = rows_to_records(&rows, range.first());
+            self.apply_records_on_branch(branch, records)?;
+            Ok(range.first())
+        }
+    }
+
+    /// Load a hyperedge by id from `space`.
+    pub fn fetch_hyperedge_by_id(
+        &self,
+        space: SpaceId,
+        id: HyperedgeId,
+        as_of: Option<RevisionId>,
+    ) -> io::Result<Option<Hyperedge>> {
+        self.fetch_hyperedge_by_id_on_branch(BranchId::MAIN, space, id, as_of)
+    }
+
+    fn fetch_hyperedge_by_id_on_branch(
+        &self,
+        branch: BranchId,
+        space: SpaceId,
+        id: HyperedgeId,
+        as_of: Option<RevisionId>,
+    ) -> io::Result<Option<Hyperedge>> {
+        let point = Hyperedge::storage_point(id);
+        let records = self.query_bbox_on_branch(branch, space, point.clone(), point, as_of)?;
+        for r in records {
+            if r.tombstone {
+                continue;
+            }
+            if let Ok(edge) = decode_edge_record(&r.data) {
+                if edge.id == id {
+                    return Ok(Some(edge));
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    /// Query all decodable hyperedges in a space.
+    pub fn query_hyperedges(
+        &self,
+        space: SpaceId,
+        as_of: Option<RevisionId>,
+    ) -> io::Result<Vec<Hyperedge>> {
+        Ok(self
+            .query_on_branch(BranchId::MAIN, space, as_of)?
+            .into_iter()
+            .filter(|r| !r.tombstone)
+            .filter_map(|r| decode_edge_record(&r.data).ok())
+            .collect())
+    }
+
+    /// Query hyperedges incident on an endpoint (symmetric index scan).
+    pub fn query_hyperedges_for_endpoint(
+        &self,
+        edge_space: SpaceId,
+        endpoint: &EndpointRef,
+        as_of: Option<RevisionId>,
+    ) -> io::Result<Vec<Hyperedge>> {
+        self.query_hyperedges_for_endpoint_directed(
+            edge_space,
+            endpoint,
+            as_of,
+            DirectionFilter::Any,
+        )
+    }
+
+    /// Incidence query with index-resident direction when M2 layout is active.
+    pub fn query_hyperedges_for_endpoint_directed(
+        &self,
+        edge_space: SpaceId,
+        endpoint: &EndpointRef,
+        as_of: Option<RevisionId>,
+        direction: DirectionFilter,
+    ) -> io::Result<Vec<Hyperedge>> {
+        self.query_hyperedges_for_endpoint_directed_with_options(
+            edge_space,
+            endpoint,
+            as_of,
+            direction,
+            QueryOptions::default(),
+        )
+    }
+
+    /// Incidence query with optional index-only (bounded staleness) mode (M4).
+    pub fn query_hyperedges_for_endpoint_directed_with_options(
+        &self,
+        edge_space: SpaceId,
+        endpoint: &EndpointRef,
+        as_of: Option<RevisionId>,
+        direction: DirectionFilter,
+        options: QueryOptions,
+    ) -> io::Result<Vec<Hyperedge>> {
+        self.ensure_endpoint_index_space().map_err(engine_to_io)?;
+        let registry_layout = self.endpoint_index_layout();
+        let wm = self.derivation.endpoint_index_watermark();
+        let rev_ceiling = as_of.unwrap_or_else(|| self.revision());
+        let index_as_of = if !options.index_only && rev_ceiling > wm {
+            Some(wm)
+        } else {
+            as_of
+        };
+        let index_records =
+            self.query_on_branch(BranchId::MAIN, ENDPOINT_INDEX_SPACE, index_as_of)?;
+        let mut ids = self.collect_incident_edge_ids_for_query(
+            endpoint,
+            direction,
+            registry_layout,
+            &index_records,
+            index_as_of,
+        )?;
+        if !options.index_only {
+            ids = self.merge_incident_ids_from_assertion_delta(
+                edge_space,
+                endpoint,
+                direction,
+                ids,
+                rev_ceiling,
+                wm,
+            )?;
+        }
+        let (_, v1_ids) = if registry_layout == EndpointIndexLayout::V2PolarityDim
+            && direction != DirectionFilter::Any
+        {
+            partition_incident_ids_by_layout(&index_records, endpoint, &ids)
+        } else {
+            (Vec::new(), Vec::new())
+        };
+        let v1_set: std::collections::HashSet<_> = v1_ids.into_iter().collect();
+        let rev_ceiling = as_of.unwrap_or_else(|| self.revision());
+        let mut edges = Vec::new();
+        for id in &ids {
+            if let Some(edge) = self.fetch_hyperedge_by_id(edge_space, *id, as_of)? {
+                if edge.is_active_at(rev_ceiling)
+                    && edge.endpoints.iter().any(|ep| {
+                        ep.space == endpoint.space && ep.node.coords == endpoint.node.coords
+                    })
+                {
+                    edges.push(edge);
+                }
+            }
+        }
+        if registry_layout == EndpointIndexLayout::V2PolarityDim
+            && direction != DirectionFilter::Any
+        {
+            edges.retain(|edge| {
+                if v1_set.contains(&edge.id) {
+                    filter_edges_by_direction(vec![edge.clone()], endpoint, direction)
+                        .pop()
+                        .is_some()
+                } else {
+                    true
+                }
+            });
+            Ok(edges)
+        } else {
+            Ok(filter_edges_by_direction(edges, endpoint, direction))
+        }
+    }
+
+    /// Count incident hyperedges on an endpoint (index-resident when M2 layout is active).
+    pub fn count_incident_edges_for_endpoint(
+        &self,
+        endpoint: &EndpointRef,
+        as_of: Option<RevisionId>,
+    ) -> io::Result<usize> {
+        self.count_incident_edges_for_endpoint_directed(endpoint, as_of, DirectionFilter::Any)
+    }
+
+    /// Count incident hyperedges with index-resident direction filtering (M2).
+    pub fn count_incident_edges_for_endpoint_directed(
+        &self,
+        endpoint: &EndpointRef,
+        as_of: Option<RevisionId>,
+        direction: DirectionFilter,
+    ) -> io::Result<usize> {
+        self.count_incident_edges_for_endpoint_directed_with_options(
+            endpoint,
+            as_of,
+            direction,
+            QueryOptions::default(),
+        )
+    }
+
+    /// Count incident edges with delta-merge over un-derived assertions (M4).
+    pub fn count_incident_edges_for_endpoint_directed_with_options(
+        &self,
+        endpoint: &EndpointRef,
+        as_of: Option<RevisionId>,
+        direction: DirectionFilter,
+        options: QueryOptions,
+    ) -> io::Result<usize> {
+        self.ensure_endpoint_index_space().map_err(engine_to_io)?;
+        let registry_layout = self.endpoint_index_layout();
+        let wm = self.derivation.endpoint_index_watermark();
+        let rev_ceiling = as_of.unwrap_or_else(|| self.revision());
+        let index_as_of = if !options.index_only && rev_ceiling > wm {
+            Some(wm)
+        } else {
+            as_of
+        };
+        let index_records =
+            self.query_on_branch(BranchId::MAIN, ENDPOINT_INDEX_SPACE, index_as_of)?;
+        if !options.index_only {
+            let edge_spaces = edge_spaces_from_registry(&self.spaces.read());
+            let merged = self.merge_incident_ids_from_assertion_delta_multi_space(
+                &edge_spaces,
+                endpoint,
+                direction,
+                incident_edge_ids_directed(
+                    &index_records,
+                    endpoint,
+                    direction,
+                    registry_layout,
+                ),
+                rev_ceiling,
+                wm,
+            )?;
+            return Ok(merged.len());
+        }
+        if registry_layout == EndpointIndexLayout::V2PolarityDim {
+            let index_count =
+                incident_edge_degree(&index_records, endpoint, direction, registry_layout);
+            if direction == DirectionFilter::Any {
+                return Ok(index_count);
+            }
+            let prefix = hypergraph::endpoint_prefix(endpoint);
+            let ids = incident_edge_ids_from_records(&index_records, &prefix);
+            let (_, v1_ids) =
+                partition_incident_ids_by_layout(&index_records, endpoint, &ids);
+            if v1_ids.is_empty() {
+                return Ok(index_count);
+            }
+            let edge_spaces = edge_spaces_from_registry(&self.spaces.read());
+            let v2_count = index_count.saturating_sub(v1_ids.len());
+            let mut v1_match = 0usize;
+            for id in v1_ids {
+                for &space in &edge_spaces {
+                    if let Ok(Some(edge)) = self.fetch_hyperedge_by_id(space, id, as_of) {
+                        if filter_edges_by_direction(vec![edge], endpoint, direction)
+                            .pop()
+                            .is_some()
+                        {
+                            v1_match += 1;
+                        }
+                        break;
+                    }
+                }
+            }
+            Ok(v2_count + v1_match)
+        } else {
+            let prefix = hypergraph::endpoint_prefix(endpoint);
+            let ids = incident_edge_ids_from_records(&index_records, &prefix);
+            if direction == DirectionFilter::Any {
+                return Ok(ids.len());
+            }
+            let edge_spaces = edge_spaces_from_registry(&self.spaces.read());
+            let mut count = 0usize;
+            for id in ids {
+                for &space in &edge_spaces {
+                    if let Ok(Some(edge)) = self.fetch_hyperedge_by_id(space, id, as_of) {
+                        if filter_edges_by_direction(vec![edge], endpoint, direction)
+                            .pop()
+                            .is_some()
+                        {
+                            count += 1;
+                        }
+                        break;
+                    }
+                }
+            }
+            Ok(count)
+        }
+    }
+
+    /// Rewrite V1 endpoint-index rows to M2 layout and compact the index space.
+    pub fn compact_endpoint_index(&self, edge_spaces: &[SpaceId]) -> io::Result<()> {
+        self.sync_derivation();
+        self.ensure_endpoint_index_space().map_err(engine_to_io)?;
+        if self.endpoint_index_layout() != EndpointIndexLayout::V2PolarityDim {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "endpoint index layout must be upgraded to V2 before compaction rewrite",
             ));
         }
-        let space_id = config.id.0;
-        self.spaces
-            .write()
-            .register(config)
-            .map_err(|e| format!("{:?}", e))?;
-        let space_dir = self.root.join("spaces").join(space_id.to_string());
-        std::fs::create_dir_all(&space_dir).map_err(|e| e.to_string())?;
-        match &self.backend {
-            WriteBackend::V2 { .. } => {}
-            WriteBackend::V3 { .. } | WriteBackend::V4 { .. } => {}
+        self.sync()?;
+        let index_records =
+            self.query_on_branch(BranchId::MAIN, ENDPOINT_INDEX_SPACE, None)?;
+        let spaces: Vec<SpaceId> = if edge_spaces.is_empty() {
+            edge_spaces_from_registry(&self.spaces.read())
+        } else {
+            edge_spaces.to_vec()
+        };
+        let rewrite_rows = plan_v1_to_v2_index_rewrite(&index_records, |id| {
+            for &space in &spaces {
+                if let Ok(Some(edge)) = self.fetch_hyperedge_by_id(space, id, None) {
+                    return Some(edge);
+                }
+            }
+            None
+        });
+        if !rewrite_rows.is_empty() {
+            let records = rows_to_records(&rewrite_rows, self.watermark.allocate());
+            self.apply_records_on_branch(BranchId::MAIN, records)?;
+            self.sync()?;
         }
-        self.persist_meta().map_err(|e| e.to_string())?;
-        Ok(())
+        self.compact(ENDPOINT_INDEX_SPACE)
+    }
+
+    fn collect_incident_edge_ids_for_query(
+        &self,
+        endpoint: &EndpointRef,
+        direction: DirectionFilter,
+        registry_layout: EndpointIndexLayout,
+        index_records: &[Record],
+        _as_of: Option<RevisionId>,
+    ) -> io::Result<Vec<HyperedgeId>> {
+        let prefix = hypergraph::endpoint_prefix(endpoint);
+        match registry_layout {
+            EndpointIndexLayout::V2PolarityDim => Ok(incident_edge_ids_directed(
+                index_records,
+                endpoint,
+                direction,
+                registry_layout,
+            )),
+            EndpointIndexLayout::V1Symmetric => Ok(incident_edge_ids_from_records(
+                index_records,
+                &prefix,
+            )),
+        }
+    }
+
+    /// Query hyperedges by relationship kind string.
+    pub fn query_hyperedges_by_kind(
+        &self,
+        space: SpaceId,
+        kind: &str,
+        as_of: Option<RevisionId>,
+    ) -> io::Result<Vec<Hyperedge>> {
+        Ok(self
+            .query_hyperedges(space, as_of)?
+            .into_iter()
+            .filter(|e| e.kind.as_str() == kind)
+            .collect())
+    }
+
+    /// Directional hypergraph traversal from a starting endpoint (M3).
+    pub fn traverse_hypergraph(&self, spec: &TraversalSpec) -> io::Result<TraversalResult> {
+        self.traverse_hypergraph_with_options(spec, QueryOptions::default())
+    }
+
+    /// Traversal with delta-merge over un-derived index rows (M4).
+    pub fn traverse_hypergraph_with_options(
+        &self,
+        spec: &TraversalSpec,
+        options: QueryOptions,
+    ) -> io::Result<TraversalResult> {
+        self.ensure_endpoint_index_space().map_err(engine_to_io)?;
+        let registry_layout = self.endpoint_index_layout();
+        let rev_ceiling = spec.as_of.unwrap_or_else(|| self.revision());
+        let wm = self.derivation.endpoint_index_watermark();
+        let index_as_of = if !options.index_only && rev_ceiling > wm {
+            Some(wm)
+        } else {
+            spec.as_of
+        };
+        let mut index_records =
+            self.query_on_branch(BranchId::MAIN, ENDPOINT_INDEX_SPACE, index_as_of)?;
+        if !options.index_only && rev_ceiling > wm {
+            index_records.extend(self.synthetic_index_records_from_delta(
+                spec.edge_space,
+                rev_ceiling,
+                wm,
+                registry_layout,
+            )?);
+        }
+        let edge_space = spec.edge_space;
+        let as_of = spec.as_of;
+        run_traversal(spec, &index_records, registry_layout, rev_ceiling, |id| {
+            self.fetch_hyperedge_by_id(edge_space, id, as_of)
+                .ok()
+                .flatten()
+                .filter(|edge| edge.is_active_at(rev_ceiling))
+        })
+    }
+
+    /// Per-kind acyclicity check over directed hyperedges in `edge_space` (M3).
+    pub fn check_hypergraph_acyclic(
+        &self,
+        edge_space: SpaceId,
+        kinds: &[HyperedgeKind],
+        as_of: Option<RevisionId>,
+    ) -> io::Result<bool> {
+        let rev_ceiling = as_of.unwrap_or_else(|| self.revision());
+        let edges: Vec<Hyperedge> = self
+            .query_hyperedges(edge_space, as_of)?
+            .into_iter()
+            .filter(|e| e.is_directed() && e.is_active_at(rev_ceiling))
+            .filter(|e| kinds.is_empty() || kinds.iter().any(|k| k == &e.kind))
+            .collect();
+        Ok(hypergraph_acyclic_for_kinds(&edges, kinds))
     }
 
     /// Fire-and-forget insert on `main`. Blocks only when the target queue is full.
@@ -363,13 +1282,13 @@ impl InfiniteDb {
     }
 
     /// Fork a new branch from `from` at the current revision.
-    pub fn create_branch(&self, name: &str, from: BranchId) -> Result<BranchId, String> {
+    pub fn create_branch(&self, name: &str, from: BranchId) -> Result<BranchId, EngineError> {
         let parent = self
             .branches
             .read()
             .get(from)
-            .ok_or_else(|| format!("parent branch {:?} not found", from))?
-            .clone();
+            .cloned()
+            .ok_or(EngineError::BranchNotFound(from))?;
         let id = BranchId(self.next_branch_id.fetch_add(1, Ordering::Relaxed));
         let forked_at = self.watermark.allocated();
         let branch = Branch {
@@ -379,15 +1298,984 @@ impl InfiniteDb {
             parent: Some(from),
             forked_at,
         };
-        self.branches
-            .write()
-            .insert(branch)
-            .map_err(|e| format!("{:?}", e))?;
+        self.branches.write().insert(branch)?;
         for (_, snap) in self.snapshots.all() {
             self.branch_overlays.register_branch(id, snap);
         }
-        self.persist_meta().map_err(|e| e.to_string())?;
+        self.persist_meta()?;
         Ok(id)
+    }
+
+    /// Begin an applicative bulk hyperedge import session (M4).
+    pub fn begin_hyperedge_import(
+        &self,
+        space: SpaceId,
+        budget: ImportBudget,
+    ) -> Result<HyperedgeImportSession, EngineError> {
+        if self.spaces.read().get(space).is_none() {
+            return Err(EngineError::SpaceNotFound(space));
+        }
+        Ok(HyperedgeImportSession::new(space, budget))
+    }
+
+    /// Commit a bulk import session — assertions sync, index derives on the bus.
+    pub fn commit_hyperedge_import(
+        &self,
+        mut session: HyperedgeImportSession,
+    ) -> Result<HyperedgeImportResult, EngineError> {
+        let space = session.space;
+        if session.is_aborted() || session.is_over_budget() {
+            let result = HyperedgeImportResult {
+                admitted: RevisionRange::empty(),
+                errors: session.take_errors(),
+                aborted: true,
+            };
+            self.maybe_persist_import_errors(space, &result)?;
+            return Ok(result);
+        }
+        let queued = session.take_queued();
+        let errors = session.take_errors();
+        if queued.is_empty() {
+            let result = HyperedgeImportResult {
+                admitted: RevisionRange::empty(),
+                errors,
+                aborted: false,
+            };
+            self.maybe_persist_import_errors(space, &result)?;
+            return Ok(result);
+        }
+        self.ensure_endpoint_index_space()?;
+        self.check_derivation_backpressure()?;
+        let mut first_rev = None;
+        let mut last_rev = RevisionId::ZERO;
+        for item in queued {
+            let mut edge = item.edge;
+            edge.valid_from = self.watermark.allocate();
+            let rev = edge.valid_from;
+            let row = prepare_assertion_write(space, &edge)?;
+            let records = rows_to_records(&[row], rev);
+            self.apply_records_on_branch(BranchId::MAIN, records)?;
+            self.derivation
+                .submit(AssertionEvent::upsert(space, edge, rev, BranchId::MAIN))?;
+            if first_rev.is_none() {
+                first_rev = Some(rev);
+            }
+            last_rev = rev;
+        }
+        self.derivation.flush();
+        let result = HyperedgeImportResult {
+            admitted: RevisionRange::new(first_rev.unwrap_or(RevisionId::ZERO), last_rev),
+            errors,
+            aborted: false,
+        };
+        self.maybe_persist_import_errors(space, &result)?;
+        Ok(result)
+    }
+
+    /// Persist an operation error record in the companion error space for `data_space` (M5).
+    pub fn persist_operation_errors(
+        &self,
+        data_space: SpaceId,
+        record: OperationErrorRecord,
+    ) -> Result<RevisionId, EngineError> {
+        ErrorKindCatalog::default().validate_kind(&record.kind)?;
+        let error_space = self.error_space_for_data(data_space)?;
+        let rev = self.watermark.allocate();
+        let row = prepare_error_write(error_space, &record)
+            .map_err(|e| EngineError::ErrorRecordEncode {
+                message: e.to_string(),
+            })?;
+        let records = rows_to_records(&[row], rev);
+        self.apply_records_on_branch(BranchId::MAIN, records)?;
+        Ok(rev)
+    }
+
+    /// Query operation error records for a data space (M5).
+    pub fn query_operation_errors(
+        &self,
+        data_space: SpaceId,
+        range: Option<OperationRevisionRange>,
+        as_of: Option<RevisionId>,
+    ) -> io::Result<Vec<OperationErrorRecord>> {
+        let error_space = self
+            .error_space_for(data_space)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "error space missing"))?;
+        let records = self.query_on_branch(BranchId::MAIN, error_space, as_of)?;
+        let mut out = Vec::new();
+        for r in records {
+            if r.tombstone {
+                continue;
+            }
+            let Ok(record) = decode_error_record_payload(&r.data) else {
+                continue;
+            };
+            if let Some(filter) = range {
+                if !filter.contains(record.revision_range.first) {
+                    continue;
+                }
+            }
+            out.push(record);
+        }
+        Ok(out)
+    }
+
+    /// Tombstone-resolve an operation error record (audit trail preserved, M5).
+    pub fn resolve_operation_error(
+        &self,
+        data_space: SpaceId,
+        range_start: RevisionId,
+    ) -> Result<(), EngineError> {
+        let error_space = self.error_space_for_data(data_space)?;
+        let rev = self.watermark.allocate();
+        let row = prepare_error_tombstone(error_space, range_start);
+        let records = rows_to_records(&[row], rev);
+        self.apply_records_on_branch(BranchId::MAIN, records)?;
+        Ok(())
+    }
+
+    /// Register a named durable frame definition (M6).
+    pub fn register_frame(
+        &self,
+        request: FrameRegisterRequest,
+    ) -> Result<FrameDefinition, EngineError> {
+        self.validate_frame_request(&request, None)?;
+        let id = request.id.unwrap_or_else(|| {
+            FrameId(self.next_frame_id.fetch_add(1, Ordering::Relaxed))
+        });
+        if self.frames.read().contains_key(&id) {
+            return Err(EngineError::InvalidFrame(FrameValidationError::DuplicateId(id)));
+        }
+        self.next_frame_id
+            .fetch_max(id.0.saturating_add(1), Ordering::Relaxed);
+        let def = FrameDefinition {
+            id,
+            name: request.name,
+            assertion_scope: request.assertion_scope,
+            judgment_overlay: request.judgment_overlay,
+            default_as_of: request.default_as_of,
+        };
+        self.frames.write().insert(id, def.clone());
+        self.persist_meta()?;
+        Ok(def)
+    }
+
+    /// Lookup a durable frame by id (M6).
+    pub fn get_frame(&self, id: FrameId) -> Option<FrameDefinition> {
+        self.frames.read().get(&id).cloned()
+    }
+
+    /// List all registered frames (M6).
+    pub fn list_frames(&self) -> Vec<FrameDefinition> {
+        self.frames.read().values().cloned().collect()
+    }
+
+    /// Reset query-plan instrumentation (M6 performance tests).
+    pub fn reset_query_plan_stats(&self) {
+        reset_query_plan_stats();
+    }
+
+    /// Read query-plan instrumentation (M6 performance tests).
+    pub fn query_plan_stats(&self) -> QueryPlanStats {
+        query_plan_stats()
+    }
+
+    /// Spatial hyperedge query resolved within a named frame (M6).
+    pub fn query_hyperedges_in_frame(
+        &self,
+        query: FrameQuery,
+    ) -> Result<Vec<FrameResolvedHyperedge>, EngineError> {
+        let def = self
+            .get_frame(query.frame_id)
+            .ok_or(EngineError::FrameNotFound(query.frame_id))?;
+        let as_of = query
+            .as_of
+            .or(def.default_as_of)
+            .unwrap_or_else(|| self.revision());
+        let sources = flatten_assertion_scope(&def.assertion_scope, query.testimony_space);
+        if sources.is_empty() {
+            return Err(EngineError::InvalidFrame(FrameValidationError::EmptyScope));
+        }
+        let mut by_source = Vec::new();
+        for source in &sources {
+            let branch = source.branch.unwrap_or(BranchId::MAIN);
+            let records = self
+                .query_bbox_on_branch(
+                    branch,
+                    source.space,
+                    query.min.clone(),
+                    query.max.clone(),
+                    Some(as_of),
+                )
+                ?;
+            by_source.push((*source, records));
+        }
+        let spaces = self.spaces.read();
+        let sourced = resolve_visibility_per_source(&spaces, &by_source, as_of);
+        drop(spaces);
+        let mut edges: Vec<FrameResolvedHyperedge> = Vec::new();
+        for sr in sourced {
+            if let Ok(edge) = decode_edge_record(&sr.record.data) {
+                edges.push(FrameResolvedHyperedge {
+                    edge,
+                    source: sr.source,
+                    judgments: Vec::new(),
+                    diagnosis: None,
+                    suppressed: false,
+                });
+            }
+        }
+        let judgments_by_subject =
+            self.collect_frame_judgments(&def.judgment_overlay, &query.min, &query.max, as_of)?;
+        let consulted = consulted_from_frame(def.id, def.default_as_of, query.as_of, self.revision());
+        Ok(apply_judgment_overlay(
+            edges,
+            &def.judgment_overlay,
+            &judgments_by_subject,
+            consulted,
+            query.options.include_suppressed,
+            query.options.include_diagnosis,
+        ))
+    }
+
+    /// Incidence query filtered through frame resolution (M6).
+    pub fn query_hyperedges_for_endpoint_in_frame(
+        &self,
+        frame_id: FrameId,
+        edge_space: SpaceId,
+        endpoint: &EndpointRef,
+        as_of: Option<RevisionId>,
+        direction: DirectionFilter,
+        options: FrameQueryOptions,
+    ) -> Result<Vec<FrameResolvedHyperedge>, EngineError> {
+        if !options.index_only {
+            self.sync_derivation();
+        }
+        let candidates = self
+            .query_hyperedges_for_endpoint_directed_with_options(
+                edge_space,
+                endpoint,
+                as_of,
+                direction,
+                QueryOptions {
+                    index_only: options.index_only,
+                },
+            )
+            ?;
+        let def = self
+            .get_frame(frame_id)
+            .ok_or(EngineError::FrameNotFound(frame_id))?;
+        let resolved_as_of = as_of
+            .or(def.default_as_of)
+            .unwrap_or_else(|| self.revision());
+        let sources = flatten_assertion_scope(&def.assertion_scope, edge_space);
+        let source_set: std::collections::HashSet<TestimonySource> = sources.into_iter().collect();
+        let edges: Vec<FrameResolvedHyperedge> = candidates
+            .into_iter()
+            .map(|edge| FrameResolvedHyperedge {
+                edge,
+                source: TestimonySource {
+                    space: edge_space,
+                    branch: None,
+                },
+                judgments: Vec::new(),
+                diagnosis: None,
+                suppressed: false,
+            })
+            .filter(|e| source_set.contains(&e.source))
+            .collect();
+        let (min, max) = Self::endpoint_judgment_bbox(endpoint);
+        let judgments_by_subject =
+            self.collect_frame_judgments(&def.judgment_overlay, &min, &max, resolved_as_of)?;
+        let consulted =
+            consulted_from_frame(def.id, def.default_as_of, as_of, self.revision());
+        Ok(apply_judgment_overlay(
+            edges,
+            &def.judgment_overlay,
+            &judgments_by_subject,
+            consulted,
+            options.include_suppressed,
+            options.include_diagnosis,
+        ))
+    }
+
+    /// Directional traversal with frame admission and judgment overlay (M6).
+    pub fn traverse_in_frame(
+        &self,
+        spec: &FrameTraversalSpec,
+    ) -> io::Result<FrameTraversalResult> {
+        let def = self.get_frame(spec.frame_id).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::NotFound, format!("frame {:?} not found", spec.frame_id))
+        })?;
+        let as_of = spec
+            .as_of
+            .or(def.default_as_of)
+            .unwrap_or_else(|| self.revision());
+        let judgments_cache = self
+            .collect_frame_judgments(
+                &def.judgment_overlay,
+                &DimensionVector::new(vec![0, 0]),
+                &DimensionVector::new(vec![u32::MAX, u32::MAX]),
+                as_of,
+            )
+            .map_err(|e| engine_to_io(e))?;
+        let consulted =
+            consulted_from_frame(def.id, def.default_as_of, spec.as_of, self.revision());
+        let sources = flatten_assertion_scope(&def.assertion_scope, spec.base.edge_space);
+        let source_set: std::collections::HashSet<TestimonySource> = sources.into_iter().collect();
+        let testimony_space = spec.base.edge_space;
+        let overlay = def.judgment_overlay.clone();
+        let options = spec.options;
+        let allowed_filter = |edge: &Hyperedge| -> bool {
+            if !source_set.contains(&TestimonySource {
+                space: testimony_space,
+                branch: None,
+            }) {
+                return false;
+            }
+            let (min, max) = {
+                let p = Hyperedge::storage_point(edge.id);
+                (p.clone(), p)
+            };
+            let mut judgments = judgments_cache.clone();
+            if let Ok(extra) = self.collect_frame_judgments(&overlay, &min, &max, as_of) {
+                for (k, v) in extra {
+                    judgments.entry(k).or_default().extend(v);
+                }
+            }
+            let resolved = apply_judgment_overlay(
+                vec![FrameResolvedHyperedge {
+                    edge: edge.clone(),
+                    source: TestimonySource {
+                        space: testimony_space,
+                        branch: None,
+                    },
+                    judgments: Vec::new(),
+                    diagnosis: None,
+                    suppressed: false,
+                }],
+                &overlay,
+                &judgments,
+                consulted,
+                options.include_suppressed,
+                options.include_diagnosis,
+            );
+            resolved
+                .first()
+                .map(|e| !e.suppressed)
+                .unwrap_or(false)
+        };
+        self.ensure_endpoint_index_space().map_err(engine_to_io)?;
+        let registry_layout = self.endpoint_index_layout();
+        let rev_ceiling = spec.base.as_of.unwrap_or_else(|| self.revision());
+        let wm = self.derivation.endpoint_index_watermark();
+        let index_as_of = if !spec.options.index_only && rev_ceiling > wm {
+            Some(wm)
+        } else {
+            spec.base.as_of
+        };
+        let mut index_records =
+            self.query_on_branch(BranchId::MAIN, ENDPOINT_INDEX_SPACE, index_as_of)?;
+        if !spec.options.index_only && rev_ceiling > wm {
+            index_records.extend(self.synthetic_index_records_from_delta(
+                spec.base.edge_space,
+                rev_ceiling,
+                wm,
+                registry_layout,
+            )?);
+        }
+        let edge_space = spec.base.edge_space;
+        let base_as_of = spec.base.as_of;
+        let mut resolved_edges: Vec<FrameResolvedHyperedge> = Vec::new();
+        let traversal = run_traversal(
+            &spec.base,
+            &index_records,
+            registry_layout,
+            rev_ceiling,
+            |id| {
+                let edge = self
+                    .fetch_hyperedge_by_id(edge_space, id, base_as_of)
+                    .ok()
+                    .flatten()
+                    .filter(|edge| edge.is_active_at(rev_ceiling))?;
+                if !allowed_filter(&edge) {
+                    return None;
+                }
+                Some(edge)
+            },
+        )?;
+        for edge in &traversal.edges {
+            let (min, max) = {
+                let p = Hyperedge::storage_point(edge.id);
+                (p.clone(), p)
+            };
+            let mut judgments = judgments_cache.clone();
+            if let Ok(extra) = self.collect_frame_judgments(&overlay, &min, &max, as_of) {
+                for (k, v) in extra {
+                    judgments.entry(k).or_default().extend(v);
+                }
+            }
+            resolved_edges.extend(apply_judgment_overlay(
+                vec![FrameResolvedHyperedge {
+                    edge: edge.clone(),
+                    source: TestimonySource {
+                        space: testimony_space,
+                        branch: None,
+                    },
+                    judgments: Vec::new(),
+                    diagnosis: None,
+                    suppressed: false,
+                }],
+                &overlay,
+                &judgments,
+                consulted,
+                options.include_suppressed,
+                options.include_diagnosis,
+            ));
+        }
+        Ok(FrameTraversalResult {
+            traversal,
+            resolved: resolved_edges,
+        })
+    }
+
+    /// Register an arbiter testimony stream backed by a dedicated assertion space (M5).
+    pub fn register_arbiter_stream(
+        &self,
+        id: ArbiterId,
+        name: impl Into<String>,
+        dims: usize,
+    ) -> Result<ArbiterStream, EngineError> {
+        if self.arbiter_streams.read().contains_key(&id) {
+            return Err(EngineError::ArbiterStreamExists(id.0));
+        }
+        let assertion_space = SpaceId(id.0.wrapping_add(0xA000_0000_0000_0000));
+        if self.spaces.read().get(assertion_space).is_none() {
+            self.register_space(SpaceConfig::new(assertion_space, name, dims))?;
+        }
+        let stream = ArbiterStream {
+            id,
+            assertion_space,
+        };
+        self.arbiter_streams.write().insert(id, stream.clone());
+        self.persist_meta()?;
+        Ok(stream)
+    }
+
+    /// Assert a judgment in an arbiter stream (M5).
+    pub fn assert_judgment(
+        &self,
+        stream: ArbiterId,
+        mut record: JudgmentRecord,
+    ) -> Result<RevisionId, EngineError> {
+        let arbiter = self
+            .arbiter_streams
+            .read()
+            .get(&stream)
+            .cloned()
+            .ok_or(EngineError::ArbiterStreamNotFound(stream.0))?;
+        self.ensure_judgment_index_space()?;
+        self.validate_judgment_subject(&record.subject)?;
+        record.arbiter = stream;
+        let rev = self.watermark.allocate();
+        if let Some(ref prov) = record.authoring_frame {
+            validate_authoring_provenance(prov, rev)?;
+        }
+        let rows = prepare_judgment_writes(arbiter.assertion_space, &record)
+            .map_err(|e| EngineError::Other {
+                message: e.to_string(),
+            })?;
+        let records = rows_to_records(&rows, rev);
+        self.apply_records_on_branch(BranchId::MAIN, records)?;
+        Ok(rev)
+    }
+
+    /// Fetch a judgment by id from an arbiter stream (M5).
+    pub fn fetch_judgment_by_id(
+        &self,
+        stream: ArbiterId,
+        id: JudgmentId,
+        as_of: Option<RevisionId>,
+    ) -> io::Result<Option<JudgmentRecord>> {
+        let assertion_space = self
+            .arbiter_streams
+            .read()
+            .get(&stream)
+            .map(|s| s.assertion_space)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "arbiter stream not found"))?;
+        let point = crate::infinitedb_core::judgment::judgment_storage_point(id);
+        let records = self.query_bbox_on_branch(
+            BranchId::MAIN,
+            assertion_space,
+            point.clone(),
+            point,
+            as_of,
+        )?;
+        for r in records {
+            if r.tombstone {
+                continue;
+            }
+            if let Ok(j) = decode_judgment_record(&r.data) {
+                if j.id == id {
+                    return Ok(Some(j));
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    /// Judgments whose subjects fall in a spatial region (M5).
+    pub fn query_judgments_in_region(
+        &self,
+        stream: ArbiterId,
+        min: DimensionVector,
+        max: DimensionVector,
+        as_of: Option<RevisionId>,
+    ) -> io::Result<Vec<JudgmentRecord>> {
+        let assertion_space = self
+            .arbiter_streams
+            .read()
+            .get(&stream)
+            .map(|s| s.assertion_space)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "arbiter stream not found"))?;
+        let (min, max) = Self::pad_judgment_index_bbox(min, max);
+        let index_records =
+            self.query_bbox_on_branch(BranchId::MAIN, JUDGMENT_INDEX_SPACE, min, max, as_of)?;
+        let mut out = Vec::new();
+        for r in index_records {
+            if r.tombstone {
+                continue;
+            }
+            let Some(id) = judgment_id_from_index_payload(&r.data) else {
+                continue;
+            };
+            if let Some(j) = self.fetch_judgment_by_id(stream, id, as_of)? {
+                if j.arbiter == stream {
+                    out.push(j);
+                }
+            }
+        }
+        let _ = assertion_space;
+        Ok(out)
+    }
+
+    /// Judgments pinned to a subject (M5).
+    pub fn query_judgments_for_subject(
+        &self,
+        stream: ArbiterId,
+        pin: &SubjectPin,
+        as_of: Option<RevisionId>,
+    ) -> io::Result<Vec<JudgmentRecord>> {
+        let prefix = subject_spatial_prefix(pin);
+        let index_records =
+            self.query_on_branch(BranchId::MAIN, JUDGMENT_INDEX_SPACE, as_of)?;
+        let mut ids = Vec::new();
+        for r in index_records {
+            if r.tombstone {
+                continue;
+            }
+            if !index_matches_subject_prefix(&r.address.point.coords, &prefix) {
+                continue;
+            }
+            if let Some(id) = judgment_id_from_index_payload(&r.data) {
+                ids.push(id);
+            }
+        }
+        let mut out = Vec::new();
+        for id in ids {
+            if let Some(j) = self.fetch_judgment_by_id(stream, id, as_of)? {
+                if j.subject == *pin {
+                    out.push(j);
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Flow-vector index derivation watermark (M7).
+    pub fn flow_vector_index_watermark(&self) -> RevisionId {
+        self.derivation.flow_vector_index_watermark()
+    }
+
+    /// Scan flow vectors whose quantized direction falls in `min_dir`..=`max_dir` (M7).
+    pub fn query_flow_vectors_in_region(
+        &self,
+        min_dir: QuantizedDirection,
+        max_dir: QuantizedDirection,
+        as_of: Option<RevisionId>,
+        options: QueryOptions,
+    ) -> io::Result<Vec<FlowVectorRecord>> {
+        self.ensure_flow_vector_index_space()
+            .map_err(engine_to_io)?;
+        let rev_ceiling = as_of.unwrap_or_else(|| self.revision());
+        let wm = self.derivation.flow_vector_index_watermark();
+        let (min, max) = pad_flow_vector_index_bbox(min_dir.clone(), max_dir.clone());
+        let mut index_records =
+            self.query_bbox_on_branch(BranchId::MAIN, FLOW_VECTOR_INDEX_SPACE, min, max, as_of)?;
+        if !options.index_only {
+            index_records.extend(self.synthetic_flow_vector_records_from_delta(
+                rev_ceiling,
+                wm,
+            )?);
+        }
+        let q = default_flow_vector_quantization();
+        let edge_spaces = edge_spaces_from_registry(&self.spaces.read());
+        let mut seen = std::collections::HashSet::new();
+        let mut out = Vec::new();
+        for r in index_records {
+            if r.tombstone {
+                continue;
+            }
+            if !direction_in_region(&r.address.point.coords, &min_dir, &max_dir) {
+                continue;
+            }
+            let Some(id) = edge_id_from_flow_vector_index_record(&r.address.point.coords, &r.data)
+            else {
+                continue;
+            };
+            if !seen.insert(id) {
+                continue;
+            }
+            if let Some(edge) = self.fetch_hyperedge_for_flow_merge(
+                &edge_spaces,
+                id,
+                as_of,
+                rev_ceiling,
+                wm,
+                options.index_only,
+            )? {
+                if !edge.is_active_at(rev_ceiling) {
+                    continue;
+                }
+                let Some(vector) = edge.flow_vector() else {
+                    continue;
+                };
+                let quantized = quantize_direction(&vector.delta, &q);
+                if !direction_in_region(&quantized.coords, &min_dir, &max_dir) {
+                    continue;
+                }
+                out.push(FlowVectorRecord {
+                    edge,
+                    vector,
+                    quantized,
+                });
+            }
+        }
+        Ok(out)
+    }
+
+    /// Flow vector for a single hyperedge assertion (M7).
+    pub fn query_flow_vector_for_edge(
+        &self,
+        edge_space: SpaceId,
+        id: HyperedgeId,
+        as_of: Option<RevisionId>,
+    ) -> io::Result<Option<FlowVectorRecord>> {
+        let rev_ceiling = as_of.unwrap_or_else(|| self.revision());
+        let Some(edge) = self.fetch_hyperedge_by_id(edge_space, id, as_of)? else {
+            return Ok(None);
+        };
+        if !edge.is_active_at(rev_ceiling) {
+            return Ok(None);
+        }
+        let Some(vector) = edge.flow_vector() else {
+            return Ok(None);
+        };
+        let quantized = quantize_direction(&vector.delta, &default_flow_vector_quantization());
+        Ok(Some(FlowVectorRecord {
+            edge,
+            vector,
+            quantized,
+        }))
+    }
+
+    /// Backward freshness for a hyperedge with computation provenance (M7).
+    pub fn check_hyperedge_freshness(
+        &self,
+        edge_space: SpaceId,
+        id: HyperedgeId,
+        as_of: Option<RevisionId>,
+    ) -> io::Result<FreshnessReport> {
+        let edge = self
+            .fetch_hyperedge_by_id(edge_space, id, as_of)?
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::NotFound, format!("hyperedge {:?} not found", id))
+            })?;
+        check_computation_freshness(&edge, &|pin| self.fetch_subject_revision_at(pin, as_of))
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "hyperedge has no computation provenance",
+                )
+            })
+    }
+
+    /// Forward stale closure from a changed subject pin (M7).
+    pub fn query_stale_downstream(
+        &self,
+        subject: SubjectPin,
+        edge_space: SpaceId,
+        max_depth: usize,
+        as_of: Option<RevisionId>,
+    ) -> io::Result<Vec<StaleTarget>> {
+        self.query_staleness_by_source_revision(subject, edge_space, max_depth, as_of)
+    }
+
+    /// Observability alias for source-revision staleness closure (M7).
+    pub fn query_staleness_by_source_revision(
+        &self,
+        source: SubjectPin,
+        edge_space: SpaceId,
+        max_depth: usize,
+        as_of: Option<RevisionId>,
+    ) -> io::Result<Vec<StaleTarget>> {
+        let rev_ceiling = as_of.unwrap_or_else(|| self.revision());
+        let wm = self.derivation.endpoint_index_watermark();
+        let registry_layout = registry_index_layout(&self.spaces.read());
+        let mut index_records =
+            self.query_on_branch(BranchId::MAIN, ENDPOINT_INDEX_SPACE, as_of)?;
+        if wm < rev_ceiling {
+            index_records.extend(self.synthetic_index_records_from_delta(
+                edge_space,
+                rev_ceiling,
+                wm,
+                registry_layout,
+            )?);
+        }
+        let fetch_edge = |id: HyperedgeId| {
+            self.fetch_hyperedge_by_id(edge_space, id, as_of)
+                .ok()
+                .flatten()
+                .filter(|e| e.is_active_at(rev_ceiling))
+        };
+        let seeds = staleness_seed_endpoints(&source, &fetch_edge);
+        forward_stale_closure(
+            &source,
+            edge_space,
+            max_depth,
+            as_of,
+            &index_records,
+            registry_layout,
+            rev_ceiling,
+            &fetch_edge,
+            &|pin| self.fetch_subject_revision_at(pin, as_of),
+            &seeds,
+        )
+    }
+
+    fn validate_frame_request(
+        &self,
+        request: &FrameRegisterRequest,
+        existing_id: Option<FrameId>,
+    ) -> Result<(), EngineError> {
+        if request.name.is_empty() {
+            return Err(FrameValidationError::EmptyName.into());
+        }
+        for frame in self.frames.read().values() {
+            if frame.name == request.name && existing_id != Some(frame.id) {
+                return Err(EngineError::FrameExists(request.name.clone()));
+            }
+        }
+        self.validate_assertion_scope(&request.assertion_scope)?;
+        for layer in &request.judgment_overlay {
+            if !self.arbiter_streams.read().contains_key(&layer.arbiter) {
+                return Err(FrameValidationError::ArbiterNotRegistered(layer.arbiter).into());
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_assertion_scope(&self, scope: &AssertionScope) -> Result<(), EngineError> {
+        match scope {
+            AssertionScope::Spaces(spaces) => {
+                if spaces.is_empty() {
+                    return Err(FrameValidationError::EmptyScope.into());
+                }
+                for space in spaces {
+                    if !is_testimony_space(*space) {
+                        return Err(FrameValidationError::ReservedSpace(*space).into());
+                    }
+                    if self.spaces.read().get(*space).is_none() {
+                        return Err(FrameValidationError::SpaceNotRegistered(*space).into());
+                    }
+                }
+            }
+            AssertionScope::Branches(branches) => {
+                if branches.is_empty() {
+                    return Err(FrameValidationError::EmptyScope.into());
+                }
+                for branch in branches {
+                    if self.branches.read().get(*branch).is_none() {
+                        return Err(FrameValidationError::BranchNotFound(*branch).into());
+                    }
+                }
+            }
+            AssertionScope::Union(parts) => {
+                if parts.is_empty() {
+                    return Err(FrameValidationError::EmptyScope.into());
+                }
+                for part in parts {
+                    self.validate_assertion_scope(part)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn collect_frame_judgments(
+        &self,
+        layers: &[JudgmentOverlayLayer],
+        min: &DimensionVector,
+        max: &DimensionVector,
+        as_of: RevisionId,
+    ) -> Result<HashMap<SubjectPin, Vec<JudgmentRecord>>, EngineError> {
+        let mut judgments_by_subject: HashMap<SubjectPin, Vec<JudgmentRecord>> = HashMap::new();
+        for layer in layers {
+            let js = self
+                .query_judgments_in_region(layer.arbiter, min.clone(), max.clone(), Some(as_of))
+                .map_err(EngineError::from)?;
+            for j in js {
+                judgments_by_subject
+                    .entry(j.subject.clone())
+                    .or_default()
+                    .push(j);
+            }
+        }
+        Ok(judgments_by_subject)
+    }
+
+    fn endpoint_judgment_bbox(endpoint: &EndpointRef) -> (DimensionVector, DimensionVector) {
+        let coords = endpoint.node.coords.clone();
+        let min = DimensionVector::new(coords.clone());
+        let max = DimensionVector::new(coords);
+        Self::pad_judgment_index_bbox(min, max)
+    }
+
+    fn maybe_persist_import_errors(
+        &self,
+        space: SpaceId,
+        result: &HyperedgeImportResult,
+    ) -> Result<(), EngineError> {
+        if result.errors.is_empty() && !result.aborted {
+            return Ok(());
+        }
+        let admitted = revision_range_from_engine(result.admitted);
+        let record = operation_record_from_import(space, admitted, &result.errors, result.aborted);
+        let _ = self.persist_operation_errors(space, record)?;
+        Ok(())
+    }
+
+    fn validate_computation_inputs(
+        &self,
+        comp: &crate::infinitedb_core::computation::ComputationProvenance,
+    ) -> Result<(), EngineError> {
+        if comp.inputs.is_empty() {
+            return Err(ComputationValidationError::EmptyInputs.into());
+        }
+        for (index, pin) in comp.inputs.iter().enumerate() {
+            if let Err(e) = self.validate_judgment_subject(pin) {
+                return Err(match e {
+                    EngineError::InvalidJudgment(JudgmentValidationError::SubjectNotFound {
+                        space,
+                        revision,
+                    }) => ComputationValidationError::InputNotFound {
+                        index,
+                        space,
+                        revision,
+                    }
+                    .into(),
+                    EngineError::InvalidJudgment(
+                        JudgmentValidationError::SubjectRevisionMismatch {
+                            expected,
+                            observed,
+                        },
+                    ) => ComputationValidationError::InputRevisionMismatch {
+                        index,
+                        expected,
+                        observed,
+                    }
+                    .into(),
+                    EngineError::InvalidJudgment(JudgmentValidationError::InvalidSubjectPin(
+                        message,
+                    )) => ComputationValidationError::InvalidInputPin { index, message }.into(),
+                    other => other,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    fn fetch_subject_revision_at(
+        &self,
+        pin: &SubjectPin,
+        as_of: Option<RevisionId>,
+    ) -> Option<RevisionId> {
+        match (&pin.kind, &pin.identity) {
+            (SubjectKind::Hyperedge, SubjectIdentity::Hyperedge(id)) => self
+                .fetch_hyperedge_by_id(pin.space, *id, as_of)
+                .ok()
+                .flatten()
+                .map(|e| e.valid_from),
+            (SubjectKind::Node, SubjectIdentity::Address(addr)) => {
+                let records = self
+                    .query_bbox_on_branch(
+                        BranchId::MAIN,
+                        pin.space,
+                        addr.point.clone(),
+                        addr.point.clone(),
+                        as_of,
+                    )
+                    .ok()?;
+                records
+                    .iter()
+                    .filter(|r| !r.tombstone)
+                    .map(|r| r.revision)
+                    .max()
+            }
+            _ => None,
+        }
+    }
+
+    fn validate_judgment_subject(&self, pin: &SubjectPin) -> Result<(), EngineError> {
+        match (&pin.kind, &pin.identity) {
+            (SubjectKind::Hyperedge, SubjectIdentity::Hyperedge(id)) => {
+                let edge = self
+                    .fetch_hyperedge_by_id(pin.space, *id, None)?
+                    .ok_or(JudgmentValidationError::SubjectNotFound {
+                        space: pin.space,
+                        revision: pin.subject_revision,
+                    })?;
+                if edge.valid_from != pin.subject_revision {
+                    return Err(JudgmentValidationError::SubjectRevisionMismatch {
+                        expected: pin.subject_revision,
+                        observed: edge.valid_from,
+                    }
+                    .into());
+                }
+                Ok(())
+            }
+            (SubjectKind::Node, SubjectIdentity::Address(addr)) => {
+                let records = self.query_bbox_on_branch(
+                    BranchId::MAIN,
+                    pin.space,
+                    addr.point.clone(),
+                    addr.point.clone(),
+                    Some(pin.subject_revision),
+                )?;
+                if records.iter().any(|r| !r.tombstone && r.revision == pin.subject_revision) {
+                    Ok(())
+                } else {
+                    Err(JudgmentValidationError::SubjectNotFound {
+                        space: pin.space,
+                        revision: pin.subject_revision,
+                    }
+                    .into())
+                }
+            }
+            _ => Err(JudgmentValidationError::InvalidSubjectPin(
+                "subject kind does not match identity".into(),
+            )
+            .into()),
+        }
     }
 
     /// Three-way merge `source` into `target` (usually `main`).
@@ -500,7 +2388,7 @@ impl InfiniteDb {
             return Ok(());
         }
         let main_revs: Vec<RevisionId> = main_jobs.iter().map(|j| j.revision).collect();
-        let result = match &self.backend {
+        let result = match &mut *self.backend.lock() {
             WriteBackend::V4 { coordinator } => coordinator.enqueue_batch(main_jobs),
             WriteBackend::V3 { coordinator } => coordinator.enqueue_batch(main_jobs),
             WriteBackend::V2 { queue, .. } => {
@@ -572,7 +2460,7 @@ impl InfiniteDb {
 
     /// Flush pending writes for one space to durable storage without syncing all spaces.
     pub fn flush(&self, space: SpaceId) -> io::Result<()> {
-        match &self.backend {
+        match &*self.backend.lock() {
             WriteBackend::V4 { coordinator } => coordinator.flush_space(space)?,
             WriteBackend::V3 { coordinator } => coordinator.flush_space(space)?,
             WriteBackend::V2 { queue, .. } => queue.request_flush(space)?,
@@ -582,7 +2470,8 @@ impl InfiniteDb {
 
     /// Flush all write queues and persist metadata. Call after writes to make data queryable.
     pub fn sync(&self) -> io::Result<()> {
-        match &self.backend {
+        self.derivation.flush();
+        match &*self.backend.lock() {
             WriteBackend::V4 { coordinator } => coordinator.sync_all()?,
             WriteBackend::V3 { coordinator } => coordinator.sync_all()?,
             WriteBackend::V2 { queue, .. } => queue.request_sync()?,
@@ -617,7 +2506,7 @@ impl InfiniteDb {
 
     /// I/O queue depth and write-path counters across all backend threads.
     pub fn io_stats(&self) -> IoStats {
-        match &self.backend {
+        match &*self.backend.lock() {
             WriteBackend::V4 { coordinator } => coordinator.io_stats(),
             WriteBackend::V3 { coordinator } => coordinator.io_stats(),
             WriteBackend::V2 { queue, io_handle, .. } => {
@@ -634,7 +2523,7 @@ impl InfiniteDb {
 
     /// Number of I/O shards (1 for format v2, per-space or per-Hilbert-shard for v3/v4).
     pub fn space_shard_count(&self) -> usize {
-        match &self.backend {
+        match &*self.backend.lock() {
             WriteBackend::V4 { coordinator } => coordinator.shard_count(),
             WriteBackend::V3 { coordinator } => coordinator.shard_count(),
             WriteBackend::V2 { .. } => 1,
@@ -642,22 +2531,10 @@ impl InfiniteDb {
     }
 
     pub(crate) fn query_ctx(&self) -> QueryCtx<'_> {
-        match &self.backend {
-            WriteBackend::V2 { live_tail, .. } => QueryCtx {
-                live_tail: Some(live_tail.as_ref()),
-                space_tails: None,
-                hilbert_tails: None,
-            },
-            WriteBackend::V3 { coordinator } => QueryCtx {
-                live_tail: None,
-                space_tails: Some(coordinator.live_tails()),
-                hilbert_tails: None,
-            },
-            WriteBackend::V4 { coordinator } => QueryCtx {
-                live_tail: None,
-                space_tails: None,
-                hilbert_tails: Some(coordinator.live_tails()),
-            },
+        QueryCtx {
+            live_tail: self.v2_live_tail.as_deref(),
+            space_tails: self.v3_space_tails.as_deref(),
+            hilbert_tails: self.v4_hilbert_tails.as_deref(),
         }
     }
 
@@ -731,7 +2608,7 @@ impl InfiniteDb {
         }
         let result = (|| {
             self.sync()?;
-            match &self.backend {
+            match &*self.backend.lock() {
                 WriteBackend::V4 { coordinator } => coordinator.compact_space(space),
                 WriteBackend::V3 { coordinator } => coordinator.compact_space(space),
                 WriteBackend::V2 { .. } => Ok(()),
@@ -759,7 +2636,7 @@ impl InfiniteDb {
             self.watermark.retire(rev);
             return Ok(());
         }
-        let result = match &self.backend {
+        let result = match &*self.backend.lock() {
             WriteBackend::V4 { coordinator } => coordinator.enqueue_write(job),
             WriteBackend::V3 { coordinator } => coordinator.enqueue_write(job),
             WriteBackend::V2 { queue, .. } => queue.enqueue_write(job),
@@ -827,6 +2704,192 @@ impl InfiniteDb {
         self.enqueue_batch(jobs)
     }
 
+    fn pad_judgment_index_bbox(
+        min: DimensionVector,
+        max: DimensionVector,
+    ) -> (DimensionVector, DimensionVector) {
+        use crate::infinitedb_core::judgment_index::JUDGMENT_INDEX_DIMS;
+        let mut min_coords = min.coords;
+        let mut max_coords = max.coords;
+        while min_coords.len() < JUDGMENT_INDEX_DIMS {
+            min_coords.push(0);
+        }
+        while max_coords.len() < JUDGMENT_INDEX_DIMS {
+            max_coords.push(u32::MAX);
+        }
+        (
+            DimensionVector::new(min_coords),
+            DimensionVector::new(max_coords),
+        )
+    }
+
+    fn hyperedge_id_from_storage_point(point: &DimensionVector) -> HyperedgeId {
+        let c = &point.coords;
+        let hi = c.first().copied().unwrap_or(0) as u64;
+        let lo = c.get(1).copied().unwrap_or(0) as u64;
+        HyperedgeId((hi << 32) | lo)
+    }
+
+    fn merge_incident_ids_from_assertion_delta(
+        &self,
+        edge_space: SpaceId,
+        endpoint: &EndpointRef,
+        direction: DirectionFilter,
+        ids: Vec<HyperedgeId>,
+        rev_ceiling: RevisionId,
+        watermark: RevisionId,
+    ) -> io::Result<Vec<HyperedgeId>> {
+        self.merge_incident_ids_from_assertion_delta_multi_space(
+            &[edge_space],
+            endpoint,
+            direction,
+            ids,
+            rev_ceiling,
+            watermark,
+        )
+    }
+
+    fn merge_incident_ids_from_assertion_delta_multi_space(
+        &self,
+        edge_spaces: &[SpaceId],
+        endpoint: &EndpointRef,
+        direction: DirectionFilter,
+        mut ids: Vec<HyperedgeId>,
+        rev_ceiling: RevisionId,
+        watermark: RevisionId,
+    ) -> io::Result<Vec<HyperedgeId>> {
+        use std::collections::HashSet;
+        let mut set: HashSet<HyperedgeId> = ids.drain(..).collect();
+        let index_layout = registry_index_layout(&self.spaces.read());
+        for &space in edge_spaces {
+            let records = self.query_on_branch(BranchId::MAIN, space, Some(rev_ceiling))?;
+            for r in records {
+                if r.revision < watermark || r.revision > rev_ceiling {
+                    continue;
+                }
+                if r.tombstone {
+                    let id = Self::hyperedge_id_from_storage_point(&r.address.point);
+                    set.remove(&id);
+                    continue;
+                }
+                if let Ok(edge) = decode_edge_record(&r.data) {
+                    let incident = edge.endpoints.iter().any(|ep| {
+                        ep.space == endpoint.space && ep.node.coords == endpoint.node.coords
+                    });
+                    if incident
+                        && filter_edges_by_direction(vec![edge.clone()], endpoint, direction)
+                            .pop()
+                            .is_some()
+                    {
+                        set.insert(edge.id);
+                    }
+                }
+            }
+        }
+        let _ = index_layout;
+        Ok(set.into_iter().collect())
+    }
+
+    fn fetch_hyperedge_for_flow_merge(
+        &self,
+        edge_spaces: &[SpaceId],
+        id: HyperedgeId,
+        as_of: Option<RevisionId>,
+        rev_ceiling: RevisionId,
+        watermark: RevisionId,
+        index_only: bool,
+    ) -> io::Result<Option<Hyperedge>> {
+        for &space in edge_spaces {
+            if let Some(edge) = self.fetch_hyperedge_by_id(space, id, as_of)? {
+                return Ok(Some(edge));
+            }
+        }
+        if index_only || watermark >= rev_ceiling {
+            return Ok(None);
+        }
+        for &space in edge_spaces {
+            let records = self.query_on_branch(BranchId::MAIN, space, Some(rev_ceiling))?;
+            for r in records {
+                if r.revision < watermark || r.revision > rev_ceiling || r.tombstone {
+                    continue;
+                }
+                if let Ok(edge) = decode_edge_record(&r.data) {
+                    if edge.id == id {
+                        return Ok(Some(edge));
+                    }
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    fn synthetic_flow_vector_records_from_delta(
+        &self,
+        rev_ceiling: RevisionId,
+        watermark: RevisionId,
+    ) -> io::Result<Vec<Record>> {
+        let q = default_flow_vector_quantization();
+        let edge_spaces = edge_spaces_from_registry(&self.spaces.read());
+        let mut synthetic = Vec::new();
+        for space in edge_spaces {
+            let records = self.query_on_branch(BranchId::MAIN, space, Some(rev_ceiling))?;
+            for r in records {
+                if r.revision < watermark || r.revision > rev_ceiling {
+                    continue;
+                }
+                if r.tombstone {
+                    continue;
+                }
+                if let Ok(edge) = decode_edge_record(&r.data) {
+                    for row in prepare_flow_vector_derivation(&edge, q) {
+                        synthetic.push(Record {
+                            address: Address::new(row.space, row.point),
+                            revision: r.revision,
+                            data: row.data,
+                            tombstone: row.tombstone,
+                            hilbert_key: CachedHilbertKey::UNSET,
+                        });
+                    }
+                }
+            }
+        }
+        Ok(synthetic)
+    }
+
+    fn synthetic_index_records_from_delta(
+        &self,
+        edge_space: SpaceId,
+        rev_ceiling: RevisionId,
+        watermark: RevisionId,
+        index_layout: EndpointIndexLayout,
+    ) -> io::Result<Vec<Record>> {
+        let records = self.query_on_branch(BranchId::MAIN, edge_space, Some(rev_ceiling))?;
+        let mut synthetic = Vec::new();
+        for r in records {
+            if r.revision < watermark || r.revision > rev_ceiling {
+                continue;
+            }
+            if r.tombstone {
+                continue;
+            }
+            if let Ok(edge) = decode_edge_record(&r.data) {
+                for row in prepare_index_derivation(&edge, index_layout) {
+                    synthetic.push(Record {
+                        address: crate::infinitedb_core::address::Address::new(
+                            row.space,
+                            row.point,
+                        ),
+                        revision: r.revision,
+                        data: row.data,
+                        tombstone: row.tombstone,
+                        hilbert_key: CachedHilbertKey::UNSET,
+                    });
+                }
+            }
+        }
+        Ok(synthetic)
+    }
+
     fn persist_meta(&self) -> io::Result<()> {
         let spaces_bytes = encode_to_vec(&*self.spaces.read(), standard())
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
@@ -855,14 +2918,24 @@ impl InfiniteDb {
         let branch_bases_bytes = encode_to_vec(&branch_bases, standard())
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
         self.store.write_meta("branch_bases.bin", &branch_bases_bytes)?;
+
+        let arbiter_streams_bytes = encode_to_vec(&*self.arbiter_streams.read(), standard())
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        self.store
+            .write_meta("arbiter_streams.bin", &arbiter_streams_bytes)?;
+
+        let frames_bytes = encode_to_vec(&*self.frames.read(), standard())
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        self.store.write_meta("frames.bin", &frames_bytes)?;
         Ok(())
     }
 }
 
 impl Drop for InfiniteDb {
     fn drop(&mut self) {
+        self.derivation.shutdown();
         let _ = self.persist_meta();
-        match &self.backend {
+        match &*self.backend.lock() {
             WriteBackend::V4 { coordinator } => {
                 let _ = coordinator.shutdown_all();
             }
