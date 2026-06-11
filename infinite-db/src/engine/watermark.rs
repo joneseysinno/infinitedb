@@ -7,7 +7,7 @@ use parking_lot::Mutex;
 use crate::infinitedb_core::address::RevisionId;
 
 /// Record of a revision that could not be durably applied.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FailedRevision {
     /// Revision that was abandoned.
     pub revision: RevisionId,
@@ -137,6 +137,11 @@ impl RevisionWatermark {
         });
     }
 
+    /// Observe recorded write failures without clearing the log (most recent retained).
+    pub fn failed_revisions(&self) -> Vec<FailedRevision> {
+        self.state.lock().failed.iter().cloned().collect()
+    }
+
     /// Drain recorded write failures (most recent retained).
     pub fn take_failed(&self) -> Vec<FailedRevision> {
         self.state.lock().failed.drain(..).collect()
@@ -145,7 +150,7 @@ impl RevisionWatermark {
     /// Highest revision guaranteed visible to readers (repeatable-read ceiling).
     ///
     /// Every revision ≤ the returned value has either been durably applied or
-    /// reported through [`Self::take_failed`]; stable never waits on a revision
+    /// abandoned via [`Self::retire_failed`]; stable never waits on a revision
     /// that can no longer succeed.
     pub fn stable_revision(&self) -> RevisionId {
         compute_stable(&self.state.lock())

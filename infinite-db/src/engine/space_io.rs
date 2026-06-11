@@ -29,7 +29,7 @@ use super::branch_overlay::BranchOverlayStore;
 use super::compactor::{maybe_compact_after_seal, CompactionPolicyOverrides};
 use super::group_commit::{commit_group_to_hot_segment, drain_write_group, migrate_staging_to_hot, WriteGroup};
 use super::hilbert_shard::ShardRef;
-use super::query::prepare_records_for_seal;
+use super::query::{prepare_records_for_seal, record_identity_key};
 use super::io_thread::IoThreadConfig;
 use super::live_tail::LiveTailView;
 use super::snapshot_store::SnapshotStore;
@@ -330,10 +330,8 @@ fn seal_space(state: &mut SpaceIoState) -> io::Result<()> {
         return Ok(());
     }
 
-    {
-        let spaces = state.spaces.read();
-        prepare_records_for_seal(&spaces, &mut records);
-    }
+    let spaces = state.spaces.read();
+    prepare_records_for_seal(&spaces, &mut records);
 
     let min_rev = records.iter().map(|r| r.revision).min().unwrap_or(RevisionId::ZERO);
     let max_rev = records.iter().map(|r| r.revision).max().unwrap_or(RevisionId::ZERO);
@@ -351,8 +349,9 @@ fn seal_space(state: &mut SpaceIoState) -> io::Result<()> {
 
     let sealed: HashSet<RecordIdentityKey> = records
         .iter()
-        .map(RecordIdentityKey::from_record)
+        .map(|r| record_identity_key(&spaces, r))
         .collect();
+    drop(spaces);
 
     let mut block = Block {
         id: block_id,
@@ -369,7 +368,7 @@ fn seal_space(state: &mut SpaceIoState) -> io::Result<()> {
         block_id,
         max_key: hilbert_max,
     };
-    state.live_tail.seal(hilbert_min, block_entry, &sealed);
+    state.live_tail.seal(hilbert_min, block_entry, &sealed, &state.spaces.read());
 
     state.snapshots.update(space, |snap| {
         snap.blocks.insert(hilbert_min, block_entry);

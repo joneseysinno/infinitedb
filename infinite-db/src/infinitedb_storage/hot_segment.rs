@@ -14,6 +14,10 @@ use std::{
 #[doc(hidden)]
 pub static TEST_FAIL_SYNC_GROUP: AtomicBool = AtomicBool::new(false);
 
+/// Test-only: inject applies only while armed (see crcw inject tests).
+#[doc(hidden)]
+pub static TEST_FAIL_SYNC_ARMED: AtomicBool = AtomicBool::new(false);
+
 use bincode::{config::standard, decode_from_slice, encode_to_vec};
 use blake3::Hasher;
 
@@ -105,7 +109,9 @@ impl HotSegment {
 
     /// Fsync the segment and commit the length header once for a write group.
     pub fn sync_group(&mut self) -> io::Result<()> {
-        if TEST_FAIL_SYNC_GROUP.swap(false, Ordering::SeqCst) {
+        if TEST_FAIL_SYNC_ARMED.load(Ordering::SeqCst)
+            && TEST_FAIL_SYNC_GROUP.swap(false, Ordering::SeqCst)
+        {
             return Err(io::Error::new(
                 io::ErrorKind::Other,
                 "injected hot segment fsync failure",
@@ -124,9 +130,13 @@ impl HotSegment {
     }
 
     /// Read all valid frames from disk (recovery and query).
+    ///
+    /// Stops at the durable [`committed_len`] boundary; bytes past that header
+    /// (failed group commits) are ignored.
     pub fn read_all_entries(&mut self) -> io::Result<Vec<WalEntry>> {
+        let durable_len = self.read_committed_len_header()?;
         self.file.seek(SeekFrom::Start((MAGIC.len() + 8) as u64))?;
-        read_frames(&mut self.file)
+        read_frames_up_to(&mut self.file, durable_len)
     }
 
     /// Decode all records from valid frames.
@@ -164,16 +174,34 @@ impl HotSegment {
         Ok(())
     }
 
+    fn read_committed_len_header(&mut self) -> io::Result<u64> {
+        self.file.seek(SeekFrom::Start(MAGIC.len() as u64))?;
+        let mut len_buf = [0u8; 8];
+        self.file.read_exact(&mut len_buf)?;
+        Ok(u64::from_le_bytes(len_buf))
+    }
+
     /// Add `bytes` to the tracked committed length (after in-memory append).
     pub fn track_appended_bytes(&mut self, bytes: usize) {
         self.committed_len = self.committed_len.saturating_add(bytes as u64);
     }
+
+    /// Roll back uncommitted appends after a failed group fsync.
+    pub fn truncate_to(&mut self, len: u64) -> io::Result<()> {
+        self.file.set_len(len)?;
+        self.committed_len = len;
+        self.file.seek(SeekFrom::End(0))?;
+        Ok(())
+    }
 }
 
-fn read_frames(file: &mut File) -> io::Result<Vec<WalEntry>> {
+fn read_frames_up_to(file: &mut File, end_offset: u64) -> io::Result<Vec<WalEntry>> {
     let mut out = Vec::new();
     let mut len_buf = [0u8; 8];
     loop {
+        if file.stream_position()? >= end_offset {
+            break;
+        }
         match file.read_exact(&mut len_buf) {
             Ok(_) => {}
             Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
@@ -249,5 +277,36 @@ mod tests {
         let records = seg.read_all_records().unwrap();
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].data, vec![9]);
+    }
+
+    #[test]
+    fn uncommitted_frames_not_replayed() {
+        let dir = TempDir::new().unwrap();
+        let mut seg = HotSegment::open(dir.path().to_path_buf(), 1).unwrap();
+        let durable_len = seg.committed_bytes();
+        let added = seg.append_frame(&sample_entry()).unwrap();
+        seg.track_appended_bytes(added);
+        let records = seg.read_all_records().unwrap();
+        assert!(records.is_empty());
+        assert_eq!(seg.committed_bytes(), durable_len + added as u64);
+    }
+
+    #[test]
+    fn failed_sync_group_rolls_back() {
+        use std::sync::atomic::Ordering;
+
+        let dir = TempDir::new().unwrap();
+        let mut seg = HotSegment::open(dir.path().to_path_buf(), 1).unwrap();
+        let durable_len = seg.committed_bytes();
+        let added = seg.append_frame(&sample_entry()).unwrap();
+        seg.track_appended_bytes(added);
+        TEST_FAIL_SYNC_ARMED.store(true, Ordering::SeqCst);
+        TEST_FAIL_SYNC_GROUP.store(true, Ordering::SeqCst);
+        assert!(seg.sync_group().is_err());
+        TEST_FAIL_SYNC_ARMED.store(false, Ordering::SeqCst);
+        seg.truncate_to(durable_len).unwrap();
+        assert_eq!(seg.committed_bytes(), durable_len);
+        assert_eq!(seg.path().metadata().unwrap().len(), durable_len);
+        assert!(seg.read_all_records().unwrap().is_empty());
     }
 }

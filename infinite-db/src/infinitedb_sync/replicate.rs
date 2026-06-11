@@ -5,12 +5,14 @@ use std::io;
 
 use bincode::{config::standard, encode_to_vec};
 
+use crate::engine::query::address_key;
 use crate::infinitedb_core::{
     address::{DimensionVector, RevisionId, SpaceId},
     block::Record,
     branch::BranchId,
     merge::MergeStrategy,
     record_identity::AddressKey,
+    space::SpaceRegistry,
 };
 use crate::InfiniteDb;
 
@@ -24,10 +26,10 @@ pub struct BranchSyncState {
     pub revision: RevisionId,
 }
 
-fn latest_per_address(mut records: Vec<Record>) -> Vec<Record> {
+fn latest_per_address(spaces: &SpaceRegistry, mut records: Vec<Record>) -> Vec<Record> {
     let mut map: HashMap<AddressKey, Record> = HashMap::new();
     for record in records.drain(..) {
-        let key = AddressKey::from_record(&record);
+        let key = address_key(spaces, &record);
         map.entry(key)
             .and_modify(|existing| {
                 if record.revision > existing.revision {
@@ -47,7 +49,8 @@ pub fn snapshot_merkle(
     space: SpaceId,
     branch: BranchId,
 ) -> io::Result<MerkleTree> {
-    let records = latest_per_address(db.query_on_branch(branch, space, None)?);
+    let spaces = db.spaces.read();
+    let records = latest_per_address(&spaces, db.query_on_branch(branch, space, None)?);
     let mut leaves = Vec::with_capacity(records.len());
     for record in &records {
         let encoded = encode_to_vec(

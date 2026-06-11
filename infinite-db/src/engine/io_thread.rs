@@ -29,7 +29,7 @@ use super::branch_overlay::BranchOverlayStore;
 use super::compactor::{maybe_compact_after_seal, CompactionPolicyOverrides};
 use super::group_commit::{commit_group_to_hot_segment, drain_write_group, migrate_staging_to_hot, WriteGroup};
 use super::live_tail::LiveTailView;
-use super::query::prepare_records_for_seal;
+use super::query::{prepare_records_for_seal, record_identity_key};
 use super::snapshot_store::SnapshotStore;
 use super::watermark::RevisionWatermark;
 use super::write_queue::{IoCommand, WriteQueueSender};
@@ -419,7 +419,7 @@ fn seal_space(state: &mut IoState, space: SpaceId) -> io::Result<()> {
 
     let sealed: HashSet<RecordIdentityKey> = records
         .iter()
-        .map(RecordIdentityKey::from_record)
+        .map(|r| record_identity_key(&spaces, r))
         .collect();
 
     let mut block = Block {
@@ -437,7 +437,7 @@ fn seal_space(state: &mut IoState, space: SpaceId) -> io::Result<()> {
         block_id,
         max_key: hilbert_max,
     };
-    state.live_tail.seal(hilbert_min, block_entry, &sealed);
+    state.live_tail.seal(hilbert_min, block_entry, &sealed, &spaces);
 
     state.snapshots.update(space, |snap| {
         snap.blocks.insert(hilbert_min, block_entry);

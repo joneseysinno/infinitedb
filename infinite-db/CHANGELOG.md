@@ -16,6 +16,10 @@
 
 ### Fixed
 
+- Hot-segment replay now honors the `committed_len` durability boundary; failed group commits roll back uncommitted frames instead of resurrecting on reopen.
+- Hilbert shard pruning in live-tail queries uses each space's configured `bits_per_dim` instead of a fixed 8-bit fallback.
+- Address identity grouping uses cached Hilbert keys (with space-aware recomputation when unset) instead of cloning coordinate vectors on every query.
+- `InfiniteDb::failed_revisions()` is non-destructive; use `take_failed_revisions()` to explicitly drain the failure log.
 - `RevisionWatermark` allocation+registration race: counter and outstanding set now update under one lock, so `stable_revision()` never observes an allocated-but-unregistered revision (fixes non-repeatable `ReadTxn` pins).
 
 ### Changed

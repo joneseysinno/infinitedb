@@ -21,9 +21,18 @@ fn space(id: u64, dims: usize) -> SpaceConfig {
 }
 
 fn reset_sync_fail_inject() {
-    use infinite_db::infinitedb_storage::hot_segment::TEST_FAIL_SYNC_GROUP;
+    use infinite_db::infinitedb_storage::hot_segment::{
+        TEST_FAIL_SYNC_ARMED, TEST_FAIL_SYNC_GROUP,
+    };
     use std::sync::atomic::Ordering;
     TEST_FAIL_SYNC_GROUP.store(false, Ordering::SeqCst);
+    TEST_FAIL_SYNC_ARMED.store(false, Ordering::SeqCst);
+}
+
+fn arm_sync_fail_inject() {
+    use infinite_db::infinitedb_storage::hot_segment::TEST_FAIL_SYNC_ARMED;
+    use std::sync::atomic::Ordering;
+    TEST_FAIL_SYNC_ARMED.store(true, Ordering::SeqCst);
 }
 
 #[test]
@@ -229,8 +238,9 @@ fn stable_advances_past_failed_group_commit() {
     use infinite_db::infinitedb_storage::hot_segment::TEST_FAIL_SYNC_GROUP;
     use std::sync::atomic::Ordering;
 
-    let _inject_guard = SYNC_INJECT_LOCK.lock().unwrap();
+    let _inject_guard = SYNC_INJECT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     reset_sync_fail_inject();
+    arm_sync_fail_inject();
     let dir = TempDir::new().unwrap();
     let db = InfiniteDb::open(dir.path()).unwrap();
     let space_id = SpaceId(1);
@@ -250,6 +260,8 @@ fn stable_advances_past_failed_group_commit() {
 
     let failed = db.failed_revisions();
     assert!(!failed.is_empty(), "failed revision should be recorded");
+    let failed_again = db.failed_revisions();
+    assert_eq!(failed, failed_again, "observation must not drain evidence");
 
     reset_sync_fail_inject();
     db.insert(space_id, DimensionVector::new(vec![2, 2]), vec![2])
@@ -257,6 +269,65 @@ fn stable_advances_past_failed_group_commit() {
     db.sync().unwrap();
     let results = db.query(space_id, None).unwrap();
     assert!(results.iter().any(|r| r.data == vec![2]));
+}
+
+#[test]
+fn failed_group_not_resurrected_on_reopen() {
+    use infinite_db::infinitedb_storage::hot_segment::TEST_FAIL_SYNC_GROUP;
+    use std::sync::atomic::Ordering;
+
+    let _inject_guard = SYNC_INJECT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    reset_sync_fail_inject();
+    arm_sync_fail_inject();
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().to_path_buf();
+    let space_id = SpaceId(1);
+    let point = DimensionVector::new(vec![9, 9]);
+
+    {
+        let db = InfiniteDb::open(&path).unwrap();
+        db.register_space(space(1, 2)).unwrap();
+        TEST_FAIL_SYNC_GROUP.store(true, Ordering::SeqCst);
+        db.insert(space_id, point.clone(), vec![99]).unwrap();
+        db.sync().unwrap_err();
+        assert!(
+            !db
+                .query(space_id, None)
+                .unwrap()
+                .iter()
+                .any(|r| r.data == vec![99]),
+            "failed write must not appear in same session"
+        );
+    }
+
+    reset_sync_fail_inject();
+    let db = InfiniteDb::open(&path).unwrap();
+    assert!(
+        !db
+            .query(space_id, None)
+            .unwrap()
+            .iter()
+            .any(|r| r.data == vec![99]),
+        "failed write must not resurrect on reopen"
+    );
+}
+
+#[test]
+fn query_bbox_respects_space_hilbert_precision_in_shard_prune() {
+    let dir = TempDir::new().unwrap();
+    let db = InfiniteDb::open(dir.path()).unwrap();
+    let space_id = SpaceId(1);
+    db.register_space(space(1, 2).with_bits_per_dim(4))
+        .unwrap();
+    let point = DimensionVector::new(vec![3, 5]);
+    db.insert(space_id, point.clone(), vec![7]).unwrap();
+    db.sync().unwrap();
+
+    let min = DimensionVector::new(vec![3, 5]);
+    let max = DimensionVector::new(vec![3, 5]);
+    let results = db.query_bbox(space_id, min, max, None).unwrap();
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].data, vec![7]);
 }
 
 #[test]

@@ -770,8 +770,13 @@ impl InfiniteDb {
         result
     }
 
-    /// Revisions abandoned due to I/O failures since the last call (drained).
+    /// Revisions abandoned due to I/O failures (non-destructive observation).
     pub fn failed_revisions(&self) -> Vec<FailedRevision> {
+        self.watermark.failed_revisions()
+    }
+
+    /// Drain the failure log after explicit acknowledgment.
+    pub fn take_failed_revisions(&self) -> Vec<FailedRevision> {
         self.watermark.take_failed()
     }
 

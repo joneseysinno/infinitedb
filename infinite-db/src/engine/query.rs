@@ -6,7 +6,7 @@ use crate::infinitedb_core::{
     address::{DimensionVector, RevisionId, SpaceId},
     block::Record,
     hilbert_key::{CachedHilbertKey, HilbertKey},
-    record_identity::AddressKey,
+    record_identity::{AddressKey, RecordIdentityKey},
     snapshot::BlockIndexEntry,
     space::SpaceRegistry,
 };
@@ -37,14 +37,6 @@ pub fn record_hilbert_key(spaces: &SpaceRegistry, record: &Record) -> HilbertKey
     }
 }
 
-fn record_hilbert_key_uncached(record: &Record) -> HilbertKey {
-    if let Some(k) = record.hilbert_key.get() {
-        k
-    } else {
-        HilbertKey(hilbert_key_standard(&record.address.point))
-    }
-}
-
 pub fn space_key(spaces: &SpaceRegistry, space: SpaceId, point: &DimensionVector) -> u128 {
     match spaces.get(space) {
         Some(config) => hilbert_key_for(point, KeyConfig {
@@ -52,6 +44,16 @@ pub fn space_key(spaces: &SpaceRegistry, space: SpaceId, point: &DimensionVector
         }),
         None => hilbert_key_standard(point),
     }
+}
+
+/// Address-only identity for latest-wins grouping.
+pub fn address_key(spaces: &SpaceRegistry, record: &Record) -> AddressKey {
+    AddressKey::from_hilbert(record, record_hilbert_key(spaces, record))
+}
+
+/// Full record identity for seal deduplication.
+pub fn record_identity_key(spaces: &SpaceRegistry, record: &Record) -> RecordIdentityKey {
+    RecordIdentityKey::from_hilbert(record, record_hilbert_key(spaces, record))
 }
 
 /// Ensure `record` carries a cached Hilbert key, computing from coordinates when unset.
@@ -73,6 +75,7 @@ pub fn prepare_records_for_seal(spaces: &SpaceRegistry, records: &mut [Record]) 
 }
 
 fn live_tail_for_space(
+    spaces: &SpaceRegistry,
     space: SpaceId,
     live_tail: Option<&LiveTailView>,
     space_live_tails: Option<&SpaceLiveTails>,
@@ -86,7 +89,7 @@ fn live_tail_for_space(
             for view in views {
                 if let Some(shard) = shard_filter {
                     let has_records = view.tail_iter().any(|r| {
-                        shard.contains_key(record_hilbert_key_uncached(r))
+                        shard.contains_key(record_hilbert_key(spaces, r))
                     });
                     let has_blocks = view.blocks.iter().any(|(min_key, _)| {
                         shard.contains_key(*min_key)
@@ -142,6 +145,7 @@ fn block_entries_from_snapshot(
 }
 
 fn block_entries_for_space(
+    spaces: &SpaceRegistry,
     space: SpaceId,
     snapshots: &SnapshotStore,
     key_filter: KeyFilter<'_>,
@@ -165,7 +169,7 @@ fn block_entries_for_space(
                     let shard_match = view.blocks.iter().any(|(min_key, _)| {
                         shard.contains_key(*min_key)
                     }) || view.tail_iter().any(|r| {
-                        shard.contains_key(record_hilbert_key_uncached(r))
+                        shard.contains_key(record_hilbert_key(spaces, r))
                     });
                     if !shard_match {
                         continue;
@@ -232,6 +236,7 @@ fn record_matches_filter(
 /// live record; that record is the one returned. When `include_tombstones` is true,
 /// all candidate records are returned unchanged (full revision history).
 fn resolve_visibility(
+    spaces: &SpaceRegistry,
     candidates: Vec<Record>,
     rev_ceiling: RevisionId,
     include_tombstones: bool,
@@ -245,7 +250,7 @@ fn resolve_visibility(
         if record.revision > rev_ceiling {
             continue;
         }
-        let key = AddressKey::from_record(&record);
+        let key = address_key(spaces, &record);
         let replace = match latest.get(&key) {
             None => true,
             Some(existing) => record.revision > existing.revision,
@@ -297,6 +302,7 @@ pub fn query_inner(
         }
     } else {
         live_tail_for_space(
+            spaces,
             space,
             live_tail,
             space_live_tails,
@@ -328,6 +334,7 @@ pub fn query_inner(
             entries
         } else {
             block_entries_for_space(
+                spaces,
                 space,
                 snapshots,
                 key_filter,
@@ -339,6 +346,7 @@ pub fn query_inner(
         }
     } else {
         block_entries_for_space(
+            spaces,
             space,
             snapshots,
             key_filter,
@@ -371,7 +379,12 @@ pub fn query_inner(
         candidates.push(record);
     }
 
-    Ok(resolve_visibility(candidates, rev_ceiling, include_tombstones))
+    Ok(resolve_visibility(
+        spaces,
+        candidates,
+        rev_ceiling,
+        include_tombstones,
+    ))
 }
 
 pub fn query_bbox(
@@ -417,6 +430,7 @@ pub fn query_bbox(
         }
     } else {
         live_tail_for_space(
+            spaces,
             space,
             live_tail,
             space_live_tails,
@@ -440,6 +454,7 @@ pub fn query_bbox(
             entries
         } else {
             block_entries_for_space(
+                spaces,
                 space,
                 snapshots,
                 key_filter,
@@ -457,6 +472,7 @@ pub fn query_bbox(
         }
     } else {
         block_entries_for_space(
+            spaces,
             space,
             snapshots,
             key_filter,
@@ -501,7 +517,7 @@ pub fn query_bbox(
         candidates.push(record);
     }
 
-    let mut results = resolve_visibility(candidates, rev_ceiling, false);
+    let mut results = resolve_visibility(spaces, candidates, rev_ceiling, false);
     results.retain(|r| r.address.point.within(&min, &max));
     Ok(results)
 }

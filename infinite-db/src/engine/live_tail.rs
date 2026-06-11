@@ -9,6 +9,7 @@ use crate::infinitedb_core::{
     hilbert_key::HilbertKey,
     record_identity::RecordIdentityKey,
     snapshot::BlockIndexEntry,
+    space::SpaceRegistry,
 };
 
 use super::shard_view::{ShardView, ShardViewHandle, TailChunk};
@@ -59,8 +60,9 @@ impl LiveTailView {
         block_min_key: HilbertKey,
         entry: BlockIndexEntry,
         sealed: &HashSet<RecordIdentityKey>,
+        spaces: &SpaceRegistry,
     ) {
-        self.view.seal(block_min_key, entry, sealed);
+        self.view.seal(block_min_key, entry, sealed, spaces);
     }
 
     /// Initialize sealed blocks from recovery.

@@ -1,6 +1,6 @@
 [package]
 name = "infinite-db"
-version = "0.3.2"
+version = "0.3.3"
 authors = ["Jonesey's Innovation"]
 edition = "2024"
 rust-version = "1.85"

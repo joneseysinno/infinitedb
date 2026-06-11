@@ -111,11 +111,13 @@ pub fn commit_group_to_hot_segment(
 
     let revisions: Vec<crate::infinitedb_core::address::RevisionId> =
         group.jobs.iter().map(|j| j.revision).collect();
+    let durable_len = hot.committed_bytes();
     for entry in group.jobs.iter().map(WriteJob::entry) {
         let added = hot.append_frame(entry)?;
         hot.track_appended_bytes(added);
     }
     if let Err(e) = hot.sync_group() {
+        let _ = hot.truncate_to(durable_len);
         let msg = e.to_string();
         for rev in &revisions {
             watermark.retire_failed(*rev, &msg);

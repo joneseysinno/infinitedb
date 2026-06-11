@@ -4,7 +4,7 @@ use std::hash::Hash;
 
 use super::address::{RevisionId, SpaceId};
 use super::block::Record;
-use super::hilbert_key::{CachedHilbertKey, HilbertKey};
+use super::hilbert_key::HilbertKey;
 
 /// Address identity within a space (Hilbert key when cached, else coordinates).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -29,37 +29,49 @@ pub struct AddressKey {
 }
 
 impl AddressKey {
-    pub fn from_record(record: &Record) -> Self {
+    pub fn from_hilbert(record: &Record, hilbert: HilbertKey) -> Self {
         Self {
             space: record.address.space,
-            address: address_identity_from_record(record),
+            address: AddressIdentity::Hilbert(hilbert),
         }
     }
 }
 
 impl RecordIdentityKey {
-    pub fn from_record(record: &Record) -> Self {
+    pub fn from_hilbert(record: &Record, hilbert: HilbertKey) -> Self {
         Self {
             space: record.address.space,
-            address: address_identity_from_record(record),
+            address: AddressIdentity::Hilbert(hilbert),
             revision: record.revision,
         }
     }
 }
 
-/// Canonical address identity: coordinates are authoritative; Hilbert is routing cache.
-fn address_identity_from_record(record: &Record) -> AddressIdentity {
-    address_identity_from_cached(
-        record.address.space,
-        record.hilbert_key,
-        &record.address.point.coords,
-    )
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::infinitedb_core::address::{Address, DimensionVector};
+    use crate::infinitedb_core::hilbert_key::CachedHilbertKey;
 
-fn address_identity_from_cached(
-    _space: SpaceId,
-    _key: CachedHilbertKey,
-    coords: &[u32],
-) -> AddressIdentity {
-    AddressIdentity::Coords(coords.to_vec())
+    #[test]
+    fn cached_and_unset_keys_group_equally() {
+        let space = SpaceId(1);
+        let point = DimensionVector::new(vec![3, 7]);
+        let hilbert = HilbertKey(42);
+        let cached = Record {
+            address: Address::new(space, point.clone()),
+            revision: RevisionId(1),
+            data: vec![1],
+            tombstone: false,
+            hilbert_key: CachedHilbertKey::set(hilbert),
+        };
+        let unset = Record {
+            hilbert_key: CachedHilbertKey::UNSET,
+            ..cached.clone()
+        };
+        assert_eq!(
+            AddressKey::from_hilbert(&cached, hilbert),
+            AddressKey::from_hilbert(&unset, hilbert),
+        );
+    }
 }

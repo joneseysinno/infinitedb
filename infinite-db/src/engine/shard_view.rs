@@ -4,6 +4,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
+use super::query::record_identity_key;
 use arc_swap::ArcSwap;
 
 use crate::infinitedb_core::{
@@ -12,6 +13,7 @@ use crate::infinitedb_core::{
     hilbert_key::HilbertKey,
     record_identity::RecordIdentityKey,
     snapshot::BlockIndexEntry,
+    space::SpaceRegistry,
 };
 
 /// Immutable chunk of tail records published in one group commit.
@@ -115,13 +117,14 @@ impl ShardViewHandle {
         block_min_key: HilbertKey,
         entry: BlockIndexEntry,
         sealed: &HashSet<RecordIdentityKey>,
+        spaces: &SpaceRegistry,
     ) {
         let current = self.view.load();
         let mut blocks = current.blocks.as_ref().clone();
         blocks.insert(block_min_key, entry);
         let remainder: Vec<Record> = current
             .tail_iter()
-            .filter(|r| !sealed.contains(&RecordIdentityKey::from_record(r)))
+            .filter(|r| !sealed.contains(&record_identity_key(spaces, r)))
             .cloned()
             .collect();
         let chunks = if remainder.is_empty() {
