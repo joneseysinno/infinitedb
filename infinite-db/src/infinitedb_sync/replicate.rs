@@ -69,7 +69,7 @@ pub fn branch_sync_state(
     Ok(BranchSyncState {
         branch,
         merkle_root: snapshot_merkle(db, space, branch)?.root(),
-        revision: RevisionId(db.revision()),
+        revision: db.revision(),
     })
 }
 

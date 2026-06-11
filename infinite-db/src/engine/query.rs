@@ -1,7 +1,6 @@
 //! Concurrent query execution over sealed blocks + live tail.
 
 use std::collections::{BTreeMap, HashMap};
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::infinitedb_core::{
     address::{DimensionVector, RevisionId, SpaceId},
@@ -23,6 +22,7 @@ use crate::infinitedb_storage::nvme::BlockStore;
 use crate::infinitedb_core::branch::BranchId;
 
 use super::branch_overlay::BranchOverlayStore;
+use super::watermark::RevisionWatermark;
 use super::hilbert_live_tails::HilbertLiveTails;
 use super::live_tail::LiveTailView;
 use super::snapshot_store::SnapshotStore;
@@ -272,7 +272,7 @@ pub fn query_inner(
     live_tail: Option<&LiveTailView>,
     space_live_tails: Option<&SpaceLiveTails>,
     spaces: &SpaceRegistry,
-    revision: &AtomicU64,
+    watermark: &RevisionWatermark,
     space: SpaceId,
     key_range: Option<(u128, u128)>,
     as_of: Option<RevisionId>,
@@ -281,7 +281,7 @@ pub fn query_inner(
     branch_overlays: Option<&BranchOverlayStore>,
     branch_id: Option<BranchId>,
 ) -> std::io::Result<Vec<Record>> {
-    let rev_ceiling = as_of.unwrap_or_else(|| RevisionId(revision.load(Ordering::Acquire)));
+    let rev_ceiling = as_of.unwrap_or_else(|| watermark.allocated());
 
     let key_filter = match key_range {
         None => KeyFilter::All,
@@ -380,7 +380,7 @@ pub fn query_bbox(
     live_tail: Option<&LiveTailView>,
     space_live_tails: Option<&SpaceLiveTails>,
     spaces: &SpaceRegistry,
-    revision: &AtomicU64,
+    watermark: &RevisionWatermark,
     space: SpaceId,
     min: DimensionVector,
     max: DimensionVector,
@@ -396,7 +396,7 @@ pub fn query_bbox(
         .unwrap_or(8);
     let shard_bits = Some(ShardRef::shard_bits_for_space(spaces, space));
     let intervals = decompose_bbox(&min, &max, bits);
-    let rev_ceiling = as_of.unwrap_or_else(|| RevisionId(revision.load(Ordering::Acquire)));
+    let rev_ceiling = as_of.unwrap_or_else(|| watermark.allocated());
 
     let shard_filter = shard_bits.map(|sb| {
         let mut shard_ids = std::collections::BTreeSet::new();

@@ -36,7 +36,7 @@ impl<'a> ReadTxn<'a> {
     /// Queries through this view are repeatable: the visible record set at the
     /// pinned revision cannot change while the transaction is held.
     pub fn new(db: &'a InfiniteDb) -> Self {
-        let as_of = Some(RevisionId(db.stable_revision()));
+        let as_of = Some(db.stable_revision());
         Self {
             db,
             branch: BranchId::MAIN,
@@ -104,7 +104,7 @@ impl<'a> ReadTxn<'a> {
             ctx.live_tail,
             ctx.space_tails,
             &spaces,
-            &self.db.revision,
+            &self.db.watermark,
             q.space,
             key_range,
             as_of,

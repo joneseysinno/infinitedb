@@ -85,7 +85,9 @@ fn enqueue_batch_cross_space() {
     use infinite_db::WriteJob;
     use infinite_db::infinitedb_storage::wal::WalEntry;
 
-    let (rev1, rev2) = db.allocate_revisions(2);
+    let range = db.allocate_revisions(2);
+    let rev1 = range.nth(0);
+    let rev2 = range.nth(1);
 
     let jobs = vec![
         WriteJob {

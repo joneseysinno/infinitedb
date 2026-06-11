@@ -19,7 +19,7 @@ use crate::engine::merge::merge_branches;
 use crate::engine::query::{query_bbox, query_inner, snapshots_map_for_persist, space_key};
 use crate::engine::snapshot_store::SnapshotStore;
 use crate::engine::space_live_tails::SpaceLiveTails;
-use crate::engine::watermark::{FailedRevision, RevisionWatermark};
+use crate::engine::watermark::{FailedRevision, RevisionRange, RevisionWatermark};
 use crate::engine::write_queue::{WriteJob, WriteQueueSender};
 use crate::infinitedb_core::{
     address::{Address, DimensionVector, RevisionId, SpaceId},
@@ -90,8 +90,7 @@ pub struct InfiniteDb {
     pub(crate) spaces: Arc<RwLock<SpaceRegistry>>,
     branches: Arc<RwLock<BranchRegistry>>,
     pub(crate) snapshots: Arc<SnapshotStore>,
-    pub(crate) revision: Arc<AtomicU64>,
-    watermark: Arc<RevisionWatermark>,
+    pub(crate) watermark: Arc<RevisionWatermark>,
     compaction_overrides: CompactionPolicyOverrides,
     next_block_id: Arc<AtomicU64>,
     next_snapshot_id: Arc<AtomicU64>,
@@ -164,7 +163,6 @@ impl InfiniteDb {
         let branches = Arc::new(RwLock::new(branches));
         let snapshots = Arc::new(SnapshotStore::new(snapshots));
         let watermark = Arc::new(RevisionWatermark::new(next_rev));
-        let revision = watermark.allocation_counter();
         let compaction_overrides: CompactionPolicyOverrides =
             Arc::new(Mutex::new(std::collections::HashMap::new()));
         let next_block_id = Arc::new(AtomicU64::new(next_block));
@@ -240,7 +238,6 @@ impl InfiniteDb {
             spaces,
             branches,
             snapshots,
-            revision,
             watermark,
             compaction_overrides,
             next_block_id,
@@ -374,7 +371,7 @@ impl InfiniteDb {
             .ok_or_else(|| format!("parent branch {:?} not found", from))?
             .clone();
         let id = BranchId(self.next_branch_id.fetch_add(1, Ordering::Relaxed));
-        let forked_at = RevisionId(self.revision.load(Ordering::Relaxed));
+        let forked_at = self.watermark.allocated();
         let branch = Branch {
             id,
             name: name.to_string(),
@@ -414,7 +411,7 @@ impl InfiniteDb {
             ctx.hilbert_tails,
             &self.branch_overlays,
             &self.spaces.read(),
-            &self.revision,
+            &self.watermark,
             &self.branches.read(),
             target,
             source,
@@ -450,7 +447,7 @@ impl InfiniteDb {
             ctx.live_tail,
             ctx.space_tails,
             &self.spaces.read(),
-            &self.revision,
+            &self.watermark,
             space,
             None,
             as_of,
@@ -562,7 +559,7 @@ impl InfiniteDb {
             ctx.live_tail,
             ctx.space_tails,
             &self.spaces.read(),
-            &self.revision,
+            &self.watermark,
             space,
             min,
             max,
@@ -596,7 +593,7 @@ impl InfiniteDb {
     /// Allocate a contiguous revision range for custom [`WriteJob`] batches.
     ///
     /// Revisions are registered as outstanding until the write path retires them.
-    pub fn allocate_revisions(&self, count: u64) -> (RevisionId, RevisionId) {
+    pub fn allocate_revisions(&self, count: u64) -> RevisionRange {
         self.watermark.allocate_n(count)
     }
 
@@ -604,13 +601,13 @@ impl InfiniteDb {
     ///
     /// A returned revision may not yet be visible; use [`Self::stable_revision`] or
     /// [`Self::sync`] before reading.
-    pub fn revision(&self) -> u64 {
-        self.revision.load(Ordering::Relaxed)
+    pub fn revision(&self) -> RevisionId {
+        self.watermark.allocated()
     }
 
     /// Highest revision guaranteed applied and visible (repeatable-read ceiling).
-    pub fn stable_revision(&self) -> u64 {
-        self.watermark.stable_revision().0
+    pub fn stable_revision(&self) -> RevisionId {
+        self.watermark.stable_revision()
     }
 
     /// Begin a concurrent read transaction pinned at the current revision.
@@ -688,11 +685,11 @@ impl InfiniteDb {
         }
         const CHUNK: usize = 4096;
         let count = rows.len() as u64;
-        let (first, last) = self.watermark.allocate_n(count);
+        let range = self.watermark.allocate_n(count);
         let mut jobs = Vec::with_capacity(rows.len().min(CHUNK));
         let spaces = self.spaces.read();
         for (idx, (point, data)) in rows.into_iter().enumerate() {
-            let rev = RevisionId(first.0 + idx as u64);
+            let rev = range.nth(idx as u64);
             let address = Address::new(space, point.clone());
             let hilbert_key = HilbertKey(space_key(&spaces, space, &point));
             let entry = WalEntry::Write {
@@ -715,7 +712,7 @@ impl InfiniteDb {
         if !jobs.is_empty() {
             self.enqueue_batch(jobs)?;
         }
-        Ok((first, last))
+        Ok((range.first(), range.last()))
     }
 
     /// Manually compact small blocks in `space` using the space's configured policy.
@@ -792,11 +789,11 @@ impl InfiniteDb {
             return Ok(());
         }
         let count = records.len() as u64;
-        let (first, _) = self.watermark.allocate_n(count);
+        let range = self.watermark.allocate_n(count);
         let spaces = self.spaces.read();
         let mut jobs = Vec::with_capacity(records.len());
         for (idx, record) in records.into_iter().enumerate() {
-            let revision = RevisionId(first.0 + idx as u64);
+            let revision = range.nth(idx as u64);
             let hilbert_key = if let Some(k) = record.hilbert_key.get() {
                 k
             } else {
@@ -840,7 +837,7 @@ impl InfiniteDb {
         self.store.write_meta("snapshots.bin", &snapshots_bytes)?;
 
         let counters = PersistedCounters::new(
-            self.watermark.revision(),
+            self.watermark.allocated().0,
             self.next_block_id.load(Ordering::Relaxed),
             self.next_snapshot_id.load(Ordering::Relaxed),
             self.next_branch_id.load(Ordering::Relaxed),

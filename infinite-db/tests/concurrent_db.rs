@@ -87,7 +87,7 @@ fn concurrent_reads_while_writing() {
             thread::spawn(move || {
                 for _ in 0..20 {
                     let results = db
-                        .query(space_id, Some(infinite_db::infinitedb_core::address::RevisionId(read_rev)))
+                        .query(space_id, Some(read_rev))
                         .unwrap();
                     assert!(results.is_empty());
                 }

@@ -260,28 +260,37 @@ fn stable_advances_past_failed_group_commit() {
 }
 
 #[test]
-fn stable_revision_never_exceeds_unretired_allocation() {
+fn allocation_registration_not_visible_to_stable() {
     let dir = TempDir::new().unwrap();
     let db = Arc::new(InfiniteDb::open(dir.path()).unwrap());
-    let space_id = SpaceId(1);
     db.register_space(space(1, 2)).unwrap();
+
+    let range = db.allocate_revisions(1);
+    let rev = range.nth(0);
+    assert!(
+        db.stable_revision() < rev,
+        "stable must not reach an allocated-but-unretired revision"
+    );
 
     let db2 = Arc::clone(&db);
     let writer = thread::spawn(move || {
-        for i in 0..200u32 {
-            db2.insert(space_id, DimensionVector::new(vec![i, 0]), vec![i as u8])
-                .unwrap();
+        for _ in 0..300 {
+            let range = db2.allocate_revisions(1);
+            let rev = range.nth(0);
+            assert!(
+                db2.stable_revision() < rev,
+                "stable must lag behind unretired allocation {rev:?}"
+            );
             thread::yield_now();
         }
-        db2.sync().unwrap();
     });
 
-    for _ in 0..5000 {
+    for _ in 0..10_000 {
         let stable = db.stable_revision();
         let allocated = db.revision();
         assert!(
             stable <= allocated,
-            "stable {stable} must not exceed allocated {allocated}"
+            "stable {stable:?} must not exceed allocated {allocated:?}"
         );
         thread::yield_now();
     }

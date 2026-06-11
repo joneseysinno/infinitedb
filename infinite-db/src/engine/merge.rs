@@ -17,7 +17,7 @@ use super::snapshot_store::SnapshotStore;
 use super::space_live_tails::SpaceLiveTails;
 use crate::infinitedb_core::space::SpaceRegistry;
 use crate::infinitedb_storage::nvme::BlockStore;
-use std::sync::atomic::AtomicU64;
+use super::watermark::RevisionWatermark;
 type Resolver<'a> = Option<&'a (dyn Fn(MergeConflict) -> Record + Send + Sync)>;
 
 fn latest_per_address(records: Vec<Record>) -> HashMap<Address, Record> {
@@ -74,7 +74,7 @@ pub fn merge_branches(
     hilbert_tails: Option<&HilbertLiveTails>,
     branch_overlays: &BranchOverlayStore,
     spaces: &SpaceRegistry,
-    revision: &AtomicU64,
+    watermark: &RevisionWatermark,
     branches: &BranchRegistry,
     target: BranchId,
     source: BranchId,
@@ -102,7 +102,7 @@ pub fn merge_branches(
             live_tail,
             space_tails,
             spaces,
-            revision,
+            watermark,
             *space,
             None,
             Some(forked_at),
@@ -123,7 +123,7 @@ pub fn merge_branches(
             live_tail,
             space_tails,
             spaces,
-            revision,
+            watermark,
             *space,
             None,
             None,

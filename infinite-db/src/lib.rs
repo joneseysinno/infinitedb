@@ -59,7 +59,7 @@ pub mod infinitedb_sync;
 // ---------------------------------------------------------------------------
 
 #[cfg(feature = "embedded")]
-pub use concurrent::{InfiniteDb, IoStats, OpenOptions, ReadTxn};
+pub use concurrent::{InfiniteDb, IoStats, OpenOptions, ReadTxn, RevisionRange};
 
 #[cfg(feature = "embedded")]
 pub use infinitedb_storage::format::{

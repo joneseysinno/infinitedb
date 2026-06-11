@@ -14,8 +14,14 @@
 - Post-compaction block-file GC (`safe_to_delete`) with branch-base snapshot pinning.
 - `branch_bases.bin` persists fork-base snapshots for branch queries across reopen.
 
+### Fixed
+
+- `RevisionWatermark` allocation+registration race: counter and outstanding set now update under one lock, so `stable_revision()` never observes an allocated-but-unregistered revision (fixes non-repeatable `ReadTxn` pins).
+
 ### Changed
 
+- `InfiniteDb::revision()` and `stable_revision()` return `RevisionId` (was `u64`).
+- `InfiniteDb::allocate_revisions(count)` returns `RevisionRange` (was `(RevisionId, RevisionId)`).
 - Phase 3 type hygiene: engine APIs use `SpaceId`/`BranchId`/`RevisionId` newtypes (disk boundaries still use raw `u64` where needed); `HilbertKey`/`CachedHilbertKey` replace raw `u128` hilbert fields; `Checksum` wraps block digests; `ShardRef` replaces `(shard_id, shard_bits)` tuples; `AddressKey`/`RecordIdentityKey` drive visibility and seal deduplication; `RevisionWatermark` tracks `BTreeSet<RevisionId>` with `predecessor()`-based stable ceiling.
 - Auto-compaction defaults to `retain_history: true`; use `CompactionPolicy::LatestOnly` to opt into history-dropping compaction.
 - `RevisionWatermark` owns allocation; `enqueue_batch` requires watermark-allocated revisions.

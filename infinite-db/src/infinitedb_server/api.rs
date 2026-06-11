@@ -311,7 +311,7 @@ pub fn handle_request(db: &InfiniteDb, session: &Session, request: Request) -> R
                     )));
                 };
                 let record =
-                    resolution_record(&stored.conflict, data, RevisionId(db.revision() + 1));
+                    resolution_record(&stored.conflict, data, db.revision().next());
                 if let Err(e) = db.insert_on_branch(
                     stored.target,
                     record.address.space,

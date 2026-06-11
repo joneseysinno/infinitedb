@@ -117,10 +117,10 @@ impl Session {
     pub fn open_at_revision(
         branch: BranchId,
         pinned_snapshot: SnapshotId,
-        revision: u64,
+        revision: RevisionId,
         grants: Vec<SpaceGrant>,
     ) -> Self {
-        Self::new(branch, pinned_snapshot, RevisionId(revision), grants)
+        Self::new(branch, pinned_snapshot, revision, grants)
     }
 }
 
