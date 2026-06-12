@@ -11,7 +11,14 @@ documentation = "https://docs.rs/infinite-db/0.3.0"
 keywords = ["database", "spatial", "hypergraph", "engineering", "peano"]
 categories = ["database-implementations", "science"]
 repository = "https://github.com/joneseysinno/infinitedb.git"
-exclude = ["target/**", "INFINITEDB_PLAN.md"]
+exclude = [
+    "target/**",
+    "target2/**",
+    "plans/**",
+    "proptest-regressions/**",
+    "INFINITEDB_PLAN.md",
+    "*.orig",
+]
 
 [package.metadata.docs.rs]
 all-features = true
