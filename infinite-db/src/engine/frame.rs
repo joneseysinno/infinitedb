@@ -3,15 +3,17 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::infinitedb_core::{
+    address::RevisionId,
     block::Record,
-    frame::{JudgmentOverlayLayer, OverlayPolicy, TestimonySource, VerdictFilter},
+    frame::{record_admitted_by_source, JudgmentOverlayLayer, OverlayPolicy, TestimonySource, VerdictFilter},
+    hlc::SessionId,
     hyperedge::{Hyperedge, HyperedgeId},
     judgment::{JudgmentRecord, JudgmentVerdict, SubjectIdentity, SubjectKind, SubjectPin},
     space::SpaceRegistry,
     staleness::{diagnose_assertion, ConsultedFrame, StalenessDiagnosis},
 };
 
-use super::query::resolve_visibility;
+use super::query::{resolve_visibility_with_pin, FrameTimePin};
 
 /// Record tagged with its admission source.
 #[derive(Debug, Clone)]
@@ -37,18 +39,40 @@ pub struct FrameResolvedHyperedge {
     pub suppressed: bool,
 }
 
-/// Apply latest-wins visibility independently per admission source.
-pub fn resolve_visibility_per_source(
+/// Apply latest-wins visibility for frame admission specs (Phase 5).
+///
+/// Filters candidates by session admission, merges cross-session buckets, and resolves
+/// supersession by HLC authorship order under the frame time pin.
+pub fn resolve_visibility_per_source<F>(
     spaces: &SpaceRegistry,
     by_source: &[(TestimonySource, Vec<Record>)],
-    as_of: crate::infinitedb_core::address::RevisionId,
-) -> Vec<SourcedRecord> {
+    pin: &FrameTimePin,
+    stable_for_session: F,
+) -> Vec<SourcedRecord>
+where
+    F: Fn(SessionId) -> RevisionId,
+{
     let mut out = Vec::new();
     for (source, candidates) in by_source {
-        let visible = resolve_visibility(spaces, candidates.clone(), as_of, false);
+        let filtered: Vec<Record> = candidates
+            .iter()
+            .filter(|r| record_admitted_by_source(r.revision.session(), source))
+            .cloned()
+            .collect();
+        let visible = resolve_visibility_with_pin(
+            spaces,
+            filtered,
+            pin,
+            false,
+            &stable_for_session,
+        );
         for record in visible {
             out.push(SourcedRecord {
-                source: *source,
+                source: TestimonySource {
+                    space: source.space,
+                    branch: source.branch,
+                    sessions: Some(vec![SessionId(record.revision.session())]),
+                },
                 record,
             });
         }
@@ -212,7 +236,7 @@ mod tests {
             ],
             weight_milli: None,
             metadata: BTreeMap::new(),
-            valid_from: RevisionId(1),
+            valid_from: RevisionId::legacy(1),
             valid_to: None,
             directionality: Directionality::Directed,
             authoring_frame: None,
@@ -229,6 +253,7 @@ mod tests {
             source: TestimonySource {
                 space: SpaceId(10),
                 branch: None,
+                sessions: None,
             },
             judgments: vec![],
             diagnosis: None,
@@ -257,7 +282,7 @@ mod tests {
             &by_subject,
             ConsultedFrame {
                 frame_id: FrameId(1),
-                as_of: RevisionId(1),
+                as_of: RevisionId::legacy(1),
             },
             false,
             false,

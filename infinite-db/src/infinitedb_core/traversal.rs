@@ -25,7 +25,7 @@ use serde::{Deserialize, Serialize};
 
 use super::{
     address::{RevisionId, SpaceId},
-    frame_query::FrameQueryOptions,
+    frame_query::{FrameQueryOptions, FrameVersionPin},
     hyperedge::{
         EndpointRef, Hyperedge, HyperedgeId, HyperedgeKind,
     },
@@ -107,6 +107,8 @@ pub struct FrameTraversalSpec {
     pub frame_id: FrameId,
     pub base: TraversalSpec,
     pub as_of: Option<RevisionId>,
+    /// Per-session stable ceilings; when set, overrides scalar `as_of` (Phase 5).
+    pub version_vector: Option<FrameVersionPin>,
     pub options: FrameQueryOptions,
 }
 

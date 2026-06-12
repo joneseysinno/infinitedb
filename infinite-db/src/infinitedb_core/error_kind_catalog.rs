@@ -25,7 +25,9 @@ impl ErrorKindCatalog {
         match kind {
             ErrorKind::ImportValidation
             | ErrorKind::ImportBudgetExceeded
-            | ErrorKind::MergeUnresolved => Ok(()),
+            | ErrorKind::MergeUnresolved
+            | ErrorKind::InterruptedSessionIntent
+            | ErrorKind::CheckpointCollision => Ok(()),
             ErrorKind::Custom(id) => {
                 if *id > 10_000 {
                     match self.policy {

@@ -88,3 +88,43 @@ pub fn decode_error_record_payload(data: &[u8]) -> io::Result<OperationErrorReco
 pub fn revision_range_from_engine(range: crate::engine::watermark::RevisionRange) -> OperationRevisionRange {
     OperationRevisionRange::new(range.first(), range.last())
 }
+
+pub fn operation_record_interrupted_intent(
+    source_space: SpaceId,
+    session: u32,
+    first: RevisionId,
+    last: RevisionId,
+    frame_count: usize,
+) -> OperationErrorRecord {
+    OperationErrorRecord {
+        kind: ErrorKind::InterruptedSessionIntent,
+        revision_range: OperationRevisionRange::new(first, last),
+        source_space,
+        entries: vec![ErrorRecordEntry {
+            index: 0,
+            item_id: session as u64,
+            class: ErrorKind::InterruptedSessionIntent,
+            message: format!(
+                "interrupted session intent: session {session} durable frames ({frame_count}) without checkpoint after revision {first:?}"
+            ),
+        }],
+    }
+}
+
+pub fn operation_record_checkpoint_collision(
+    source_space: SpaceId,
+    checkpoint: &crate::infinitedb_core::intent_checkpoint::IntentCheckpoint,
+    message: impl Into<String>,
+) -> OperationErrorRecord {
+    OperationErrorRecord {
+        kind: ErrorKind::CheckpointCollision,
+        revision_range: checkpoint.revision_range(),
+        source_space,
+        entries: vec![ErrorRecordEntry {
+            index: 0,
+            item_id: checkpoint.first_revision.session() as u64,
+            class: ErrorKind::CheckpointCollision,
+            message: message.into(),
+        }],
+    }
+}

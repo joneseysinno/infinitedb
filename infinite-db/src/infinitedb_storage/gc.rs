@@ -89,7 +89,7 @@ mod tests {
     fn make_record(rev: u64, tombstone: bool) -> Record {
         Record {
             address: Address::new(SpaceId(1), DimensionVector::new(vec![0, 0])),
-            revision: RevisionId(rev),
+            revision: RevisionId::legacy(rev),
             data: vec![],
             tombstone,
             hilbert_key: CachedHilbertKey::UNSET,
@@ -104,13 +104,13 @@ mod tests {
             make_record(3, false), // live record
         ];
         let policy = RetentionPolicy {
-            tombstone_horizon: RevisionId(5),
+            tombstone_horizon: RevisionId::legacy(5),
             version_horizon: RevisionId::ZERO,
         };
         let kept = apply_retention(records, &policy);
         // Only tombstone at rev 5 and the live record survive.
         assert_eq!(kept.len(), 2);
-        assert!(kept.iter().all(|r| !r.tombstone || r.revision.0 >= 5));
+        assert!(kept.iter().all(|r| !r.tombstone || r.revision.legacy_sequence() >= 5));
     }
 
     #[test]
@@ -122,11 +122,11 @@ mod tests {
         ];
         let policy = RetentionPolicy {
             tombstone_horizon: RevisionId::ZERO,
-            version_horizon: RevisionId(3),
+            version_horizon: RevisionId::legacy(3),
         };
         let kept = apply_retention(records, &policy);
         assert_eq!(kept.len(), 2);
-        assert!(kept.iter().all(|r| r.revision.0 >= 3));
+        assert!(kept.iter().all(|r| r.revision.legacy_sequence() >= 3));
     }
 
     #[test]

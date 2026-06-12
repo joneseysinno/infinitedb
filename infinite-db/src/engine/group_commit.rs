@@ -11,7 +11,7 @@ use crate::infinitedb_storage::hot_segment::HotSegment;
 use crate::infinitedb_storage::wal::WalEntry;
 
 use super::live_tail::LiveTailView;
-use super::watermark::RevisionWatermark;
+use super::session::SessionWatermarks;
 use super::write_queue::{IoCommand, WriteJob};
 
 /// Maximum frames coalesced into one group commit.
@@ -102,7 +102,7 @@ pub fn commit_group_to_hot_segment(
     hot: &mut HotSegment,
     group: WriteGroup,
     live_tail: &LiveTailView,
-    watermark: &RevisionWatermark,
+    watermark: &SessionWatermarks,
     group_commits: &AtomicU64,
 ) -> io::Result<()> {
     if group.is_empty() {

@@ -97,7 +97,10 @@ fn merge_fast_forward_non_conflicting() {
     db.sync().unwrap();
 
     let main = db.query(SpaceId(1), None).unwrap();
-    let latest = main.iter().max_by_key(|r| r.revision.0).unwrap();
+    let latest = main
+        .iter()
+        .max_by_key(|r| r.revision.legacy_sequence())
+        .unwrap();
     assert_eq!(latest.data, vec![42]);
 }
 
@@ -147,7 +150,10 @@ fn merge_prefer_higher_revision() {
     assert!(result.conflicts.is_empty());
     db.sync().unwrap();
     let main = db.query(SpaceId(1), None).unwrap();
-    let latest = main.iter().max_by_key(|r| r.revision.0).unwrap();
+    let latest = main
+        .iter()
+        .max_by_key(|r| r.revision.legacy_sequence())
+        .unwrap();
     assert_eq!(latest.data, vec![9]);
 }
 

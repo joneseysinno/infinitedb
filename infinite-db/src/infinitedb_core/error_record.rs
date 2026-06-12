@@ -42,6 +42,10 @@ pub enum ErrorKind {
     ImportValidation,
     ImportBudgetExceeded,
     MergeUnresolved,
+    /// Durable session intent interrupted before checkpoint (D-P5).
+    InterruptedSessionIntent,
+    /// Address overlap detected at an intent checkpoint boundary (Phase 4).
+    CheckpointCollision,
     Custom(u32),
 }
 
@@ -66,8 +70,8 @@ pub struct OperationErrorRecord {
 /// Storage point for an error record keyed by operation revision range start.
 pub fn error_storage_point(range_start: RevisionId) -> DimensionVector {
     DimensionVector::new(vec![
-        (range_start.0 >> 32) as u32,
-        (range_start.0 & 0xFFFF_FFFF) as u32,
+        (range_start.legacy_sequence() >> 32) as u32,
+        (range_start.legacy_sequence() & 0xFFFF_FFFF) as u32,
     ])
 }
 
@@ -76,7 +80,7 @@ pub fn revision_from_error_point(point: &DimensionVector) -> Option<RevisionId> 
     if point.coords.len() != 2 {
         return None;
     }
-    Some(RevisionId(
+    Some(RevisionId::legacy(
         ((point.coords[0] as u64) << 32) | (point.coords[1] as u64),
     ))
 }

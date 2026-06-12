@@ -171,6 +171,71 @@ fn bulk_import_over_budget_aborts() {
 }
 
 #[test]
+fn delete_not_visible_after_delta_merge_before_derivation() {
+    let (db, _dir, edge_space) = open_db();
+    let entity = SpaceId(1);
+    let hub = node(entity, 99);
+    let insert_rev = db
+        .insert_hyperedge(edge_space, directed_edge(1, hub.clone(), node(entity, 100)))
+        .unwrap();
+    db.sync().unwrap();
+    let delete_rev = db.delete_hyperedge(edge_space, HyperedgeId(1)).unwrap();
+    assert!(
+        db.endpoint_index_watermark() < delete_rev,
+        "watermark must not advance past un-derived delete"
+    );
+    assert!(
+        db.derivation_stats().outstanding_derivations > 0,
+        "delete event must remain outstanding until derivation retires it"
+    );
+    let index_only = db
+        .query_hyperedges_for_endpoint_directed_with_options(
+            edge_space,
+            &hub,
+            None,
+            DirectionFilter::Any,
+            QueryOptions::index_only(),
+        )
+        .unwrap();
+    assert_eq!(index_only.len(), 1, "stale index may still list the edge");
+    let _ = insert_rev;
+    db.sync().unwrap();
+    assert_eq!(db.derivation_stats().outstanding_derivations, 0);
+    assert_eq!(db.endpoint_index_watermark(), delete_rev);
+    assert!(
+        db.query_hyperedges_for_endpoint_directed(edge_space, &hub, None, DirectionFilter::Any)
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn delete_recovery_on_reopen_rederives_tombstone() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path();
+    let edge_space = SpaceId(10);
+    let entity = SpaceId(1);
+    let hub = node(entity, 88);
+    {
+        let db = OpenOptions::default().open(path).unwrap();
+        db.register_space(SpaceConfig::new(edge_space, "edges", 2))
+            .unwrap();
+        db.insert_hyperedge(edge_space, directed_edge(2, hub.clone(), node(entity, 89)))
+            .unwrap();
+        db.sync().unwrap();
+        db.delete_hyperedge(edge_space, HyperedgeId(2)).unwrap();
+        db.sync().unwrap();
+    }
+    {
+        let db = OpenOptions::default().open(path).unwrap();
+        let edges = db
+            .query_hyperedges_for_endpoint_directed(edge_space, &hub, None, DirectionFilter::Any)
+            .unwrap();
+        assert!(edges.is_empty());
+    }
+}
+
+#[test]
 fn crash_recovery_reopen_rederives_index() {
     let dir = TempDir::new().unwrap();
     let path = dir.path();

@@ -386,7 +386,7 @@ fn inactive_edge_excluded() {
     let a = node(1);
     let b = node(2);
     let mut edge = directed_edge(1, "flow", vec![a.clone()], vec![b.clone()]);
-    edge.valid_to = Some(RevisionId(0));
+    edge.valid_to = Some(RevisionId::legacy(0));
     db.insert_hyperedge(edge_space, edge).unwrap();
     db.sync().unwrap();
 

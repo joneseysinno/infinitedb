@@ -106,10 +106,10 @@ fn latest_wins() {
     assert_eq!(at_rev1.len(), 1);
     assert_eq!(at_rev1[0].data, vec![10]);
 
-    let between = db.query(space_id, Some(RevisionId(rev2.0))).unwrap();
+    let between = db.query(space_id, Some(rev2)).unwrap();
     assert_eq!(between.len(), 1);
     assert_eq!(between[0].data, vec![20]);
-    assert!(rev1.0 < rev2.0 && rev2.0 < rev3.0);
+    assert!(rev1 < rev2 && rev2 < rev3);
 }
 
 #[test]
@@ -163,7 +163,7 @@ fn seal_window_no_duplicate_records_under_load() {
             if let Ok(results) = db_reader.query(space_id, None) {
                 let mut pairs = HashSet::new();
                 for r in &results {
-                    let key = (r.address.point.coords.clone(), r.revision.0);
+                    let key = (r.address.point.coords.clone(), r.revision.legacy_sequence());
                     assert!(pairs.insert(key), "duplicate (address, revision) in query");
                 }
                 iter_read.fetch_add(1, Ordering::Relaxed);
@@ -497,7 +497,7 @@ fn insert_many_round_trip() {
         .map(|i| (DimensionVector::new(vec![i, i % 7]), vec![i as u8]))
         .collect();
     let (first, last) = db.insert_many(space_id, rows).unwrap();
-    assert!(first.0 <= last.0);
+    assert!(first <= last);
     db.sync().unwrap();
 
     let results = db.query(space_id, None).unwrap();
@@ -553,7 +553,7 @@ fn as_of_survives_auto_compaction_with_keep_all() {
     .unwrap();
 
     // One block per distinct coordinate (block index keys on hilbert min_key).
-    let mut rev1 = RevisionId(0);
+    let mut rev1 = RevisionId::legacy(0);
     for i in 0..10u64 {
         let point = DimensionVector::new(vec![i as u32, 0]);
         let rev = db.insert(space_id, point, vec![i as u8]).unwrap();

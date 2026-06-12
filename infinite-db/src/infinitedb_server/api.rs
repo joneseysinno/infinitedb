@@ -523,7 +523,7 @@ mod tests {
         Session::new(
             BranchId(1),
             SnapshotId(1),
-            RevisionId(0),
+            RevisionId::legacy(0),
             vec![SpaceGrant { space: SpaceId(1), level: AccessLevel::ReadWrite }],
         )
     }
@@ -532,7 +532,7 @@ mod tests {
         Session::new(
             BranchId(1),
             SnapshotId(1),
-            RevisionId(0),
+            RevisionId::legacy(0),
             vec![SpaceGrant { space: SpaceId(1), level: AccessLevel::ReadOnly }],
         )
     }
@@ -540,7 +540,7 @@ mod tests {
     #[test]
     fn ping_always_responds() {
         let s = rw_session();
-        let r = dispatch(Request::Ping, &s, |_| Ok(vec![]), |_, _, _, _| Ok(RevisionId(1)), |_, _| Ok(BranchId(2)), |_| Ok(SnapshotId(1)));
+        let r = dispatch(Request::Ping, &s, |_| Ok(vec![]), |_, _, _, _| Ok(RevisionId::legacy(1)), |_, _| Ok(BranchId(2)), |_| Ok(SnapshotId(1)));
         assert!(matches!(r, Response::Pong));
     }
 
@@ -563,7 +563,7 @@ mod tests {
                 *captured.borrow_mut() = Some(q);
                 Ok(vec![])
             },
-            |_, _, _, _| Ok(RevisionId(1)),
+            |_, _, _, _| Ok(RevisionId::legacy(1)),
             |_, _| Ok(BranchId(2)),
             |_| Ok(SnapshotId(1)),
         );
@@ -578,10 +578,10 @@ mod tests {
         let s = ro_session();
         let addr = Address::new(SpaceId(1), DimensionVector::new(vec![0, 0]));
         let r = dispatch(
-            Request::Write { address: addr, revision: RevisionId(1), data: vec![] },
+            Request::Write { address: addr, revision: RevisionId::legacy(1), data: vec![] },
             &s,
             |_| Ok(vec![]),
-            |_, _, _, _| Ok(RevisionId(1)),
+            |_, _, _, _| Ok(RevisionId::legacy(1)),
             |_, _| Ok(BranchId(2)),
             |_| Ok(SnapshotId(1)),
         );

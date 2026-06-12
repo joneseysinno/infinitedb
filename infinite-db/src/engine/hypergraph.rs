@@ -126,7 +126,7 @@ pub fn rows_to_records(rows: &[HypergraphWriteRow], first_revision: RevisionId) 
     rows.iter()
         .enumerate()
         .map(|(i, row)| {
-            let revision = RevisionId(first_revision.0 + i as u64);
+            let revision = RevisionId::legacy(first_revision.legacy_sequence() + i as u64);
             Record {
                 address: crate::infinitedb_core::address::Address::new(row.space, row.point.clone()),
                 revision,

@@ -54,9 +54,9 @@ impl RevisionRange {
         self.last
     }
 
-    /// Return the revision at `index` (0 = first).
+    /// Return the revision at `index` (0 = first) within the global session-0 stream.
     pub fn nth(self, index: u64) -> RevisionId {
-        RevisionId(self.first.0 + index)
+        RevisionId::legacy(self.first.legacy_sequence() + index)
     }
 }
 
@@ -101,7 +101,7 @@ impl RevisionWatermark {
     pub fn new(initial: u64) -> Self {
         Self {
             state: Mutex::new(WatermarkState {
-                allocated: RevisionId(initial),
+                allocated: RevisionId::legacy(initial),
                 outstanding: BTreeSet::new(),
                 failed: VecDeque::new(),
             }),
@@ -111,7 +111,7 @@ impl RevisionWatermark {
     /// Allocate the next revision and register it as outstanding.
     pub fn allocate(&self) -> RevisionId {
         let mut state = self.state.lock();
-        let rev = RevisionId(state.allocated.0 + 1);
+        let rev = state.allocated.next_global();
         state.allocated = rev;
         state.outstanding.insert(rev);
         rev
@@ -121,11 +121,13 @@ impl RevisionWatermark {
     pub fn allocate_n(&self, count: u64) -> RevisionRange {
         debug_assert!(count > 0, "allocate_n requires count > 0");
         let mut state = self.state.lock();
-        let first = RevisionId(state.allocated.0 + 1);
-        let last = RevisionId(first.0 + count - 1);
+        let first = state.allocated.next_global();
+        let last = RevisionId::legacy(first.legacy_sequence() + count - 1);
         state.allocated = last;
-        for rev in first.0..=last.0 {
-            state.outstanding.insert(RevisionId(rev));
+        let mut seq = first.legacy_sequence();
+        while seq <= last.legacy_sequence() {
+            state.outstanding.insert(RevisionId::legacy(seq));
+            seq += 1;
         }
         RevisionRange { first, last }
     }
@@ -137,7 +139,24 @@ impl RevisionWatermark {
 
     /// Seed the allocation counter (database open / recovery).
     pub fn set_revision(&self, value: u64) {
-        self.state.lock().allocated = RevisionId(value);
+        self.state.lock().allocated = RevisionId::legacy(value);
+    }
+
+    /// Raise the allocation high-water without registering outstanding work.
+    pub fn seed_allocated(&self, rev: RevisionId) {
+        let mut state = self.state.lock();
+        if rev > state.allocated {
+            state.allocated = rev;
+        }
+    }
+
+    /// Register an externally stamped revision as outstanding (HLC sessions).
+    pub fn register_outstanding(&self, rev: RevisionId) {
+        let mut state = self.state.lock();
+        state.outstanding.insert(rev);
+        if rev > state.allocated {
+            state.allocated = rev;
+        }
     }
 
     /// Retire a revision after durable apply and live-tail publish.
@@ -188,12 +207,12 @@ mod tests {
         wm.allocate(); // 1
         wm.allocate(); // 2
         wm.allocate(); // 3
-        wm.retire(RevisionId(1));
-        wm.retire(RevisionId(3));
+        wm.retire(RevisionId::legacy(1));
+        wm.retire(RevisionId::legacy(3));
         // Outstanding: {2}. Stable should be 1 (predecessor of 2), not 0.
-        assert_eq!(wm.stable_revision(), RevisionId(1));
-        wm.retire(RevisionId(2));
-        assert_eq!(wm.stable_revision(), RevisionId(3));
+        assert_eq!(wm.stable_revision(), RevisionId::legacy(1));
+        wm.retire(RevisionId::legacy(2));
+        assert_eq!(wm.stable_revision(), RevisionId::legacy(3));
     }
 
     #[test]
@@ -211,22 +230,26 @@ mod tests {
     #[test]
     fn compute_stable_cases() {
         let empty = WatermarkState {
-            allocated: RevisionId(5),
+            allocated: RevisionId::legacy(5),
             outstanding: BTreeSet::new(),
             failed: VecDeque::new(),
         };
-        assert_eq!(compute_stable(&empty), RevisionId(5));
+        assert_eq!(compute_stable(&empty), RevisionId::legacy(5));
 
         let with_gap = WatermarkState {
-            allocated: RevisionId(3),
-            outstanding: BTreeSet::from([RevisionId(2)]),
+            allocated: RevisionId::legacy(3),
+            outstanding: BTreeSet::from([RevisionId::legacy(2)]),
             failed: VecDeque::new(),
         };
-        assert_eq!(compute_stable(&with_gap), RevisionId(1));
+        assert_eq!(compute_stable(&with_gap), RevisionId::legacy(1));
 
         let dense = WatermarkState {
-            allocated: RevisionId(3),
-            outstanding: BTreeSet::from([RevisionId(1), RevisionId(2), RevisionId(3)]),
+            allocated: RevisionId::legacy(3),
+            outstanding: BTreeSet::from([
+                RevisionId::legacy(1),
+                RevisionId::legacy(2),
+                RevisionId::legacy(3),
+            ]),
             failed: VecDeque::new(),
         };
         assert_eq!(compute_stable(&dense), RevisionId::ZERO);
@@ -235,11 +258,11 @@ mod tests {
     #[test]
     fn revision_range_nth() {
         let range = RevisionRange {
-            first: RevisionId(10),
-            last: RevisionId(12),
+            first: RevisionId::legacy(10),
+            last: RevisionId::legacy(12),
         };
-        assert_eq!(range.nth(0), RevisionId(10));
-        assert_eq!(range.nth(2), RevisionId(12));
+        assert_eq!(range.nth(0), RevisionId::legacy(10));
+        assert_eq!(range.nth(2), RevisionId::legacy(12));
     }
 
     #[test]

@@ -136,7 +136,7 @@ mod tests {
         Snapshot {
             id: SnapshotId(id),
             space: SpaceId(1),
-            revision: RevisionId(id),
+            revision: RevisionId::legacy(id),
             parent: None,
             blocks: BTreeMap::new(),
         }
@@ -190,7 +190,7 @@ mod tests {
         let first_point = DimensionVector::new(vec![10, 20]);
         let record = Record {
             address: Address::new(SpaceId(1), first_point.clone()),
-            revision: RevisionId(1),
+            revision: RevisionId::legacy(1),
             data: vec![1, 2, 3],
             tombstone: false,
             hilbert_key: crate::infinitedb_core::hilbert_key::CachedHilbertKey::UNSET,
@@ -199,8 +199,8 @@ mod tests {
             id: BlockId(999),
             space: SpaceId(1),
             records: vec![record],
-            min_revision: RevisionId(1),
-            max_revision: RevisionId(1),
+            min_revision: RevisionId::legacy(1),
+            max_revision: RevisionId::legacy(1),
             checksum: Checksum::ZERO,
         };
 
@@ -209,7 +209,7 @@ mod tests {
             target_snapshot: SnapshotId(2),
             added_blocks: vec![block],
             removed_block_ids: vec![],
-            at_revision: RevisionId(1),
+            at_revision: RevisionId::legacy(1),
         };
 
         let updated = delta.apply(&empty_snapshot(1));

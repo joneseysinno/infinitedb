@@ -39,7 +39,7 @@ fn latest_per_address(spaces: &SpaceRegistry, mut records: Vec<Record>) -> Vec<R
             .or_insert(record);
     }
     let mut latest: Vec<Record> = map.into_values().collect();
-    latest.sort_by_key(|r| (r.address.point.coords.clone(), r.revision.0));
+    latest.sort_by_key(|r| (r.address.point.coords.clone(), r.revision.legacy_sequence()));
     latest
 }
 

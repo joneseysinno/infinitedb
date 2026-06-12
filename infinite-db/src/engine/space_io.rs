@@ -33,7 +33,7 @@ use super::query::{prepare_records_for_seal, record_identity_key};
 use super::io_thread::IoThreadConfig;
 use super::live_tail::LiveTailView;
 use super::snapshot_store::SnapshotStore;
-use super::watermark::RevisionWatermark;
+use super::session::SessionWatermarks;
 use super::write_queue::{IoCommand, WriteQueueSender};
 
 pub struct SpaceIoHandle {
@@ -54,7 +54,7 @@ impl SpaceIoHandle {
         rx: Receiver<IoCommand>,
         config: IoThreadConfig,
         shard_filter: Option<ShardRef>,
-        watermark: Arc<RevisionWatermark>,
+        watermark: Arc<SessionWatermarks>,
         compaction_overrides: CompactionPolicyOverrides,
         branch_overlays: Option<Arc<BranchOverlayStore>>,
     ) -> Self {
@@ -125,7 +125,7 @@ pub fn open_space_pipeline(
     next_block_id: Arc<AtomicU64>,
     config: IoThreadConfig,
     shard_filter: Option<ShardRef>,
-    watermark: Arc<RevisionWatermark>,
+    watermark: Arc<SessionWatermarks>,
     compaction_overrides: CompactionPolicyOverrides,
     branch_overlays: Option<Arc<BranchOverlayStore>>,
 ) -> (WriteQueueSender, SpaceIoHandle) {
@@ -161,7 +161,7 @@ struct SpaceIoState {
     hot_record_count: usize,
     hot_committed_bytes: u64,
     shard_filter: Option<ShardRef>,
-    watermark: Arc<RevisionWatermark>,
+    watermark: Arc<SessionWatermarks>,
     compaction_overrides: CompactionPolicyOverrides,
     branch_overlays: Option<Arc<BranchOverlayStore>>,
     pending_error: Option<io::Error>,
@@ -178,7 +178,7 @@ fn run_space_io_loop(
     rx: Receiver<IoCommand>,
     config: IoThreadConfig,
     shard_filter: Option<ShardRef>,
-    watermark: Arc<RevisionWatermark>,
+    watermark: Arc<SessionWatermarks>,
     compaction_overrides: CompactionPolicyOverrides,
     branch_overlays: Option<Arc<BranchOverlayStore>>,
     group_commits: Arc<AtomicU64>,

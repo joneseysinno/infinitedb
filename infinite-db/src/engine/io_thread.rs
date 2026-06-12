@@ -31,13 +31,13 @@ use super::group_commit::{commit_group_to_hot_segment, drain_write_group, migrat
 use super::live_tail::LiveTailView;
 use super::query::{prepare_records_for_seal, record_identity_key};
 use super::snapshot_store::SnapshotStore;
-use super::watermark::RevisionWatermark;
+use super::session::SessionWatermarks;
 use super::write_queue::{IoCommand, WriteQueueSender};
 
 /// Tuning for the dedicated I/O thread.
 #[derive(Debug, Clone)]
 pub struct IoThreadConfig {
-    /// Deprecated: ignored; all writes use group-committed hot segments.
+    /// Deadline for session timed fast-path direct seal attempts (Phase 7).
     pub direct_write_timeout: std::time::Duration,
     /// Secondary seal trigger by record count (pathological tiny records).
     pub hot_segment_seal_threshold: usize,
@@ -68,6 +68,9 @@ pub struct IoStats {
     /// Deprecated: always zero (staging WAL removed).
     pub staged_writes: u64,
     pub staging_wal_frames: usize,
+    pub fast_path_seal_success: u64,
+    pub fast_path_seal_timeout: u64,
+    pub fast_path_wal_fallback: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -92,7 +95,7 @@ impl IoThreadHandle {
         next_block_id: Arc<AtomicU64>,
         rx: Receiver<IoCommand>,
         config: IoThreadConfig,
-        watermark: Arc<RevisionWatermark>,
+        watermark: Arc<SessionWatermarks>,
         compaction_overrides: CompactionPolicyOverrides,
         branch_overlays: Option<Arc<BranchOverlayStore>>,
     ) -> Self {
@@ -158,7 +161,7 @@ pub fn open_io_pipeline(
     spaces: Arc<RwLock<SpaceRegistry>>,
     next_block_id: Arc<AtomicU64>,
     config: IoThreadConfig,
-    watermark: Arc<RevisionWatermark>,
+    watermark: Arc<SessionWatermarks>,
     compaction_overrides: CompactionPolicyOverrides,
     branch_overlays: Option<Arc<BranchOverlayStore>>,
 ) -> (WriteQueueSender, IoThreadHandle) {
@@ -190,7 +193,7 @@ struct IoState {
     hot: HashMap<SpaceId, HotSegment>,
     hot_record_counts: HashMap<SpaceId, usize>,
     hot_committed_bytes: HashMap<SpaceId, u64>,
-    watermark: Arc<RevisionWatermark>,
+    watermark: Arc<SessionWatermarks>,
     compaction_overrides: CompactionPolicyOverrides,
     branch_overlays: Option<Arc<BranchOverlayStore>>,
     pending_error: Option<io::Error>,
@@ -205,7 +208,7 @@ fn run_io_loop(
     next_block_id: Arc<AtomicU64>,
     rx: Receiver<IoCommand>,
     config: IoThreadConfig,
-    watermark: Arc<RevisionWatermark>,
+    watermark: Arc<SessionWatermarks>,
     compaction_overrides: CompactionPolicyOverrides,
     branch_overlays: Option<Arc<BranchOverlayStore>>,
     group_commits: Arc<AtomicU64>,

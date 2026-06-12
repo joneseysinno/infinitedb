@@ -124,7 +124,7 @@ mod tests {
             99,
             SyncOperation::Write {
                 address: Address::new(SpaceId(1), DimensionVector::new(vec![1, 2])),
-                revision: RevisionId(3),
+                revision: RevisionId::legacy(3),
                 data: vec![7, 8],
             },
         )];

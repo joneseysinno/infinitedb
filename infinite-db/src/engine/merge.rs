@@ -17,7 +17,7 @@ use super::snapshot_store::SnapshotStore;
 use super::space_live_tails::SpaceLiveTails;
 use crate::infinitedb_core::space::SpaceRegistry;
 use crate::infinitedb_storage::nvme::BlockStore;
-use super::watermark::RevisionWatermark;
+use super::session::SessionWatermarks;
 type Resolver<'a> = Option<&'a (dyn Fn(MergeConflict) -> Record + Send + Sync)>;
 
 fn latest_per_address(records: Vec<Record>) -> HashMap<Address, Record> {
@@ -47,8 +47,16 @@ fn pick_winner(
         MergeStrategy::PreferTarget => Ok(conflict.target.clone()),
         MergeStrategy::PreferSource => Ok(conflict.source.clone()),
         MergeStrategy::PreferHigherRevision => {
-            let target_rev = conflict.target.as_ref().map(|r| r.revision.0).unwrap_or(0);
-            let source_rev = conflict.source.as_ref().map(|r| r.revision.0).unwrap_or(0);
+            let target_rev = conflict
+                .target
+                .as_ref()
+                .map(|r| r.revision.legacy_sequence())
+                .unwrap_or(0);
+            let source_rev = conflict
+                .source
+                .as_ref()
+                .map(|r| r.revision.legacy_sequence())
+                .unwrap_or(0);
             if source_rev >= target_rev {
                 Ok(conflict.source.clone())
             } else {
@@ -74,7 +82,7 @@ pub fn merge_branches(
     hilbert_tails: Option<&HilbertLiveTails>,
     branch_overlays: &BranchOverlayStore,
     spaces: &SpaceRegistry,
-    watermark: &RevisionWatermark,
+    watermark: &SessionWatermarks,
     branches: &BranchRegistry,
     target: BranchId,
     source: BranchId,

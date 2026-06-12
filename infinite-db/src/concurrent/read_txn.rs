@@ -3,6 +3,9 @@
 //! Pin a concurrent read view at a revision ceiling so queries do not observe
 //! in-flight writes. Obtain one from [`InfiniteDb::read`].
 //!
+//! Phase 2: pins a **version vector** (per-session stable ceilings) with a scalar
+//! meet available as the default `as_of` ceiling.
+//!
 //! ```no_run
 //! use infinite_db::InfiniteDb;
 //! use infinite_db::infinitedb_core::address::SpaceId;
@@ -15,6 +18,7 @@
 //! ```
 
 use crate::engine::query::{query_inner, space_key};
+use crate::engine::session::VersionVector;
 use crate::infinitedb_core::{
     address::{DimensionVector, RevisionId, SpaceId},
     block::Record,
@@ -28,20 +32,28 @@ pub struct ReadTxn<'a> {
     db: &'a InfiniteDb,
     branch: BranchId,
     as_of: Option<RevisionId>,
+    version_vector: VersionVector,
 }
 
 impl<'a> ReadTxn<'a> {
-    /// Pin reads at the current stable revision on `main`.
+    /// Pin reads at the scalar meet of per-session stable revisions on `main`.
     ///
     /// Queries through this view are repeatable: the visible record set at the
     /// pinned revision cannot change while the transaction is held.
     pub fn new(db: &'a InfiniteDb) -> Self {
-        let as_of = Some(db.stable_revision());
+        let version_vector = db.capture_version_vector();
+        let as_of = Some(version_vector.scalar_meet());
         Self {
             db,
             branch: BranchId::MAIN,
             as_of,
+            version_vector,
         }
+    }
+
+    /// Per-session stable ceilings captured at transaction open (Phase 2).
+    pub fn version_vector(&self) -> &VersionVector {
+        &self.version_vector
     }
 
     /// Read through a branch overlay instead of `main`.
@@ -104,7 +116,7 @@ impl<'a> ReadTxn<'a> {
             ctx.live_tail,
             ctx.space_tails,
             &spaces,
-            &self.db.watermark,
+            &self.db.session_watermarks,
             q.space,
             key_range,
             as_of,

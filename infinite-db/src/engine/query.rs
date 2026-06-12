@@ -6,6 +6,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use crate::infinitedb_core::{
     address::{DimensionVector, RevisionId, SpaceId},
     block::Record,
+    hlc::SessionId,
     hilbert_key::{CachedHilbertKey, HilbertKey},
     record_identity::{AddressKey, RecordIdentityKey},
     snapshot::BlockIndexEntry,
@@ -23,7 +24,7 @@ use crate::infinitedb_storage::nvme::BlockStore;
 use crate::infinitedb_core::branch::BranchId;
 
 use super::branch_overlay::BranchOverlayStore;
-use super::watermark::RevisionWatermark;
+use super::session::{SessionWatermarks, VersionVector};
 use super::hilbert_live_tails::HilbertLiveTails;
 use super::live_tail::LiveTailView;
 use super::snapshot_store::SnapshotStore;
@@ -255,6 +256,75 @@ fn record_interval_scan(count: u32) {
     QUERY_INTERVAL_SCANS.fetch_add(count, Ordering::Relaxed);
 }
 
+/// Scalar or per-session revision ceiling for frame queries (Phase 5).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FrameTimePin {
+    Scalar(RevisionId),
+    Vector(VersionVector),
+}
+
+impl FrameTimePin {
+    /// Scalar ceiling for diagnosis and legacy callers.
+    pub fn scalar_ceiling(&self) -> RevisionId {
+        match self {
+            FrameTimePin::Scalar(r) => *r,
+            FrameTimePin::Vector(v) => v.scalar_meet(),
+        }
+    }
+}
+
+fn record_visible_at<F>(record: &Record, pin: &FrameTimePin, stable_for_session: F) -> bool
+where
+    F: Fn(SessionId) -> RevisionId,
+{
+    match pin {
+        FrameTimePin::Scalar(ceiling) => record.revision <= *ceiling,
+        FrameTimePin::Vector(vector) => {
+            let session = SessionId(record.revision.session());
+            let ceiling = vector
+                .get(session)
+                .unwrap_or_else(|| stable_for_session(session));
+            record.revision <= ceiling
+        }
+    }
+}
+
+/// Apply latest-wins visibility with a scalar or version-vector ceiling (Phase 5).
+pub(crate) fn resolve_visibility_with_pin<F>(
+    spaces: &SpaceRegistry,
+    candidates: Vec<Record>,
+    pin: &FrameTimePin,
+    include_tombstones: bool,
+    stable_for_session: F,
+) -> Vec<Record>
+where
+    F: Fn(SessionId) -> RevisionId,
+{
+    if include_tombstones {
+        return candidates;
+    }
+
+    let mut latest: HashMap<AddressKey, Record> = HashMap::new();
+    for record in candidates {
+        if !record_visible_at(&record, pin, &stable_for_session) {
+            continue;
+        }
+        let key = address_key(spaces, &record);
+        let replace = match latest.get(&key) {
+            None => true,
+            Some(existing) => record.revision > existing.revision,
+        };
+        if replace {
+            latest.insert(key, record);
+        }
+    }
+
+    latest
+        .into_values()
+        .filter(|r| !r.tombstone)
+        .collect()
+}
+
 /// Apply latest-wins visibility per address identity.
 ///
 /// An address is visible iff its highest revision at or below `rev_ceiling` is a
@@ -302,7 +372,7 @@ pub fn query_inner(
     live_tail: Option<&LiveTailView>,
     space_live_tails: Option<&SpaceLiveTails>,
     spaces: &SpaceRegistry,
-    watermark: &RevisionWatermark,
+    watermark: &SessionWatermarks,
     space: SpaceId,
     key_range: Option<(u128, u128)>,
     as_of: Option<RevisionId>,
@@ -418,7 +488,7 @@ pub fn query_bbox(
     live_tail: Option<&LiveTailView>,
     space_live_tails: Option<&SpaceLiveTails>,
     spaces: &SpaceRegistry,
-    watermark: &RevisionWatermark,
+    watermark: &SessionWatermarks,
     space: SpaceId,
     min: DimensionVector,
     max: DimensionVector,

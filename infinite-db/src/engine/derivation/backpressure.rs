@@ -28,4 +28,6 @@ pub struct DerivationStats {
     pub events_processed: u64,
     pub derived_rows_written: u64,
     pub backpressure_rejections: u64,
+    pub derivation_failures: u64,
+    pub outstanding_derivations: usize,
 }

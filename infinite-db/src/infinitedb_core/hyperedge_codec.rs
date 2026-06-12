@@ -173,8 +173,8 @@ mod tests {
             ],
             weight_milli: Some(1000),
             metadata: BTreeMap::from([("src".into(), "ifc".into())]),
-            valid_from: RevisionId(5),
-            valid_to: Some(RevisionId(10)),
+            valid_from: RevisionId::legacy(5),
+            valid_to: Some(RevisionId::legacy(10)),
             directionality: Directionality::Directed,
             authoring_frame: None,
             computation: None,
@@ -220,7 +220,7 @@ mod tests {
         let mut edge = sample_v2_edge();
         edge.authoring_frame = Some(AuthoringFrameProvenance {
             frame_id: FrameId(7),
-            as_of: RevisionId(3),
+            as_of: RevisionId::legacy(3),
         });
         let bytes = encode_hyperedge(&edge).unwrap();
         assert_eq!(bytes[0], HYPEREDGE_PAYLOAD_V3_TAG);
@@ -236,7 +236,7 @@ mod tests {
                 kind: SubjectKind::Hyperedge,
                 space: SpaceId(1),
                 identity: SubjectIdentity::Hyperedge(HyperedgeId(1)),
-                subject_revision: RevisionId(2),
+                subject_revision: RevisionId::legacy(2),
             }],
         });
         let bytes = encode_hyperedge(&edge).unwrap();
@@ -250,14 +250,14 @@ mod tests {
         let mut edge = sample_v2_edge();
         edge.authoring_frame = Some(AuthoringFrameProvenance {
             frame_id: FrameId(7),
-            as_of: RevisionId(3),
+            as_of: RevisionId::legacy(3),
         });
         edge.computation = Some(ComputationProvenance {
             inputs: vec![SubjectPin {
                 kind: SubjectKind::Hyperedge,
                 space: SpaceId(1),
                 identity: SubjectIdentity::Hyperedge(HyperedgeId(1)),
-                subject_revision: RevisionId(2),
+                subject_revision: RevisionId::legacy(2),
             }],
         });
         let bytes = encode_hyperedge(&edge).unwrap();
@@ -272,7 +272,7 @@ mod tests {
         let mut edge = sample_v2_edge();
         edge.authoring_frame = Some(AuthoringFrameProvenance {
             frame_id: FrameId(1),
-            as_of: RevisionId(1),
+            as_of: RevisionId::legacy(1),
         });
         let bytes = encode_hyperedge(&edge).unwrap();
         assert_eq!(bytes[0], HYPEREDGE_PAYLOAD_V3_TAG);

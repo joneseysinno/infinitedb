@@ -135,7 +135,7 @@ mod tests {
         Session::new(
             BranchId(1),
             SnapshotId(1),
-            RevisionId(0),
+            RevisionId::legacy(0),
             vec![SpaceGrant { space: SpaceId(1), level }],
         )
     }

@@ -33,7 +33,7 @@ pub fn expand_endpoint_index_records_for_compaction(
     for row in rewrite_rows {
         expanded.push(Record {
             address: crate::infinitedb_core::address::Address::new(row.space, row.point),
-            revision: crate::infinitedb_core::address::RevisionId(u64::MAX),
+            revision: crate::infinitedb_core::address::RevisionId::legacy(u64::MAX),
             data: row.data,
             tombstone: row.tombstone,
             hilbert_key: crate::infinitedb_core::hilbert_key::CachedHilbertKey::UNSET,

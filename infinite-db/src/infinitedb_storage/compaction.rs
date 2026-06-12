@@ -131,7 +131,7 @@ mod tests {
     fn make_record(x: u32, rev: u64, tombstone: bool) -> Record {
         Record {
             address: Address::new(SpaceId(1), DimensionVector::new(vec![x, 0])),
-            revision: RevisionId(rev),
+            revision: RevisionId::legacy(rev),
             data: vec![],
             tombstone,
             hilbert_key: CachedHilbertKey::UNSET,
@@ -142,8 +142,8 @@ mod tests {
         Block {
             id: BlockId(id),
             space: SpaceId(1),
-            min_revision: RevisionId(0),
-            max_revision: RevisionId(99),
+            min_revision: RevisionId::legacy(0),
+            max_revision: RevisionId::legacy(99),
             records,
             checksum: Checksum::ZERO,
         }
@@ -184,6 +184,6 @@ mod tests {
             || { let id = BlockId(next_id); next_id += 1; id },
         );
         assert_eq!(result.new_blocks[0].records.len(), 1);
-        assert_eq!(result.new_blocks[0].records[0].revision, RevisionId(2));
+        assert_eq!(result.new_blocks[0].records[0].revision, RevisionId::legacy(2));
     }
 }

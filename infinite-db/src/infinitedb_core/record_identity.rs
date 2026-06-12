@@ -60,7 +60,7 @@ mod tests {
         let hilbert = HilbertKey(42);
         let cached = Record {
             address: Address::new(space, point.clone()),
-            revision: RevisionId(1),
+            revision: RevisionId::legacy(1),
             data: vec![1],
             tombstone: false,
             hilbert_key: CachedHilbertKey::set(hilbert),

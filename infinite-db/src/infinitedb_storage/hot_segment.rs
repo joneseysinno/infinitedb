@@ -262,7 +262,7 @@ mod tests {
     fn sample_entry() -> WalEntry {
         WalEntry::Write {
             address: Address::new(SpaceId(1), DimensionVector::new(vec![1, 2])),
-            revision: RevisionId(1),
+            revision: RevisionId::legacy(1),
             data: vec![9],
         }
     }

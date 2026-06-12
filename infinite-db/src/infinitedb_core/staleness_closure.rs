@@ -37,12 +37,26 @@ pub struct StaleTarget {
     pub depth: usize,
 }
 
+/// Whether an observed subject revision satisfies a computation input pin.
+///
+/// Exact equality is required. When the pin was serialized through legacy `u64`
+/// revision encoding but the live record carries a full HLC stamp (Phase 5),
+/// matching sequence under a legacy-embedded pin still counts as fresh.
+fn revisions_match_for_freshness(pinned: RevisionId, observed: RevisionId) -> bool {
+    if pinned == observed {
+        return true;
+    }
+    pinned.is_global_legacy()
+        && !observed.is_global_legacy()
+        && pinned.legacy_sequence() == observed.legacy_sequence()
+}
+
 /// Compare pinned input revision against the observed subject revision at `as_of`.
 pub fn input_freshness(
     pin: &SubjectPin,
     observed_revision: RevisionId,
 ) -> InputFreshness {
-    let status = if observed_revision == pin.subject_revision {
+    let status = if revisions_match_for_freshness(pin.subject_revision, observed_revision) {
         FreshnessStatus::Fresh
     } else {
         FreshnessStatus::Stale
@@ -119,7 +133,7 @@ mod tests {
             ],
             weight_milli: None,
             metadata: BTreeMap::new(),
-            valid_from: RevisionId(5),
+            valid_from: RevisionId::legacy(5),
             valid_to: None,
             directionality: Directionality::Directed,
             authoring_frame: None,
@@ -132,16 +146,33 @@ mod tests {
 
     #[test]
     fn fresh_when_revision_matches() {
-        let (edge, obs) = sample_edge(RevisionId(3), RevisionId(3));
+        let (edge, obs) = sample_edge(RevisionId::legacy(3), RevisionId::legacy(3));
         let report = check_computation_freshness(&edge, &|_| Some(obs)).unwrap();
         assert!(report.is_fresh);
     }
 
     #[test]
     fn stale_when_revision_superseded() {
-        let (edge, _) = sample_edge(RevisionId(3), RevisionId(7));
+        let (edge, _) = sample_edge(RevisionId::legacy(3), RevisionId::legacy(7));
         let report =
-            check_computation_freshness(&edge, &|_| Some(RevisionId(7))).unwrap();
+            check_computation_freshness(&edge, &|_| Some(RevisionId::legacy(7))).unwrap();
         assert!(!report.is_fresh);
+    }
+
+    #[test]
+    fn legacy_pin_matches_hlc_observed_sequence() {
+        use crate::infinitedb_core::hlc::HlcStamp;
+        let (edge, _) = sample_edge(RevisionId::legacy(3), RevisionId::legacy(3));
+        let hlc_observed = RevisionId::from_stamp(HlcStamp {
+            physical_ms: 1,
+            logical: 0,
+            session: 2,
+            sequence: 3,
+        });
+        let mut edge = edge;
+        edge.computation.as_mut().unwrap().inputs[0].subject_revision = RevisionId::legacy(3);
+        let report =
+            check_computation_freshness(&edge, &|_| Some(hlc_observed)).unwrap();
+        assert!(report.is_fresh);
     }
 }

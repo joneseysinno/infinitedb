@@ -27,7 +27,9 @@ use parking_lot::RwLock;
 
 use crate::infinitedb_core::{
     block::{Block, BlockId},
+    block_codec::decode_block,
     checksum::Checksum,
+    revision_codec::RevisionWireFormat,
 };
 
 // ---------------------------------------------------------------------------
@@ -157,7 +159,9 @@ impl BlockStore {
         }
         let path = self.block_path(id);
         let bytes = fs::read(&path)?;
-        let (block, _): (Block, _) = decode_from_slice(&bytes, standard())
+        let block = decode_from_slice::<Block, _>(&bytes, standard())
+            .map(|(block, _)| block)
+            .or_else(|_| decode_block(&bytes, RevisionWireFormat::LegacyU64))
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         verify_checksum(&block)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;

@@ -70,7 +70,7 @@ fn v3_provenance_roundtrip_after_reopen() {
         let mut edge = directed_edge(1, hub, node(entity, 2));
         edge.authoring_frame = Some(AuthoringFrameProvenance {
             frame_id: FrameId(42),
-            as_of: RevisionId(1),
+            as_of: RevisionId::legacy(1),
         });
         db.insert_hyperedge(edge_space, edge).unwrap();
         db.sync().unwrap();
@@ -97,7 +97,7 @@ fn judgment_pin_rejects_wrong_revision() {
         kind: SubjectKind::Hyperedge,
         space: edge_space,
         identity: SubjectIdentity::Hyperedge(HyperedgeId(9)),
-        subject_revision: RevisionId(rev.0 + 100),
+        subject_revision: RevisionId::legacy(rev.legacy_sequence() + 100),
     };
     let record = JudgmentRecord {
         id: JudgmentId(1),

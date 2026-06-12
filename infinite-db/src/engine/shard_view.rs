@@ -80,7 +80,11 @@ impl ShardViewHandle {
 
     /// Replace the entire view atomically.
     pub fn publish(&self, view: ShardView) {
-        let max_rev = view.tail_iter().map(|r| r.revision.0).max().unwrap_or(0);
+        let max_rev = view
+            .tail_iter()
+            .map(|r| r.revision.legacy_sequence())
+            .max()
+            .unwrap_or(0);
         self.view.store(Arc::new(view));
         self.captured_at.store(max_rev, Ordering::Release);
     }
@@ -101,7 +105,7 @@ impl ShardViewHandle {
         let max_rev = chunks
             .iter()
             .flat_map(|c| c.iter())
-            .map(|r| r.revision.0)
+            .map(|r| r.revision.legacy_sequence())
             .max()
             .unwrap_or(0);
         self.view.store(Arc::new(ShardView {
@@ -135,7 +139,7 @@ impl ShardViewHandle {
         let max_rev = chunks
             .iter()
             .flat_map(|c| c.iter())
-            .map(|r| r.revision.0)
+            .map(|r| r.revision.legacy_sequence())
             .max()
             .unwrap_or(0);
         self.view.store(Arc::new(ShardView {
@@ -170,7 +174,7 @@ impl ShardViewHandle {
 
     /// Highest revision in the published tail.
     pub fn captured_at(&self) -> RevisionId {
-        RevisionId(self.captured_at.load(Ordering::Acquire))
+        RevisionId::legacy(self.captured_at.load(Ordering::Acquire))
     }
 }
 

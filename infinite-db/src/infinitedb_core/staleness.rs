@@ -110,7 +110,7 @@ mod tests {
             ],
             weight_milli: None,
             metadata: BTreeMap::new(),
-            valid_from: RevisionId(1),
+            valid_from: RevisionId::legacy(1),
             valid_to: None,
             directionality: Directionality::Directed,
             authoring_frame: Some(AuthoringFrameProvenance { frame_id: frame, as_of }),
@@ -120,10 +120,10 @@ mod tests {
 
     #[test]
     fn diagnose_stale_frame() {
-        let edge = edge_with_frame(FrameId(1), RevisionId(5));
+        let edge = edge_with_frame(FrameId(1), RevisionId::legacy(5));
         let consulted = ConsultedFrame {
             frame_id: FrameId(1),
-            as_of: RevisionId(10),
+            as_of: RevisionId::legacy(10),
         };
         assert_eq!(
             diagnose_assertion(&edge, consulted, &[]),
@@ -133,10 +133,10 @@ mod tests {
 
     #[test]
     fn diagnose_condemned_by_judgment() {
-        let edge = edge_with_frame(FrameId(1), RevisionId(10));
+        let edge = edge_with_frame(FrameId(1), RevisionId::legacy(10));
         let consulted = ConsultedFrame {
             frame_id: FrameId(1),
-            as_of: RevisionId(10),
+            as_of: RevisionId::legacy(10),
         };
         let j = JudgmentRecord {
             id: JudgmentId(1),
@@ -145,7 +145,7 @@ mod tests {
                 kind: SubjectKind::Hyperedge,
                 space: SpaceId(1),
                 identity: SubjectIdentity::Hyperedge(HyperedgeId(1)),
-                subject_revision: RevisionId(1),
+                subject_revision: RevisionId::legacy(1),
             },
             verdict: JudgmentVerdict::Fail,
             rationale: None,

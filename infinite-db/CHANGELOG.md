@@ -4,6 +4,30 @@
 
 ### Added
 
+- **Peer track Phase 7 — timed fast path:** optional `TimedFastPathPolicy` on `OpenOptions` (default off); when enabled, `sync_session_wal` attempts durable seal to `sessions/{id}.fast` within `direct_seal_deadline` (from `IoThreadConfig::direct_write_timeout`, default 2ms) and falls back to session WAL append on timeout; `DurableIntent` carries `DurabilityMedium` (`SessionWal` / `FastSegment`); no `live_tail` publish before `commit_session_intent`; durable-but-uncommitted `.fast` bytes quarantined on recovery as `InterruptedSessionIntent`; `session_write_stats()` / `io_stats()` fast-path counters.
+- Integration tests: `tests/fast_path_phase7.rs`.
+
+- **Peer track Phase 6 — derivation bus under plural streams:** per-session `DerivationSessionWatermark` vectors with `register_for_session` / `retire_for_session`; `endpoint_index_watermark_vector()` and `flow_vector_index_watermark_vector()`; per-session delta merge via `record_in_derivation_delta`; session-scoped backpressure in `check_backpressure(submitting_session, head)`; hash-partitioned derivation workers (`splitmix64` on `HyperedgeId`, edge-lock map removed); vector-aware `recover_derivation_on_open` replays per-session gaps only; scalar `endpoint_index_watermark()` remains the meet across sessions for backward compatibility.
+- Integration tests: `tests/derivation_phase6.rs`.
+
+- **Peer track Phase 5 — frame integration (`AssertionScope::Session`):** session-scoped stream admission from `record.revision.session()`; `merge_admission_specs` with `Union`/`Session`/`Spaces`/`Branches`; optional `FrameQuery.version_vector` per-session pin (scalar `as_of` fallback); HLC authorship-order supersession among admitted sessions; `insert_hyperedge_with_session` with derivation-bus replay on intent commit; `fetch_hyperedge_by_id` overlays authoritative `valid_from` from record revision; legacy-encoded computation pins match HLC observed revisions for freshness (Phase 5 compat).
+- Integration tests: `tests/frame_session_phase5.rs`.
+
+- **Peer track Phase 4 — intent checkpoints:** `IntentCheckpoint` session-WAL frames with revision range + operation kind; durable-but-uncommitted tail quarantined on recovery (D-P5) as `InterruptedSessionIntent` error records; `sync_session_wal` / `commit_session_intent` with `DurableIntent` typestate token; checkpoint-bound collision detection; derivation flush at commit boundary.
+- Integration tests: `tests/intent_checkpoint.rs`.
+
+- **Peer track Phase 3 — per-session WAL:** `sessions/{id}.wal` with `committed_len` durability boundary; `insert_with_session` / `sync_session`; HLC-ordered recovery on open with per-stream quarantine; three-gate WAL retirement meta (`sealed`, `replication_confirmed`, `collision_evaluated`); session WAL frames preserve full HLC stamps; reopen hydrates per-session allocation heads from `meta/session_wals.bin`.
+- Integration tests: `tests/session_wal.rs`.
+
+- **Peer track Phase 2 — session stamping and version vectors:** `open_session()`, `WriteSession::stamp` / `stamp_n`, per-session `HlcClock`, `SessionWatermarks` with session-keyed retire routing; `VersionVector` read pins and scalar stable meet; implicit session-0 default preserves legacy single-writer API.
+- Integration tests: `tests/session_stamping.rs`.
+
+- **Peer track Phase 1 — HLC `RevisionId` widening:** 128-bit `HlcStamp` composite (D-P1 layout); `RevisionId::legacy` / `from_stamp` / `legacy_sequence` / `next_global`; versioned `revision_codec` and `block_codec` for v5 wire; v4 directories remain read-write with legacy u64 wire embedding (D-P4); `FORMAT_VERSION_V5` accepted on open.
+- Integration tests: `tests/hlc_revision.rs`.
+
+- **Peer track Phase 0 — derivation watermark repair:** outstanding-set / contiguous-prefix derivation watermarks (register on submit, retire on apply); `FailedDerivation` + `derivation_stats.derivation_failures`; bus shutdown drains queued events; delta-merge boundary fix (`revision > watermark`); assertion tombstone respected in `fetch_hyperedge_by_id`.
+- Peer-track decision records D-P1–D-P4 in `SEMANTICS.md`.
+
 - **Milestone 7 — flow-vector lane and staleness closures:** `FlowVector`, `FlowVectorSubscriber`, `FLOW_VECTOR_INDEX_SPACE`; `ComputationProvenance` / Hyperedge V4 codec; `query_flow_vectors_in_region`, `query_flow_vector_for_edge`, `check_hyperedge_freshness`, `query_stale_downstream`; delta-merge reads for flow-vector index lag.
 - Integration tests: `tests/hypergraph_m7.rs`.
 

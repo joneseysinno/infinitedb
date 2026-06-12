@@ -58,9 +58,15 @@ pub mod infinitedb_sync;
 
 #[cfg(feature = "embedded")]
 pub use concurrent::{InfiniteDb, IoStats, OpenOptions, ReadTxn, RevisionRange};
+#[cfg(feature = "embedded")]
+pub use engine::session::{DurableIntent, VersionVector, WriteSession};
+pub use infinitedb_core::intent_checkpoint::{IntentCheckpoint, IntentOperationKind};
 
 #[cfg(feature = "embedded")]
 pub use engine::derivation::{DerivationBackpressurePolicy, DerivationStats};
+pub use engine::timed_fast_path::{
+    SessionWriteStatsSnapshot, TimedFastPathPolicy,
+};
 #[cfg(feature = "embedded")]
 pub use engine::error::EngineError;
 #[cfg(feature = "embedded")]
@@ -74,10 +80,10 @@ pub use engine::frame::{AttachedJudgment, FrameResolvedHyperedge, FrameTraversal
 pub use infinitedb_core::{
     error_record::{ErrorKind, OperationErrorRecord, OperationRevisionRange},
     frame::{
-        AssertionScope, FrameDefinition, FrameRegisterRequest, JudgmentOverlayLayer, OverlayPolicy,
-        TestimonySource, VerdictFilter,
+        merge_admission_specs, AssertionScope, FrameDefinition, FrameRegisterRequest,
+        JudgmentOverlayLayer, OverlayPolicy, TestimonySource, VerdictFilter,
     },
-    frame_query::{FrameQuery, FrameQueryOptions},
+    frame_query::{FrameQuery, FrameQueryOptions, FrameVersionPin},
     judgment::{ArbiterId, ArbiterStream, JudgmentId, JudgmentRecord, JudgmentVerdict, SubjectPin},
     provenance::{AuthoringFrameProvenance, FrameId},
     computation::ComputationProvenance,
@@ -93,8 +99,13 @@ pub use infinitedb_core::flow_vector::FlowVectorRecord;
 pub use infinitedb_core::query::QueryOptions;
 
 #[cfg(feature = "embedded")]
+pub use infinitedb_core::hlc::{HlcStamp, SessionId, GLOBAL_SESSION};
+pub use infinitedb_core::revision_codec::{
+    RevisionWireFormat, FORMAT_VERSION_HLC_REVISION, REVISION_WIRE_HLC_TAG,
+};
+
 pub use infinitedb_storage::format::{
-    FormatVersion, FORMAT_VERSION_V2, FORMAT_VERSION_V3, FORMAT_VERSION_V4,
+    FormatVersion, FORMAT_VERSION_V2, FORMAT_VERSION_V3, FORMAT_VERSION_V4, FORMAT_VERSION_V5,
 };
 
 #[cfg(feature = "server")]

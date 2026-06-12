@@ -25,7 +25,7 @@ use super::hilbert_shard::{hilbert_shard_id, shard_for_point, shard_count, Shard
 use super::io_thread::{IoStats, IoThreadConfig};
 use super::snapshot_store::SnapshotStore;
 use super::space_io::{bootstrap_live_tail_blocks, open_space_pipeline, SpaceIoHandle};
-use super::watermark::RevisionWatermark;
+use super::session::SessionWatermarks;
 use super::write_queue::{WriteJob, WriteQueueSender};
 
 struct HilbertShard {
@@ -43,7 +43,7 @@ pub struct HilbertCoordinator {
     spaces: Arc<RwLock<SpaceRegistry>>,
     next_block_id: Arc<AtomicU64>,
     config: IoThreadConfig,
-    watermark: Arc<RevisionWatermark>,
+    watermark: Arc<SessionWatermarks>,
     compaction_overrides: CompactionPolicyOverrides,
     shards: DashMap<ShardKey, Arc<HilbertShard>>,
 }
@@ -57,7 +57,7 @@ impl HilbertCoordinator {
         spaces: Arc<RwLock<SpaceRegistry>>,
         next_block_id: Arc<AtomicU64>,
         config: IoThreadConfig,
-        watermark: Arc<RevisionWatermark>,
+        watermark: Arc<SessionWatermarks>,
         compaction_overrides: CompactionPolicyOverrides,
     ) -> Self {
         Self {

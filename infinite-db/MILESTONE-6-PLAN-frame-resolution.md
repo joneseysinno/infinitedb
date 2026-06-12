@@ -48,15 +48,15 @@ Named durable frames and index-resident frame-resolution queries: assertion scop
 
 ## Interim stream admission
 
-Until peer-track HLC lands, assertion scope admits testimony by **registered hyperedge spaces** and/or **branch overlays**. `AssertionScope` is extensible for future session ids.
+Assertion scope admits testimony by **registered hyperedge spaces**, **branch overlays**, and/or **asserting sessions** (`AssertionScope::Session`). Session admission reads the session component from each record's revision stamp (authoritative at the block boundary, not the hyperedge payload's encoded `valid_from`). `Union` composes scopes; `merge_admission_specs` merges session filters per `(space, branch)` bucket.
+
+Frame queries accept scalar `as_of` or optional `version_vector` (per-session stable pin). Vector pins fetch through the max pinned component, then apply per-session ceilings in MVCC.
 
 ---
 
 ## Explicitly deferred
 
-- HLC `AssertionScope::Session`
 - Frame composition (frame over frame output)
-- Flow-vector / staleness closures — M7
 - Server wire protocol for frames
 - Full branch-isolated traversal without MAIN endpoint index
 

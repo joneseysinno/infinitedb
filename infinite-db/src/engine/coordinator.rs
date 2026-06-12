@@ -20,7 +20,7 @@ use super::compactor::CompactionPolicyOverrides;
 use super::io_thread::{IoStats, IoThreadConfig};
 use super::snapshot_store::SnapshotStore;
 use super::space_io::{bootstrap_live_tail_blocks, open_space_pipeline, SpaceIoHandle};
-use super::watermark::RevisionWatermark;
+use super::session::SessionWatermarks;
 use super::space_live_tails::SpaceLiveTails;
 use super::write_queue::{WriteJob, WriteQueueSender};
 
@@ -38,7 +38,7 @@ pub struct SpaceCoordinator {
     spaces: Arc<RwLock<SpaceRegistry>>,
     next_block_id: Arc<AtomicU64>,
     config: IoThreadConfig,
-    watermark: Arc<RevisionWatermark>,
+    watermark: Arc<SessionWatermarks>,
     compaction_overrides: CompactionPolicyOverrides,
     branch_overlays: Option<Arc<BranchOverlayStore>>,
     shards: DashMap<SpaceId, Arc<SpaceShard>>,
@@ -52,7 +52,7 @@ impl SpaceCoordinator {
         spaces: Arc<RwLock<SpaceRegistry>>,
         next_block_id: Arc<AtomicU64>,
         config: IoThreadConfig,
-        watermark: Arc<RevisionWatermark>,
+        watermark: Arc<SessionWatermarks>,
         compaction_overrides: CompactionPolicyOverrides,
         branch_overlays: Option<Arc<BranchOverlayStore>>,
     ) -> Self {

@@ -8,8 +8,12 @@
 //! - Adapter traits (`adapter`) provide typed upstream bindings.
 //! - Kind catalog (`kind_catalog`) provides runtime discoverability/policy checks.
 
-/// Addressing primitives (`Address`, `SpaceId`, `DimensionVector`).
+/// Addressing primitives (`Address`, `SpaceId`, `DimensionVector`, `RevisionId`).
 pub mod address;
+/// HLC stamp layout (peer track Phase 1).
+pub mod hlc;
+pub mod revision_codec;
+pub mod block_codec;
 /// Block-level storage records.
 pub mod block;
 /// Branching model and branch registry.
@@ -50,6 +54,8 @@ pub mod provenance;
 pub mod error_record;
 pub mod error_record_codec;
 pub mod error_kind_catalog;
+/// Intent checkpoint descriptors (peer track Phase 4).
+pub mod intent_checkpoint;
 /// Judgment testimony conventions (M5).
 pub mod judgment;
 pub mod judgment_codec;

@@ -251,7 +251,7 @@ mod tests {
                 SpaceId(1),
                 DimensionVector::new(vec![10, 20]),
             ),
-            revision: RevisionId(1),
+            revision: RevisionId::legacy(1),
             data: vec![1, 2, 3],
         }
     }
@@ -278,7 +278,7 @@ mod tests {
 
         let mut writer = WalWriter::open(path.clone()).unwrap();
         writer.append(&sample_entry()).unwrap();
-        writer.append(&WalEntry::Checkpoint { revision: RevisionId(1) }).unwrap();
+        writer.append(&WalEntry::Checkpoint { revision: RevisionId::legacy(1) }).unwrap();
         drop(writer);
 
         let mut reader = WalReader::open(path).unwrap();
@@ -317,7 +317,7 @@ mod tests {
         writer.append(&sample_entry()).unwrap();
         let entries = vec![
             sample_entry(),
-            WalEntry::Checkpoint { revision: RevisionId(2) },
+            WalEntry::Checkpoint { revision: RevisionId::legacy(2) },
         ];
         writer.rewrite(&entries).unwrap();
         drop(writer);

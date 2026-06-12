@@ -1,9 +1,15 @@
 //! Frame query request types (M6).
 
+use std::collections::BTreeMap;
+
 use super::{
     address::{DimensionVector, RevisionId, SpaceId},
+    hlc::SessionId,
     provenance::FrameId,
 };
+
+/// Per-session stable revision pin for frame queries (Phase 5).
+pub type FrameVersionPin = BTreeMap<SessionId, RevisionId>;
 
 /// Options controlling frame query behavior.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -24,5 +30,7 @@ pub struct FrameQuery {
     pub min: DimensionVector,
     pub max: DimensionVector,
     pub as_of: Option<RevisionId>,
+    /// Per-session stable ceilings; when set, overrides scalar `as_of` (Phase 5).
+    pub version_vector: Option<FrameVersionPin>,
     pub options: FrameQueryOptions,
 }

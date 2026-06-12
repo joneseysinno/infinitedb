@@ -142,6 +142,7 @@ fn suppress_policy_removes_condemned_edges() {
             min,
             max,
             as_of: None,
+            version_vector: None,
             options: FrameQueryOptions::default(),
         })
         .unwrap();
@@ -197,6 +198,7 @@ fn annotate_policy_keeps_edges_with_judgments() {
             min,
             max,
             as_of: None,
+            version_vector: None,
             options: FrameQueryOptions::default(),
         })
         .unwrap();
@@ -252,6 +254,7 @@ fn select_contested_surfaces_conflict_judgments() {
             min,
             max,
             as_of: None,
+            version_vector: None,
             options: FrameQueryOptions::default(),
         })
         .unwrap();
@@ -272,13 +275,13 @@ fn provenance_diagnosis_in_frame_query() {
         name: "diag".into(),
         assertion_scope: AssertionScope::Spaces(vec![edge_space]),
         judgment_overlay: vec![],
-        default_as_of: Some(RevisionId(100)),
+        default_as_of: Some(RevisionId::legacy(100)),
     })
     .unwrap();
     let mut edge = directed_edge(1200, node(entity, 20), node(entity, 21));
     edge.authoring_frame = Some(AuthoringFrameProvenance {
         frame_id: ProvFrameId(99),
-        as_of: RevisionId(1),
+        as_of: RevisionId::legacy(1),
     });
     db.insert_hyperedge(edge_space, edge).unwrap();
     db.sync().unwrap();
@@ -289,7 +292,8 @@ fn provenance_diagnosis_in_frame_query() {
             testimony_space: edge_space,
             min,
             max,
-            as_of: Some(RevisionId(100)),
+            as_of: Some(RevisionId::legacy(100)),
+            version_vector: None,
             options: FrameQueryOptions {
                 include_diagnosis: true,
                 ..Default::default()
@@ -348,6 +352,7 @@ fn performance_contract_scan_count_bounded() {
             min,
             max,
             as_of: None,
+            version_vector: None,
             options: FrameQueryOptions::default(),
         })
         .unwrap();
@@ -419,6 +424,7 @@ fn traverse_in_frame_skips_suppressed_edges() {
                 as_of: None,
             },
             as_of: None,
+            version_vector: None,
             options: FrameQueryOptions::default(),
         })
         .unwrap();
@@ -476,6 +482,7 @@ fn retrospective_frame_lists_all_judgments() {
             min,
             max,
             as_of: None,
+            version_vector: None,
             options: FrameQueryOptions::default(),
         })
         .unwrap();

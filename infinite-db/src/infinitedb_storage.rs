@@ -9,6 +9,10 @@ pub mod cluster;
 pub mod hot_segment;
 /// Write-ahead logging and recovery.
 pub mod wal;
+/// Per-session WAL files (peer track Phase 3).
+pub mod session_wal;
+/// Per-session fast durability segments (peer track Phase 7).
+pub mod session_fast_segment;
 /// NVMe-friendly block store and cache.
 pub mod nvme;
 /// Block compaction routines.
