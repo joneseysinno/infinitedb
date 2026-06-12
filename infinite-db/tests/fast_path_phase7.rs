@@ -20,8 +20,17 @@ use infinite_db::infinitedb_storage::session_fast_segment::{
     SessionFastSegment, HEADER_LEN as FAST_HEADER_LEN,
 };
 use infinite_db::infinitedb_storage::session_wal::{SessionWalFrame, SessionWalReader};
-use infinite_db::{InfiniteDb, OpenOptions, TimedFastPathPolicy};
+use infinite_db::{InfiniteDb, OpenOptions, TimedFastPathPolicy, WriteSession};
 use tempfile::TempDir;
+
+fn commit_session(db: &InfiniteDb, session: &WriteSession) {
+    let durable = db.sync_session_wal(session).unwrap();
+    if session.has_pending_intent() {
+        db.commit_session_intent(session, &durable).unwrap();
+    } else {
+        db.sync().unwrap();
+    }
+}
 
 fn reset_fast_sync_test_hooks() {
     use infinite_db::infinitedb_storage::session_fast_segment::{
@@ -221,7 +230,7 @@ fn fast_path_crash_after_commit_survives_reopen() {
         vec![42],
     )
     .unwrap();
-    db.sync_session(&session).unwrap();
+    commit_session(&db, &session);
 
     let before_reopen = db.query(SpaceId(1), None).unwrap();
     assert_eq!(before_reopen.len(), 1);
@@ -264,7 +273,7 @@ fn fast_path_regression_uncommitted_not_visible_until_checkpoint() {
 }
 
 #[test]
-fn fast_path_regression_sync_session_compat() {
+fn fast_path_regression_commit_session_wal_and_intent() {
     let _guard = fast_path_test_lock();
     let (db, dir) = open_db_fast(Duration::from_secs(30));
     let session = db.open_session();
@@ -276,7 +285,8 @@ fn fast_path_regression_sync_session_compat() {
         vec![42],
     )
     .unwrap();
-    db.sync_session(&session).unwrap();
+    let durable = db.sync_session_wal(&session).unwrap();
+    db.commit_session_intent(&session, &durable).unwrap();
     assert_eq!(db.query(SpaceId(1), None).unwrap().len(), 1);
 
     let reopened = OpenOptions::default().open(dir.path()).unwrap();

@@ -15,6 +15,15 @@ use infinite_db::infinitedb_core::{
 };
 use tempfile::TempDir;
 
+fn commit_session(db: &InfiniteDb, session: &WriteSession) {
+    let durable = db.sync_session_wal(session).unwrap();
+    if session.has_pending_intent() {
+        db.commit_session_intent(session, &durable).unwrap();
+    } else {
+        db.sync().unwrap();
+    }
+}
+
 fn open_db() -> (InfiniteDb, TempDir, SpaceId) {
     open_db_with_policy(DerivationBackpressurePolicy::default())
 }
@@ -69,7 +78,7 @@ fn commit_hyperedge(
     let rev = db
         .insert_hyperedge_with_session(session, space, edge)
         .unwrap();
-    db.sync_session(session).unwrap();
+    commit_session(db, session);
     rev
 }
 
@@ -277,7 +286,7 @@ fn hash_partition_preserves_per_edge_order() {
         db.insert_hyperedge_with_session(&session, edge_space, edge)
             .unwrap();
     }
-    db.sync_session(&session).unwrap();
+    commit_session(&db, &session);
     db.sync_derivation();
     let edges = db
         .query_hyperedges_for_endpoint(edge_space, &hub, None)

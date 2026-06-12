@@ -126,15 +126,6 @@ impl WriteQueueSender {
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "I/O thread stopped"))
     }
 
-    /// Request sync and block until complete.
-    pub fn request_sync(&self) -> io::Result<()> {
-        let (done_tx, done_rx) = bounded(1);
-        self.post_sync(done_tx)?;
-        done_rx
-            .recv()
-            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "I/O thread stopped"))?
-    }
-
     /// Post a sync barrier without waiting (parallel fan-out).
     pub fn post_sync(&self, done: crossbeam_channel::Sender<io::Result<()>>) -> io::Result<()> {
         self.tx

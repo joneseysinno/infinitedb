@@ -15,6 +15,11 @@ use super::{
 )]
 pub struct ArbiterId(pub u64);
 
+/// Minimum arbiter id accepted by `register_arbiter_stream`.
+///
+/// Lower ids collide with reserved key-layout regions; production overlays should use ids ≥ this.
+pub const RESERVED_ARBITER_ID_THRESHOLD: u64 = 10;
+
 /// Judgment assertion identity within an arbiter stream.
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, Encode, Decode,

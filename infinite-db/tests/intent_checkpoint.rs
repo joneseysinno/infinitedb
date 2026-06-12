@@ -42,7 +42,7 @@ fn uncommitted_session_writes_not_visible_until_checkpoint() {
 }
 
 #[test]
-fn sync_session_commits_pending_intent_for_compat() {
+fn commit_session_wal_and_intent_persists_on_reopen() {
     let (db, dir) = open_db();
     let session = db.open_session();
     let sid = session.id();
@@ -53,7 +53,8 @@ fn sync_session_commits_pending_intent_for_compat() {
         vec![42],
     )
     .unwrap();
-    db.sync_session(&session).unwrap();
+    let durable = db.sync_session_wal(&session).unwrap();
+    db.commit_session_intent(&session, &durable).unwrap();
     assert_eq!(db.query(SpaceId(1), None).unwrap().len(), 1);
 
     let reopened = OpenOptions::default().open(dir.path()).unwrap();
@@ -133,8 +134,8 @@ fn session_wal_retains_intent_checkpoint_frame() {
     )
     .unwrap();
     let durable = db.sync_session_wal(&session).unwrap();
-    let cp = db.commit_session_intent(&session, &durable).unwrap();
-    assert_eq!(cp.kind, IntentOperationKind::Insert);
+    let outcome = db.commit_session_intent(&session, &durable).unwrap();
+    assert_eq!(outcome.checkpoint.kind, IntentOperationKind::Insert);
 
     let frames = SessionWalReader::open(dir.path(), sid)
         .unwrap()

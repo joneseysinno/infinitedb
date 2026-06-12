@@ -3,12 +3,21 @@
 use std::sync::Arc;
 use std::thread;
 
-use infinite_db::{InfiniteDb, OpenOptions};
+use infinite_db::{InfiniteDb, OpenOptions, WriteSession};
 use infinite_db::infinitedb_core::{
     address::{DimensionVector, SpaceId},
     hlc::{SessionId, GLOBAL_SESSION},
 };
 use tempfile::TempDir;
+
+fn commit_session(db: &InfiniteDb, session: &WriteSession) {
+    let durable = db.sync_session_wal(session).unwrap();
+    if session.has_pending_intent() {
+        db.commit_session_intent(session, &durable).unwrap();
+    } else {
+        db.sync().unwrap();
+    }
+}
 
 fn open_db() -> (InfiniteDb, TempDir) {
     let dir = TempDir::new().unwrap();
@@ -44,9 +53,9 @@ fn open_session_mints_distinct_hlc_stamps() {
     let s2 = db.open_session();
     assert_ne!(s1.id(), s2.id());
     assert_ne!(s1.id().0, GLOBAL_SESSION);
-    let a = s1.stamp();
-    let b = s1.stamp();
-    let c = s2.stamp();
+    let a = s1.stamp().unwrap();
+    let b = s1.stamp().unwrap();
+    let c = s2.stamp().unwrap();
     assert!(a < b);
     assert!(b < c || a.session() != c.session());
     assert!(!a.is_global_legacy());
@@ -62,9 +71,9 @@ fn concurrent_session_stamps_are_monotone_per_session() {
         let db = Arc::clone(&db);
         handles.push(thread::spawn(move || {
             let session = db.open_session();
-            let mut prev = session.stamp();
+            let mut prev = session.stamp().unwrap();
             for _ in 0..200 {
-                let next = session.stamp();
+                let next = session.stamp().unwrap();
                 assert!(prev < next);
                 assert_eq!(next.session(), session.id().0);
                 prev = next;
@@ -77,12 +86,32 @@ fn concurrent_session_stamps_are_monotone_per_session() {
 }
 
 #[test]
-fn read_txn_pins_version_vector_scalar_meet() {
+fn read_txn_pins_per_session_vector() {
     let (db, _dir) = open_db();
+    let s1 = db.open_session();
+    let s2 = db.open_session();
+    db.insert_with_session(
+        &s1,
+        SpaceId(1),
+        DimensionVector::new(vec![1, 0]),
+        vec![1],
+    )
+    .unwrap();
+    commit_session(&db, &s1);
     let txn = db.read();
     let vector = txn.version_vector();
     assert!(vector.get(SessionId(GLOBAL_SESSION)).is_some());
-    assert_eq!(txn.version_vector().scalar_meet(), db.stable_revision());
+    assert!(vector.get(s1.id()).is_some());
+
+    db.insert_with_session(
+        &s2,
+        SpaceId(1),
+        DimensionVector::new(vec![2, 0]),
+        vec![2],
+    )
+    .unwrap();
+    commit_session(&db, &s2);
+    assert_eq!(txn.query(SpaceId(1)).unwrap().len(), 1);
 }
 
 #[test]
@@ -90,8 +119,8 @@ fn per_session_watermarks_are_independent() {
     let (db, _dir) = open_db();
     let slow = db.open_session();
     let fast = db.open_session();
-    let held = slow.stamp();
-    let fast_rev = fast.stamp();
+    let held = slow.stamp().unwrap();
+    let fast_rev = fast.stamp().unwrap();
     let slow_stable = db.stable_for_session(slow.id());
     let fast_stable = db.stable_for_session(fast.id());
     assert!(

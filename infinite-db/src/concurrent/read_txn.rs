@@ -1,22 +1,24 @@
 //! Point-in-time read transaction.
 //!
-//! Pin a concurrent read view at a revision ceiling so queries do not observe
-//! in-flight writes. Obtain one from [`InfiniteDb::read`].
+//! Pin a concurrent read view at per-session stable ceilings so queries do not
+//! observe in-flight writes. Obtain one from [`InfiniteDb::read`].
 //!
-//! Phase 2: pins a **version vector** (per-session stable ceilings) with a scalar
-//! meet available as the default `as_of` ceiling.
+//! Repeatable read: no admitted session's stable component moves under the
+//! pinned vector for the lifetime of this transaction.
 //!
 //! ```no_run
 //! use infinite_db::InfiniteDb;
 //! use infinite_db::infinitedb_core::address::SpaceId;
+//! use infinite_db::EngineError;
 //!
-//! # fn example(db: &InfiniteDb) -> std::io::Result<()> {
+//! # fn example(db: &InfiniteDb) -> Result<(), EngineError> {
 //! let txn = db.read();
 //! let rows = txn.query(SpaceId(1))?;
 //! # Ok(())
 //! # }
 //! ```
 
+use crate::engine::error::EngineError;
 use crate::engine::query::{query_inner, space_key};
 use crate::engine::session::VersionVector;
 use crate::infinitedb_core::{
@@ -27,33 +29,42 @@ use crate::infinitedb_core::{
 };
 use crate::InfiniteDb;
 
-/// Concurrent read view pinned at a revision ceiling.
+/// How this read view resolves revision ceilings.
+#[derive(Debug, Clone)]
+enum ReadVisibility {
+    /// Per-session pin captured at open (D-P6).
+    Vector(VersionVector),
+    /// Explicit scalar ceiling — meaningful within one epoch/stream only.
+    Scalar(RevisionId),
+}
+
+/// Concurrent read view pinned at per-session stable revisions.
 pub struct ReadTxn<'a> {
     db: &'a InfiniteDb,
     branch: BranchId,
-    as_of: Option<RevisionId>,
-    version_vector: VersionVector,
+    visibility: ReadVisibility,
+    /// Snapshot at open — always available for inspection.
+    captured_vector: VersionVector,
 }
 
 impl<'a> ReadTxn<'a> {
-    /// Pin reads at the scalar meet of per-session stable revisions on `main`.
+    /// Pin reads at each admitted session's stable revision on `main`.
     ///
-    /// Queries through this view are repeatable: the visible record set at the
-    /// pinned revision cannot change while the transaction is held.
+    /// Queries through this view are repeatable: the visible record set cannot
+    /// change while the transaction is held.
     pub fn new(db: &'a InfiniteDb) -> Self {
-        let version_vector = db.capture_version_vector();
-        let as_of = Some(version_vector.scalar_meet());
+        let captured_vector = db.capture_version_vector();
         Self {
             db,
             branch: BranchId::MAIN,
-            as_of,
-            version_vector,
+            visibility: ReadVisibility::Vector(captured_vector.clone()),
+            captured_vector,
         }
     }
 
-    /// Per-session stable ceilings captured at transaction open (Phase 2).
+    /// Per-session stable ceilings captured at transaction open.
     pub fn version_vector(&self) -> &VersionVector {
-        &self.version_vector
+        &self.captured_vector
     }
 
     /// Read through a branch overlay instead of `main`.
@@ -62,15 +73,34 @@ impl<'a> ReadTxn<'a> {
         self
     }
 
-    /// Override the revision ceiling for this read view.
+    /// Switch to explicit scalar ceiling mode (within-one-stream caveat applies).
     pub fn as_of(mut self, rev: RevisionId) -> Self {
-        self.as_of = Some(rev);
+        self.visibility = ReadVisibility::Scalar(rev);
         self
     }
 
+    fn pinned_vector(&self) -> Option<&VersionVector> {
+        match &self.visibility {
+            ReadVisibility::Vector(v) => Some(v),
+            ReadVisibility::Scalar(_) => None,
+        }
+    }
+
+    fn scalar_as_of(&self) -> Option<RevisionId> {
+        match &self.visibility {
+            ReadVisibility::Vector(_) => None,
+            ReadVisibility::Scalar(r) => Some(*r),
+        }
+    }
+
     /// Query all live records in `space` within this read view.
-    pub fn query(&self, space: SpaceId) -> std::io::Result<Vec<Record>> {
-        self.db.query_on_branch(self.branch, space, self.as_of)
+    pub fn query(&self, space: SpaceId) -> Result<Vec<Record>, EngineError> {
+        self.db.query_on_branch_pinned(
+            self.branch,
+            space,
+            self.scalar_as_of(),
+            self.pinned_vector(),
+        )
     }
 
     /// Bounding-box query within this read view.
@@ -79,17 +109,21 @@ impl<'a> ReadTxn<'a> {
         space: SpaceId,
         min: DimensionVector,
         max: DimensionVector,
-    ) -> std::io::Result<Vec<Record>> {
-        self.db
-            .query_bbox_on_branch(self.branch, space, min, max, self.as_of)
+    ) -> Result<Vec<Record>, EngineError> {
+        self.db.query_bbox_on_branch_pinned(
+            self.branch,
+            space,
+            min,
+            max,
+            self.scalar_as_of(),
+            self.pinned_vector(),
+        )
     }
 
     /// Execute a [`Query`] descriptor against this read view.
-    ///
-    /// When `q.range` is set, an exact per-record coordinate filter is applied
-    /// so results match [`InfiniteDb::query_bbox`].
-    pub fn execute(&self, q: &Query) -> std::io::Result<Vec<Record>> {
-        let as_of = q.as_of.or(self.as_of);
+    pub fn execute(&self, q: &Query) -> Result<Vec<Record>, EngineError> {
+        let as_of = q.as_of.or(self.scalar_as_of());
+        let pinned = self.pinned_vector();
         let spaces = self.db.spaces.read();
         let key_range = match q.key_range {
             Some(kr) => Some(kr),
@@ -113,18 +147,19 @@ impl<'a> ReadTxn<'a> {
         let mut results = query_inner(
             &self.db.store,
             &self.db.snapshots,
-            ctx.live_tail,
-            ctx.space_tails,
+            None,
             &spaces,
             &self.db.session_watermarks,
             q.space,
             key_range,
             as_of,
+            pinned,
             q.include_tombstones,
-            ctx.hilbert_tails,
+            Some(ctx.hilbert_tails),
             Some(&self.db.branch_overlays),
             branch_id,
-        )?;
+        )
+        .map_err(EngineError::from)?;
 
         if let Some(range) = &q.range {
             results.retain(|r| r.address.point.within(&range.min, &range.max));

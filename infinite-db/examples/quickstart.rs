@@ -2,14 +2,13 @@
 
 use infinite_db::infinitedb_core::address::{DimensionVector, SpaceId};
 use infinite_db::infinitedb_core::space::SpaceConfig;
-use infinite_db::InfiniteDb;
+use infinite_db::{EngineError, InfiniteDb};
 
-fn main() -> std::io::Result<()> {
+fn main() -> Result<(), EngineError> {
     let dir = std::env::temp_dir().join("infinite-db-quickstart");
     let db = InfiniteDb::open(&dir)?;
 
-    db.register_space(SpaceConfig::new(SpaceId(1), "demo", 2))
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+    db.register_space(SpaceConfig::new(SpaceId(1), "demo", 2))?;
     db.insert(SpaceId(1), DimensionVector::new(vec![0, 0]), vec![1, 2, 3])?;
     db.sync()?;
 

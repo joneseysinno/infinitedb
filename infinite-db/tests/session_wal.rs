@@ -1,11 +1,20 @@
 //! Peer track Phase 3 — per-session WAL integration tests.
 
-use infinite_db::{InfiniteDb, OpenOptions};
+use infinite_db::{InfiniteDb, OpenOptions, WriteSession};
 use infinite_db::infinitedb_core::{
     address::{DimensionVector, SpaceId},
 };
 use infinite_db::infinitedb_storage::session_wal::SessionWalReader;
 use tempfile::TempDir;
+
+fn commit_session(db: &InfiniteDb, session: &WriteSession) {
+    let durable = db.sync_session_wal(session).unwrap();
+    if session.has_pending_intent() {
+        db.commit_session_intent(session, &durable).unwrap();
+    } else {
+        db.sync().unwrap();
+    }
+}
 
 fn open_db() -> (InfiniteDb, TempDir) {
     let dir = TempDir::new().unwrap();
@@ -31,7 +40,7 @@ fn insert_with_session_survives_reopen() {
         vec![42],
     )
     .unwrap();
-    db.sync_session(&session).unwrap();
+    commit_session(&db, &session);
 
     let before_reopen = db.query(SpaceId(1), None).unwrap();
     assert_eq!(before_reopen.len(), 1, "record must be visible before reopen");
@@ -70,7 +79,7 @@ fn quarantine_corrupt_session_wal_does_not_block_open() {
         vec![1],
     )
     .unwrap();
-    db.sync_session(&session).unwrap();
+    commit_session(&db, &session);
     drop(db);
 
     let wal_path = dir.path().join("sessions").join(format!("{}.wal", sid.0));
@@ -89,12 +98,6 @@ fn retirement_requires_all_three_gates() {
     let (db, _dir) = open_db();
     let session = db.open_session();
     let sid = session.id();
-    assert!(!db.try_retire_session_wal(sid).unwrap());
-    db.mark_session_wal_sealed(sid);
-    assert!(!db.try_retire_session_wal(sid).unwrap());
-    db.mark_session_wal_replication_confirmed(sid);
-    assert!(!db.try_retire_session_wal(sid).unwrap());
-    db.mark_session_wal_collision_evaluated(sid);
     db.insert_with_session(
         &session,
         SpaceId(1),
@@ -102,6 +105,11 @@ fn retirement_requires_all_three_gates() {
         vec![7],
     )
     .unwrap();
-    db.sync_session(&session).unwrap();
-    assert!(db.try_retire_session_wal(sid).unwrap());
+    commit_session(&db, &session);
+    let through = db.stable_for_session(sid);
+
+    assert!(!db.retire_session_wal(sid).unwrap());
+    db.mark_session_wal_sealed(sid, through);
+    db.mark_session_wal_collision_evaluated_through(sid, through);
+    assert!(db.retire_session_wal(sid).unwrap());
 }

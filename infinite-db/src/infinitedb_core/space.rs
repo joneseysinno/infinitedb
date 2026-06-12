@@ -23,6 +23,23 @@ impl Default for CompactionPolicy {
     }
 }
 
+/// Retention policy for companion `{name}_errors` spaces (resolved records only).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Encode, Decode, PartialEq, Eq)]
+pub struct ErrorRetentionPolicy {
+    /// Maximum tombstone-resolved error records to retain; older resolved pairs are compacted away.
+    #[serde(default)]
+    pub max_resolved_keep: Option<usize>,
+}
+
+impl ErrorRetentionPolicy {
+    /// Retain at most `n` most recently resolved error records.
+    pub fn keep_latest_resolved(n: usize) -> Self {
+        Self {
+            max_resolved_keep: Some(n),
+        }
+    }
+}
+
 /// Endpoint reverse-index coordinate layout (reserved `ENDPOINT_INDEX_SPACE` only).
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, Encode, Decode,
@@ -66,6 +83,9 @@ pub struct SpaceConfig {
     /// When true, do not auto-register a companion error space on registration.
     #[serde(default)]
     pub skip_error_space: bool,
+    /// Optional retention for resolved records in the companion error space.
+    #[serde(default)]
+    pub error_retention: Option<ErrorRetentionPolicy>,
 }
 
 impl SpaceConfig {
@@ -81,6 +101,7 @@ impl SpaceConfig {
             endpoint_index_layout: EndpointIndexLayout::default(),
             error_space: None,
             skip_error_space: false,
+            error_retention: None,
         }
     }
 
@@ -111,6 +132,12 @@ impl SpaceConfig {
     /// Link an existing companion error space.
     pub fn with_error_space(mut self, error_space: SpaceId) -> Self {
         self.error_space = Some(error_space);
+        self
+    }
+
+    /// Retention policy for resolved records in the companion error space.
+    pub fn with_error_retention(mut self, policy: ErrorRetentionPolicy) -> Self {
+        self.error_retention = Some(policy);
         self
     }
 

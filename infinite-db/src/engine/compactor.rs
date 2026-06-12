@@ -82,8 +82,8 @@ pub fn policy_to_settings(policy: &CompactionPolicy) -> (CompactionConfig, Optio
     }
 }
 
-/// Compact small blocks in a shard after seal when block count exceeds threshold.
-pub fn maybe_compact_after_seal(
+/// Compact blocks in a shard when at least `min_blocks` candidates are present.
+pub fn compact_space_now(
     store: &BlockStore,
     snapshots: &SnapshotStore,
     live_tail: &LiveTailView,
@@ -93,6 +93,7 @@ pub fn maybe_compact_after_seal(
     shard_filter: Option<ShardRef>,
     policy_overrides: Option<&CompactionPolicyOverrides>,
     branch_overlays: Option<&BranchOverlayStore>,
+    min_blocks: usize,
 ) -> io::Result<()> {
     let view = live_tail.load_view();
     let candidates: Vec<(HilbertKey, BlockIndexEntry)> = view
@@ -105,8 +106,7 @@ pub fn maybe_compact_after_seal(
         .map(|(k, e)| (*k, *e))
         .collect();
 
-    const TIER_THRESHOLD: usize = 8;
-    if candidates.len() < TIER_THRESHOLD {
+    if candidates.len() < min_blocks {
         return Ok(());
     }
 
@@ -192,4 +192,31 @@ pub fn maybe_compact_after_seal(
     let _ = gc_superseded_blocks(store, &result.superseded, &live)?;
 
     Ok(())
+}
+
+/// Compact small blocks in a shard after seal when block count exceeds threshold.
+pub fn maybe_compact_after_seal(
+    store: &BlockStore,
+    snapshots: &SnapshotStore,
+    live_tail: &LiveTailView,
+    spaces: &RwLock<SpaceRegistry>,
+    next_block_id: &std::sync::atomic::AtomicU64,
+    space: SpaceId,
+    shard_filter: Option<ShardRef>,
+    policy_overrides: Option<&CompactionPolicyOverrides>,
+    branch_overlays: Option<&BranchOverlayStore>,
+) -> io::Result<()> {
+    const TIER_THRESHOLD: usize = 8;
+    compact_space_now(
+        store,
+        snapshots,
+        live_tail,
+        spaces,
+        next_block_id,
+        space,
+        shard_filter,
+        policy_overrides,
+        branch_overlays,
+        TIER_THRESHOLD,
+    )
 }

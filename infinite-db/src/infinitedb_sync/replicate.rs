@@ -1,10 +1,10 @@
 //! Branch-aware replication helpers for [`crate::InfiniteDb`].
 
 use std::collections::HashMap;
-use std::io;
 
 use bincode::{config::standard, encode_to_vec};
 
+use crate::engine::error::EngineError;
 use crate::engine::query::address_key;
 use crate::infinitedb_core::{
     address::{DimensionVector, RevisionId, SpaceId},
@@ -48,7 +48,7 @@ pub fn snapshot_merkle(
     db: &InfiniteDb,
     space: SpaceId,
     branch: BranchId,
-) -> io::Result<MerkleTree> {
+) -> Result<MerkleTree, EngineError> {
     let spaces = db.spaces.read();
     let records = latest_per_address(&spaces, db.query_on_branch(branch, space, None)?);
     let mut leaves = Vec::with_capacity(records.len());
@@ -57,7 +57,9 @@ pub fn snapshot_merkle(
             (&record.address, &record.data, record.tombstone),
             standard(),
         )
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        .map_err(|e| EngineError::Other {
+            message: e.to_string(),
+        })?;
         leaves.push(merkle::hash_record(&encoded));
     }
     Ok(MerkleTree::build(&leaves))
@@ -68,7 +70,7 @@ pub fn branch_sync_state(
     db: &InfiniteDb,
     space: SpaceId,
     branch: BranchId,
-) -> io::Result<BranchSyncState> {
+) -> Result<BranchSyncState, EngineError> {
     Ok(BranchSyncState {
         branch,
         merkle_root: snapshot_merkle(db, space, branch)?.root(),
@@ -97,7 +99,7 @@ pub fn converge_main_records(
     local: &InfiniteDb,
     remote: &InfiniteDb,
     space: SpaceId,
-) -> io::Result<()> {
+) -> Result<(), EngineError> {
     remote.sync()?;
     let remote_records = remote.query(space, None)?;
     let local_records = local.query(space, None)?;
@@ -138,16 +140,15 @@ pub fn converge_with_branch_merge(
     space: SpaceId,
     remote_branch: BranchId,
     strategy: MergeStrategy,
-) -> io::Result<()> {
+) -> Result<(), EngineError> {
     converge_main_records(local, remote, space)?;
     let imported = import_branch_overlay(local, remote, remote_branch, "sync-import")
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        .map_err(|e| EngineError::Other { message: e })?;
     let result = local.merge_branch(BranchId::MAIN, imported, strategy, None)?;
     if !result.conflicts.is_empty() {
-        return Err(io::Error::new(
-            io::ErrorKind::Other,
-            format!("sync merge left {} conflicts", result.conflicts.len()),
-        ));
+        return Err(EngineError::Other {
+            message: format!("sync merge left {} conflicts", result.conflicts.len()),
+        });
     }
     local.flush(space)?;
     local.sync()

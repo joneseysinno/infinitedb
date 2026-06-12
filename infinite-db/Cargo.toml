@@ -78,11 +78,6 @@ path = "tests/concurrent_db.rs"
 required-features = ["embedded"]
 
 [[test]]
-name = "concurrent_db_phase_b"
-path = "tests/concurrent_db_phase_b.rs"
-required-features = ["embedded"]
-
-[[test]]
 name = "concurrent_db_phase_c"
 path = "tests/concurrent_db_phase_c.rs"
 required-features = ["embedded"]

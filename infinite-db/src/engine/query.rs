@@ -28,7 +28,6 @@ use super::session::{SessionWatermarks, VersionVector};
 use super::hilbert_live_tails::HilbertLiveTails;
 use super::live_tail::LiveTailView;
 use super::snapshot_store::SnapshotStore;
-use super::space_live_tails::SpaceLiveTails;
 
 /// Return the cached Hilbert key on `record`, or compute it when unset (legacy blocks).
 pub fn record_hilbert_key(spaces: &SpaceRegistry, record: &Record) -> HilbertKey {
@@ -80,7 +79,6 @@ fn live_tail_for_space(
     spaces: &SpaceRegistry,
     space: SpaceId,
     live_tail: Option<&LiveTailView>,
-    space_live_tails: Option<&SpaceLiveTails>,
     hilbert_live_tails: Option<&HilbertLiveTails>,
     shard_filter: Option<ShardRef>,
 ) -> Vec<Record> {
@@ -107,12 +105,6 @@ fn live_tail_for_space(
                 .filter(|r| r.address.space == space)
                 .collect();
         }
-    }
-    if let Some(tails) = space_live_tails {
-        return tails
-            .get(space)
-            .map(|t| t.snapshot())
-            .unwrap_or_default();
     }
     live_tail
         .map(|t| t.snapshot())
@@ -152,7 +144,6 @@ fn block_entries_for_space(
     snapshots: &SnapshotStore,
     key_filter: KeyFilter<'_>,
     live_tail: Option<&LiveTailView>,
-    space_live_tails: Option<&SpaceLiveTails>,
     hilbert_live_tails: Option<&HilbertLiveTails>,
     shard_filter: Option<ShardRef>,
 ) -> Vec<(HilbertKey, BlockIndexEntry)> {
@@ -184,17 +175,6 @@ fn block_entries_for_space(
                 }
             }
             return entries;
-        }
-    }
-    if let Some(tails) = space_live_tails {
-        if let Some(tail) = tails.get(space) {
-            let view = tail.load_view();
-            return view
-                .blocks
-                .iter()
-                .filter(|(min_key, entry)| overlaps(**min_key, entry.max_key))
-                .map(|(k, e)| (*k, e.clone()))
-                .collect();
         }
     }
     let _ = live_tail;
@@ -289,6 +269,49 @@ where
     }
 }
 
+/// Per-session visibility under a strict vector pin (D-P6: absent session → invisible).
+pub(crate) fn record_visible_at_strict_pinned(
+    record: &Record,
+    vector: &VersionVector,
+) -> bool {
+    let session = SessionId(record.revision.session());
+    vector
+        .get(session)
+        .is_some_and(|ceiling| record.revision <= ceiling)
+}
+
+/// Latest-wins visibility with a strict version-vector pin (ReadTxn / D-P6).
+pub(crate) fn resolve_visibility_strict_pin(
+    spaces: &SpaceRegistry,
+    candidates: Vec<Record>,
+    vector: &VersionVector,
+    include_tombstones: bool,
+) -> Vec<Record> {
+    if include_tombstones {
+        return candidates;
+    }
+
+    let mut latest: HashMap<AddressKey, Record> = HashMap::new();
+    for record in candidates {
+        if !record_visible_at_strict_pinned(&record, vector) {
+            continue;
+        }
+        let key = address_key(spaces, &record);
+        let replace = match latest.get(&key) {
+            None => true,
+            Some(existing) => record.revision > existing.revision,
+        };
+        if replace {
+            latest.insert(key, record);
+        }
+    }
+
+    latest
+        .into_values()
+        .filter(|r| !r.tombstone)
+        .collect()
+}
+
 /// Apply latest-wins visibility with a scalar or version-vector ceiling (Phase 5).
 pub(crate) fn resolve_visibility_with_pin<F>(
     spaces: &SpaceRegistry,
@@ -366,22 +389,28 @@ pub(crate) fn resolve_visibility(
 /// Visibility rule: an address is visible iff its highest revision ≤ the ceiling
 /// is a live record; exactly one record per address is returned unless
 /// `include_tombstones` is set (which preserves full revision history).
+///
+/// When `pinned_vector` is set, visibility is per-session (D-P6): a record is
+/// visible iff `record.revision ≤ vector[record.session]` and the session is
+/// present in the pin.
 pub fn query_inner(
     store: &BlockStore,
     snapshots: &SnapshotStore,
     live_tail: Option<&LiveTailView>,
-    space_live_tails: Option<&SpaceLiveTails>,
     spaces: &SpaceRegistry,
     watermark: &SessionWatermarks,
     space: SpaceId,
     key_range: Option<(u128, u128)>,
     as_of: Option<RevisionId>,
+    pinned_vector: Option<&VersionVector>,
     include_tombstones: bool,
     hilbert_live_tails: Option<&HilbertLiveTails>,
     branch_overlays: Option<&BranchOverlayStore>,
     branch_id: Option<BranchId>,
 ) -> std::io::Result<Vec<Record>> {
-    let rev_ceiling = as_of.unwrap_or_else(|| watermark.allocated());
+    let rev_ceiling = pinned_vector
+        .map(|v| v.fetch_ceiling())
+        .unwrap_or_else(|| as_of.unwrap_or_else(|| watermark.allocated()));
 
     let key_filter = match key_range {
         None => KeyFilter::All,
@@ -400,7 +429,6 @@ pub fn query_inner(
             spaces,
             space,
             live_tail,
-            space_live_tails,
             hilbert_live_tails,
             None,
         )
@@ -434,7 +462,6 @@ pub fn query_inner(
                 snapshots,
                 key_filter,
                 live_tail,
-                space_live_tails,
                 hilbert_live_tails,
                 None,
             )
@@ -446,7 +473,6 @@ pub fn query_inner(
             snapshots,
             key_filter,
             live_tail,
-            space_live_tails,
             hilbert_live_tails,
             None,
         )
@@ -474,25 +500,34 @@ pub fn query_inner(
         candidates.push(record);
     }
 
-    Ok(resolve_visibility(
-        spaces,
-        candidates,
-        rev_ceiling,
-        include_tombstones,
-    ))
+    if let Some(vector) = pinned_vector {
+        Ok(resolve_visibility_strict_pin(
+            spaces,
+            candidates,
+            vector,
+            include_tombstones,
+        ))
+    } else {
+        Ok(resolve_visibility(
+            spaces,
+            candidates,
+            rev_ceiling,
+            include_tombstones,
+        ))
+    }
 }
 
 pub fn query_bbox(
     store: &BlockStore,
     snapshots: &SnapshotStore,
     live_tail: Option<&LiveTailView>,
-    space_live_tails: Option<&SpaceLiveTails>,
     spaces: &SpaceRegistry,
     watermark: &SessionWatermarks,
     space: SpaceId,
     min: DimensionVector,
     max: DimensionVector,
     as_of: Option<RevisionId>,
+    pinned_vector: Option<&VersionVector>,
     hilbert_live_tails: Option<&HilbertLiveTails>,
     branch_overlays: Option<&BranchOverlayStore>,
     branch_id: Option<BranchId>,
@@ -506,7 +541,9 @@ pub fn query_bbox(
     let intervals = decompose_bbox(&min, &max, bits);
     let _ = intervals;
     record_interval_scan(1);
-    let rev_ceiling = as_of.unwrap_or_else(|| watermark.allocated());
+    let rev_ceiling = pinned_vector
+        .map(|v| v.fetch_ceiling())
+        .unwrap_or_else(|| as_of.unwrap_or_else(|| watermark.allocated()));
 
     let shard_filter = shard_bits.map(|sb| {
         let mut shard_ids = std::collections::BTreeSet::new();
@@ -530,7 +567,6 @@ pub fn query_bbox(
             spaces,
             space,
             live_tail,
-            space_live_tails,
             hilbert_live_tails,
             None,
         )
@@ -556,7 +592,6 @@ pub fn query_bbox(
                 snapshots,
                 key_filter,
                 live_tail,
-                space_live_tails,
                 hilbert_live_tails,
                 shard_bits.map(|sb| {
                     let first = intervals
@@ -574,7 +609,6 @@ pub fn query_bbox(
             snapshots,
             key_filter,
             live_tail,
-            space_live_tails,
             hilbert_live_tails,
             shard_bits.map(|sb| {
                 let first = intervals
@@ -614,7 +648,11 @@ pub fn query_bbox(
         candidates.push(record);
     }
 
-    let mut results = resolve_visibility(spaces, candidates, rev_ceiling, false);
+    let mut results = if let Some(vector) = pinned_vector {
+        resolve_visibility_strict_pin(spaces, candidates, vector, false)
+    } else {
+        resolve_visibility(spaces, candidates, rev_ceiling, false)
+    };
     results.retain(|r| r.address.point.within(&min, &max));
     Ok(results)
 }

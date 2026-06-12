@@ -20,7 +20,8 @@ use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 
 use crossbeam_channel::{unbounded, Sender};
-use parking_lot::Mutex;
+use parking_lot::{Condvar, Mutex};
+use std::time::Duration;
 
 use crate::engine::error::EngineError;
 use crate::engine::hypergraph::HypergraphWriteRow;
@@ -95,6 +96,7 @@ pub struct DerivationBus {
     watermarks: Arc<WatermarkRegistry>,
     stats: Arc<Mutex<DerivationStats>>,
     pending: Arc<AtomicU64>,
+    idle: Arc<(Mutex<()>, Condvar)>,
     policy: DerivationBackpressurePolicy,
     workers: Mutex<Vec<JoinHandle<()>>>,
     shutdown: Arc<AtomicBool>,
@@ -119,6 +121,7 @@ impl DerivationBus {
 
         let stats = Arc::new(Mutex::new(DerivationStats::default()));
         let pending = Arc::new(AtomicU64::new(0));
+        let idle = Arc::new((Mutex::new(()), Condvar::new()));
         let shutdown = Arc::new(AtomicBool::new(false));
 
         let shared = Arc::new(BusState {
@@ -134,13 +137,18 @@ impl DerivationBus {
             let shared = Arc::clone(&shared);
             let shutdown = Arc::clone(&shutdown);
             let pending_counter = Arc::clone(&pending);
+            let idle_signal = Arc::clone(&idle);
             workers.push(thread::spawn(move || {
                 let _shutdown = shutdown;
                 while let Ok(event) = rx.recv() {
                     if let Err(e) = shared.process_event(event.clone()) {
                         shared.record_failure(&event, e);
                     }
-                    pending_counter.fetch_sub(1, Ordering::AcqRel);
+                    if pending_counter.fetch_sub(1, Ordering::AcqRel) == 1 {
+                        let (lock, cvar) = &*idle_signal;
+                        cvar.notify_all();
+                        let _ = lock;
+                    }
                 }
             }));
         }
@@ -150,6 +158,7 @@ impl DerivationBus {
             watermarks,
             stats,
             pending,
+            idle,
             policy,
             workers: Mutex::new(workers),
             shutdown,
@@ -168,22 +177,10 @@ impl DerivationBus {
         self.watermarks.failed_derivations()
     }
 
-    pub fn endpoint_index_watermark(&self) -> RevisionId {
-        self.watermarks
-            .get("endpoint_index")
-            .unwrap_or(RevisionId::ZERO)
-    }
-
     pub fn endpoint_index_watermark_vector(&self) -> VersionVector {
         self.watermarks
             .get_vector("endpoint_index")
             .unwrap_or_default()
-    }
-
-    pub fn flow_vector_index_watermark(&self) -> RevisionId {
-        self.watermarks
-            .get("flow_vector_index")
-            .unwrap_or(RevisionId::ZERO)
     }
 
     pub fn flow_vector_index_watermark_vector(&self) -> VersionVector {
@@ -240,8 +237,25 @@ impl DerivationBus {
 
     /// Block until all queued events are processed.
     pub fn flush(&self) {
+        let (lock, cvar) = &*self.idle;
+        let mut guard = lock.lock();
         while self.pending.load(Ordering::Acquire) > 0 {
-            thread::yield_now();
+            cvar.wait(&mut guard);
+        }
+    }
+
+    /// Block until derivation watermarks for `session` reach `through`.
+    pub fn wait_for_session(&self, session: SessionId, through: RevisionId) {
+        let (lock, cvar) = &*self.idle;
+        let mut guard = lock.lock();
+        loop {
+            if self.watermarks.min_complete_for_session(session) >= through {
+                return;
+            }
+            if self.pending.load(Ordering::Acquire) == 0 {
+                return;
+            }
+            cvar.wait_for(&mut guard, Duration::from_millis(10));
         }
     }
 

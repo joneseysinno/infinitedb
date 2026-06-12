@@ -13,7 +13,7 @@ use infinite_db::infinitedb_core::branch::BranchId;
 use infinite_db::infinitedb_core::query::Query;
 use infinite_db::infinitedb_core::snapshot::SnapshotId;
 use infinite_db::infinitedb_core::space::{CompactionPolicy, SpaceConfig};
-use infinite_db::{InfiniteDb, OpenOptions, FORMAT_VERSION_V2};
+use infinite_db::{InfiniteDb, OpenOptions, FORMAT_VERSION_V4};
 use tempfile::TempDir;
 
 fn space(id: u64, dims: usize) -> SpaceConfig {
@@ -387,37 +387,6 @@ fn stable_revision_lag_and_catch_up() {
 }
 
 #[test]
-fn v2_seal_partitions_interleaved_spaces() {
-    let dir = TempDir::new().unwrap();
-    let db = OpenOptions {
-        format_version: Some(FORMAT_VERSION_V2),
-        ..Default::default()
-    }
-    .open(dir.path())
-    .unwrap();
-    let space_a = SpaceId(10);
-    let space_b = SpaceId(20);
-    db.register_space(space(space_a.0, 2)).unwrap();
-    db.register_space(space(space_b.0, 2)).unwrap();
-
-    db.insert(space_a, DimensionVector::new(vec![1, 1]), vec![1])
-        .unwrap();
-    db.insert(space_b, DimensionVector::new(vec![2, 2]), vec![2])
-        .unwrap();
-    db.sync().unwrap();
-    db.flush(space_a).unwrap();
-
-    let b_rows = db.query(space_b, None).unwrap();
-    assert_eq!(b_rows.len(), 1);
-    assert_eq!(b_rows[0].data, vec![2]);
-
-    db.flush(space_b).unwrap();
-    let a_rows = db.query(space_a, None).unwrap();
-    assert_eq!(a_rows.len(), 1);
-    assert_eq!(a_rows[0].data, vec![1]);
-}
-
-#[test]
 fn endpoint_space_multi_shard_writes_isolated() {
     let dir = TempDir::new().unwrap();
     let db = InfiniteDb::open(dir.path()).unwrap();
@@ -606,7 +575,7 @@ fn latest_only_compaction_drops_history() {
 fn branch_base_blocks_survive_main_compaction() {
     let dir = TempDir::new().unwrap();
     let mut opts = OpenOptions::default();
-    opts.format_version = Some(FORMAT_VERSION_V2);
+    opts.format_version = Some(FORMAT_VERSION_V4);
     opts.io_thread.hot_segment_seal_bytes = 64;
     let db = opts.open(dir.path()).unwrap();
     let space_id = SpaceId(1);
@@ -653,7 +622,7 @@ fn branch_base_blocks_survive_main_compaction() {
 fn compaction_removes_superseded_blocks_without_branches() {
     let dir = TempDir::new().unwrap();
     let mut opts = OpenOptions::default();
-    opts.format_version = Some(FORMAT_VERSION_V2);
+    opts.format_version = Some(FORMAT_VERSION_V4);
     opts.io_thread.hot_segment_seal_bytes = 64;
     let db = opts.open(dir.path()).unwrap();
     let space_id = SpaceId(1);

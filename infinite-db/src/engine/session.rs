@@ -15,7 +15,7 @@ use crate::infinitedb_core::{
 use crate::infinitedb_storage::wal::WalEntry;
 
 use super::derivation::AssertionEvent;
-use super::hlc_clock::HlcClock;
+use super::hlc_clock::{ClockSkewError, HlcClock};
 use super::session_wal_store::{SessionWalMeta, SessionWalStore};
 use super::timed_fast_path::DurabilityMedium;
 use super::watermark::{FailedRevision, RevisionRange, RevisionWatermark};
@@ -129,8 +129,16 @@ impl Default for VersionVector {
 
 impl VersionVector {
     /// Scalar meet — minimum stable component across admitted sessions.
+    ///
+    /// Pre-dates plural epochs; meaningful only within a single stream. Prefer
+    /// per-session [`Self::get`] for cross-session visibility (D-P6).
     pub fn scalar_meet(&self) -> RevisionId {
         self.0.values().min().copied().unwrap_or(RevisionId::ZERO)
+    }
+
+    /// Maximum pinned component — conservative fetch ceiling for vector pins.
+    pub fn fetch_ceiling(&self) -> RevisionId {
+        self.0.values().max().copied().unwrap_or(RevisionId::ZERO)
     }
 
     pub fn get(&self, session: SessionId) -> Option<RevisionId> {
@@ -216,7 +224,9 @@ impl SessionWatermarks {
             .unwrap_or(RevisionId::ZERO)
     }
 
-    /// Scalar stable ceiling — meet of per-session stables (frame convenience).
+    /// Scalar stable ceiling — meet of per-session stables (admit-everything frame default).
+    ///
+    /// Pre-dates plural epochs; not a cross-session visibility ceiling under HLC.
     pub fn stable_revision(&self) -> RevisionId {
         self.scalar_stable_meet()
     }
@@ -410,32 +420,32 @@ impl WriteSession {
     }
 
     /// Validate → stamp → register outstanding (Phase 2 write path).
-    pub fn stamp(&self) -> RevisionId {
+    pub fn stamp(&self) -> Result<RevisionId, ClockSkewError> {
         if self.id.0 == GLOBAL_SESSION {
-            self.watermarks.session_zero().allocate()
+            Ok(self.watermarks.session_zero().allocate())
         } else {
-            let stamp = self.clock.as_ref().unwrap().lock().stamp();
+            let stamp = self.clock.as_ref().unwrap().lock().stamp()?;
             let rev = RevisionId::from_stamp(stamp);
             self.watermarks
                 .watermark_for(self.id)
                 .register_outstanding(rev);
-            rev
+            Ok(rev)
         }
     }
 
-    pub fn stamp_n(&self, count: u64) -> RevisionRange {
+    pub fn stamp_n(&self, count: u64) -> Result<RevisionRange, ClockSkewError> {
         debug_assert!(count > 0, "stamp_n requires count > 0");
         if self.id.0 == GLOBAL_SESSION {
-            self.watermarks.session_zero().allocate_n(count)
+            Ok(self.watermarks.session_zero().allocate_n(count))
         } else {
-            let stamps = self.clock.as_ref().unwrap().lock().stamp_n(count);
+            let stamps = self.clock.as_ref().unwrap().lock().stamp_n(count)?;
             let first = RevisionId::from_stamp(stamps[0]);
             let last = RevisionId::from_stamp(*stamps.last().unwrap());
             let wm = self.watermarks.watermark_for(self.id);
             for stamp in stamps {
                 wm.register_outstanding(RevisionId::from_stamp(stamp));
             }
-            RevisionRange::new(first, last)
+            Ok(RevisionRange::new(first, last))
         }
     }
 }

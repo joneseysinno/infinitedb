@@ -1,7 +1,6 @@
-//! [`InfiniteDb`] — fire-and-forget writes with per-space I/O (v3) or global I/O (v2).
+//! [`InfiniteDb`] — fire-and-forget writes with Hilbert-shard I/O (format v4/v5).
 
 use std::collections::HashMap;
-use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -11,7 +10,6 @@ use parking_lot::{Mutex, RwLock};
 
 use crate::engine::branch_overlay::{BranchOverlayStore, OverlayKey};
 use crate::engine::compactor::CompactionPolicyOverrides;
-use crate::engine::coordinator::SpaceCoordinator;
 use crate::engine::derivation::{
     record_in_derivation_delta, AssertionEvent, DerivationBackpressurePolicy, DerivationBus,
     DerivationSink, DerivationStats, EdgeLocatorSubscriber, EndpointIndexSubscriber,
@@ -22,7 +20,7 @@ use crate::engine::flow_vector::{
     prepare_flow_vector_derivation,
 };
 use crate::engine::staleness_closure::{forward_stale_closure, staleness_seed_endpoints};
-use crate::engine::error::{engine_to_io, EngineError};
+use crate::engine::error::EngineError;
 use crate::engine::error_record::{
     decode_error_record_payload, operation_record_checkpoint_collision,
     operation_record_from_import, operation_record_interrupted_intent, prepare_error_tombstone,
@@ -40,16 +38,16 @@ use crate::engine::judgment::{
 };
 use crate::engine::hilbert_coordinator::HilbertCoordinator;
 use crate::engine::hilbert_live_tails::HilbertLiveTails;
-use crate::engine::io_thread::{open_io_pipeline, IoStats, IoThreadConfig, IoThreadHandle};
-use crate::engine::live_tail::LiveTailView;
+use crate::engine::io_thread::{IoStats, IoThreadConfig};
 use crate::engine::merge::merge_branches;
 use crate::engine::query::{
     query_bbox, query_inner, query_plan_stats, reset_query_plan_stats, snapshots_map_for_persist,
     space_key, QueryPlanStats,
 };
 use crate::engine::snapshot_store::SnapshotStore;
-use crate::engine::space_live_tails::SpaceLiveTails;
 use crate::engine::session::{DurableIntent, SessionWatermarks, VersionVector, WriteSession};
+use crate::engine::collision::CollisionEvaluation;
+use crate::engine::replication_gate::ReplicationGatePolicy;
 use crate::engine::timed_fast_path::{DurabilityMedium, TimedFastPathPolicy};
 use crate::infinitedb_storage::session_fast_segment::FastSealOutcome;
 use crate::engine::session_wal_store::{
@@ -57,7 +55,7 @@ use crate::engine::session_wal_store::{
     wal_entry_revision,
 };
 use crate::engine::watermark::{FailedRevision, RevisionRange};
-use crate::engine::write_queue::{WriteJob, WriteQueueSender};
+use crate::engine::write_queue::WriteJob;
 use crate::engine::endpoint_index_migrate::edge_spaces_from_registry;
 use crate::engine::hypergraph::{
     self, decode_edge_record, endpoint_index_space_config, filter_edges_by_direction,
@@ -108,6 +106,7 @@ use crate::infinitedb_core::{
     merge::{MergeConflict, MergeResult, MergeStrategy},
     persisted_counters::PersistedCounters,
     query::{DirectionFilter, QueryOptions},
+    judgment::RESERVED_ARBITER_ID_THRESHOLD,
     space::{CompactionPolicy, EndpointIndexLayout, SpaceConfig, SpaceRegistry},
     snapshot::SnapshotId,
     traversal::{
@@ -115,12 +114,12 @@ use crate::infinitedb_core::{
     },
 };
 use crate::infinitedb_storage::{
-    format::{FormatVersion, FORMAT_VERSION_V2, FORMAT_VERSION_V3, FORMAT_VERSION_V4, FORMAT_VERSION_V5},
+    format::{FormatVersion, FORMAT_VERSION_V4},
     nvme::BlockStore,
     wal::WalEntry,
 };
 
-/// Options for opening [`InfiniteDb`] (formats v2–v4).
+/// Options for opening [`InfiniteDb`] (formats v4–v5).
 #[derive(Debug, Clone)]
 pub struct OpenOptions {
     /// I/O thread queue depth, staging, and durability settings.
@@ -133,6 +132,8 @@ pub struct OpenOptions {
     pub derivation: DerivationBackpressurePolicy,
     /// Timed session fast path (Phase 7, default off).
     pub timed_fast_path: TimedFastPathPolicy,
+    /// Session WAL replication gate posture (hardening D-P8, default `NotApplicable`).
+    pub replication_gate: ReplicationGatePolicy,
 }
 
 impl Default for OpenOptions {
@@ -144,31 +145,16 @@ impl Default for OpenOptions {
             format_version: None,
             derivation: DerivationBackpressurePolicy::default(),
             timed_fast_path: TimedFastPathPolicy::from_io_config(&io_thread),
+            replication_gate: ReplicationGatePolicy::default(),
         }
     }
 }
 
 impl OpenOptions {
     /// Open or create a database at `dir` using these options.
-    pub fn open<P: AsRef<Path>>(&self, dir: P) -> io::Result<InfiniteDb> {
+    pub fn open<P: AsRef<Path>>(&self, dir: P) -> Result<InfiniteDb, EngineError> {
         InfiniteDb::open_with_options(dir, self)
     }
-}
-
-pub(crate) enum WriteBackend {
-    /// Format v2: single global I/O thread.
-    V2 {
-        queue: WriteQueueSender,
-        io_handle: Mutex<IoThreadHandle>,
-    },
-    /// Format v3: one I/O thread per space.
-    V3 {
-        coordinator: SpaceCoordinator,
-    },
-    /// Format v4: Hilbert shards per space + branch overlays.
-    V4 {
-        coordinator: HilbertCoordinator,
-    },
 }
 
 /// Thread-safe embedded database with concurrent reads and fire-and-forget writes.
@@ -183,6 +169,7 @@ pub struct InfiniteDb {
     default_write_session: WriteSession,
     session_wal_store: Arc<SessionWalStore>,
     timed_fast_path: TimedFastPathPolicy,
+    replication_gate: ReplicationGatePolicy,
     compaction_overrides: CompactionPolicyOverrides,
     next_block_id: Arc<AtomicU64>,
     next_snapshot_id: Arc<AtomicU64>,
@@ -190,20 +177,18 @@ pub struct InfiniteDb {
     pub(crate) branch_overlays: Arc<BranchOverlayStore>,
     #[cfg(feature = "sync")]
     conflicts: Arc<crate::infinitedb_sync::conflict_queue::ConflictQueue>,
-    backend: Arc<Mutex<WriteBackend>>,
+    coordinator: Arc<HilbertCoordinator>,
+    hilbert_tails: Arc<HilbertLiveTails>,
     derivation: Arc<DerivationBus>,
     arbiter_streams: Arc<RwLock<HashMap<ArbiterId, ArbiterStream>>>,
     frames: Arc<RwLock<HashMap<FrameId, FrameDefinition>>>,
     next_frame_id: Arc<AtomicU64>,
-    v2_live_tail: Option<Arc<LiveTailView>>,
-    v3_space_tails: Option<Arc<SpaceLiveTails>>,
-    v4_hilbert_tails: Option<Arc<HilbertLiveTails>>,
 }
 
-/// Applies derived index rows through the shared write backend.
+/// Applies derived index rows through the Hilbert write coordinator.
 struct DbDerivationSink {
     spaces: Arc<RwLock<SpaceRegistry>>,
-    backend: Arc<Mutex<WriteBackend>>,
+    coordinator: Arc<HilbertCoordinator>,
 }
 
 impl DerivationSink for DbDerivationSink {
@@ -248,63 +233,58 @@ impl DerivationSink for DbDerivationSink {
             jobs.push(WriteJob::main(record.revision, entry, hilbert_key));
         }
         drop(spaces);
-        let mut backend = self.backend.lock();
-        match &mut *backend {
-            WriteBackend::V4 { coordinator } => coordinator.enqueue_batch(jobs)?,
-            WriteBackend::V3 { coordinator } => coordinator.enqueue_batch(jobs)?,
-            WriteBackend::V2 { queue, .. } => {
-                for job in jobs {
-                    queue.enqueue_write(job)?;
-                }
-            }
-        }
+        self.coordinator.enqueue_batch(jobs).map_err(EngineError::from)?;
         Ok(())
     }
 }
 
 impl InfiniteDb {
     /// Open or create a database at `dir` with default [`OpenOptions`].
-    pub fn open<P: AsRef<Path>>(dir: P) -> io::Result<Self> {
+    pub fn open<P: AsRef<Path>>(dir: P) -> Result<Self, EngineError> {
         OpenOptions::default().open(dir)
     }
 
     /// Open or create a database at `dir` with explicit tuning and format version.
-    pub fn open_with_options<P: AsRef<Path>>(dir: P, options: &OpenOptions) -> io::Result<Self> {
+    pub fn open_with_options<P: AsRef<Path>>(dir: P, options: &OpenOptions) -> Result<Self, EngineError> {
         let root = dir.as_ref().to_path_buf();
-        let store = Arc::new(BlockStore::open_with_cache(
-            root.clone(),
-            options.block_cache_bytes,
-        )?);
+        let store = Arc::new(
+            BlockStore::open_with_cache(root.clone(), options.block_cache_bytes)
+                .map_err(EngineError::from)?,
+        );
 
-        let format_version = match FormatVersion::read_from_meta(&root.join("meta"))? {
+        let format_version = match FormatVersion::read_from_meta(&root.join("meta"))
+            .map_err(EngineError::from)?
+        {
             Some(v) => v.0,
             None => options.format_version.unwrap_or(FORMAT_VERSION_V4),
         };
 
-        match format_version {
-            FORMAT_VERSION_V2 | FORMAT_VERSION_V3 | FORMAT_VERSION_V4 | FORMAT_VERSION_V5 => {}
-            other => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("unsupported concurrent format version {other}"),
-                ));
-            }
+        if !FormatVersion(format_version).is_supported() {
+            let message = if matches!(format_version, 2 | 3) {
+                format!(
+                    "format version {format_version} is no longer supported; \
+                     open with a v4/v5 database or create a new directory"
+                )
+            } else {
+                format!("unsupported concurrent format version {format_version}")
+            };
+            return Err(EngineError::Other { message });
         }
 
-        if FormatVersion::read_from_meta(&root.join("meta"))?.is_none() {
-            FormatVersion(format_version).write_to_meta(&root.join("meta"))?;
-            if format_version == FORMAT_VERSION_V2 {
-                std::fs::create_dir_all(root.join("hot"))?;
-                std::fs::create_dir_all(root.join("wal"))?;
-            } else {
-                std::fs::create_dir_all(root.join("spaces"))?;
-            }
+        if FormatVersion::read_from_meta(&root.join("meta"))
+            .map_err(EngineError::from)?
+            .is_none()
+        {
+            FormatVersion(format_version)
+                .write_to_meta(&root.join("meta"))
+                .map_err(EngineError::from)?;
+            std::fs::create_dir_all(root.join("spaces")).map_err(EngineError::from)?;
         }
 
         let branch_overlays = Arc::new(BranchOverlayStore::new());
-        if format_version == FORMAT_VERSION_V4 {
-            branch_overlays.replay_all(&root)?;
-        }
+        branch_overlays
+            .replay_all(&root)
+            .map_err(EngineError::from)?;
         if let Ok(bytes) = store.read_meta("branch_bases.bin") {
             if let Ok((bases, _)) = decode_from_slice::<
                 std::collections::BTreeMap<(u64, u64), crate::infinitedb_core::snapshot::Snapshot>,
@@ -315,7 +295,10 @@ impl InfiniteDb {
             }
         }
         #[cfg(feature = "sync")]
-        let conflicts = Arc::new(crate::infinitedb_sync::conflict_queue::ConflictQueue::open(&root)?);
+        let conflicts = Arc::new(
+            crate::infinitedb_sync::conflict_queue::ConflictQueue::open(&root)
+                .map_err(EngineError::from)?,
+        );
 
         let (spaces, branches, snapshots, next_rev, next_block, next_snap, next_branch, next_session) =
             load_meta(&store).unwrap_or_else(default_meta);
@@ -348,75 +331,23 @@ impl InfiniteDb {
             });
         }
 
-        let (backend, v2_live_tail, v3_space_tails, v4_hilbert_tails) =
-            if format_version == FORMAT_VERSION_V4 {
-                let coordinator = HilbertCoordinator::new(
-                    root.clone(),
-                    Arc::clone(&store),
-                    Arc::clone(&snapshots),
-                    Arc::clone(&branch_overlays),
-                    Arc::clone(&spaces),
-                    Arc::clone(&next_block_id),
-                    options.io_thread.clone(),
-                    Arc::clone(&session_watermarks),
-                    Arc::clone(&compaction_overrides),
-                );
-                coordinator.bootstrap_registered_spaces()?;
-                coordinator.sync_all()?;
-                let tails = coordinator.live_tails_arc();
-                (
-                    WriteBackend::V4 { coordinator },
-                    None,
-                    None,
-                    Some(tails),
-                )
-            } else if format_version == FORMAT_VERSION_V3 {
-                let coordinator = SpaceCoordinator::new(
-                    root.clone(),
-                    Arc::clone(&store),
-                    Arc::clone(&snapshots),
-                    Arc::clone(&spaces),
-                    Arc::clone(&next_block_id),
-                    options.io_thread.clone(),
-                    Arc::clone(&session_watermarks),
-                    Arc::clone(&compaction_overrides),
-                    Some(Arc::clone(&branch_overlays)),
-                );
-                coordinator.bootstrap_registered_spaces()?;
-                coordinator.sync_all()?;
-                let tails = coordinator.live_tails_arc();
-                (
-                    WriteBackend::V3 { coordinator },
-                    None,
-                    Some(tails),
-                    None,
-                )
-            } else {
-                let live_tail = Arc::new(LiveTailView::new());
-                let (queue, io_handle) = open_io_pipeline(
-                    root.clone(),
-                    Arc::clone(&store),
-                    Arc::clone(&snapshots),
-                    Arc::clone(&live_tail),
-                    Arc::clone(&spaces),
-                    Arc::clone(&next_block_id),
-                    options.io_thread.clone(),
-                    Arc::clone(&session_watermarks),
-                    Arc::clone(&compaction_overrides),
-                    Some(Arc::clone(&branch_overlays)),
-                );
-                (
-                    WriteBackend::V2 {
-                        queue,
-                        io_handle: Mutex::new(io_handle),
-                    },
-                    Some(live_tail),
-                    None,
-                    None,
-                )
-            };
-
-        let backend = Arc::new(Mutex::new(backend));
+        let coordinator = HilbertCoordinator::new(
+            root.clone(),
+            Arc::clone(&store),
+            Arc::clone(&snapshots),
+            Arc::clone(&branch_overlays),
+            Arc::clone(&spaces),
+            Arc::clone(&next_block_id),
+            options.io_thread.clone(),
+            Arc::clone(&session_watermarks),
+            Arc::clone(&compaction_overrides),
+        );
+        coordinator
+            .bootstrap_registered_spaces()
+            .map_err(EngineError::from)?;
+        coordinator.sync_all().map_err(EngineError::from)?;
+        let hilbert_tails = coordinator.live_tails_arc();
+        let coordinator = Arc::new(coordinator);
         let derivation_watermarks = Arc::new(WatermarkRegistry::new());
         derivation_watermarks.register("endpoint_index", RevisionId::ZERO);
         derivation_watermarks.register("edge_locator", RevisionId::ZERO);
@@ -428,7 +359,7 @@ impl InfiniteDb {
         ];
         let sink = Arc::new(DbDerivationSink {
             spaces: Arc::clone(&spaces),
-            backend: Arc::clone(&backend),
+            coordinator: Arc::clone(&coordinator),
         });
         let derivation = Arc::new(DerivationBus::new(
             options.derivation.clone(),
@@ -471,6 +402,7 @@ impl InfiniteDb {
             default_write_session,
             session_wal_store,
             timed_fast_path: options.timed_fast_path.clone(),
+            replication_gate: options.replication_gate,
             compaction_overrides,
             next_block_id,
             next_snapshot_id,
@@ -478,14 +410,12 @@ impl InfiniteDb {
             branch_overlays,
             #[cfg(feature = "sync")]
             conflicts,
-            backend,
+            coordinator,
+            hilbert_tails,
             derivation,
             arbiter_streams,
             frames,
             next_frame_id,
-            v2_live_tail,
-            v3_space_tails,
-            v4_hilbert_tails,
         };
         db.apply_recovered_session_wal(&recovered_session_wal)?;
         db.apply_recovered_fast_segments()?;
@@ -497,7 +427,7 @@ impl InfiniteDb {
     fn apply_recovered_session_wal(
         &self,
         recovered: &[crate::engine::session_wal_store::SessionWalRecovery],
-    ) -> io::Result<()> {
+    ) -> Result<(), EngineError> {
         let entries = merge_recovered_entries(recovered);
         if !entries.is_empty() {
             self.replay_session_wal_entries(&entries)?;
@@ -509,14 +439,13 @@ impl InfiniteDb {
             if !batch.committed_groups.is_empty() || !batch.uncommitted.is_empty() {
                 self.session_wal_store
                     .reset_after_recovery(batch.session)
-                    .map_err(EngineError::from)
-                    .map_err(engine_to_io)?;
+                    .map_err(EngineError::from)?;
             }
         }
         Ok(())
     }
 
-    fn apply_recovered_fast_segments(&self) -> io::Result<()> {
+    fn apply_recovered_fast_segments(&self) -> Result<(), EngineError> {
         let recovered = self.session_wal_store.recover_fast_segments();
         for batch in recovered {
             if !batch.entries.is_empty() {
@@ -524,13 +453,12 @@ impl InfiniteDb {
             }
             self.session_wal_store
                 .reset_fast_after_recovery(batch.session)
-                .map_err(EngineError::from)
-                .map_err(engine_to_io)?;
+                .map_err(EngineError::from)?;
         }
         Ok(())
     }
 
-    fn replay_session_wal_entries(&self, entries: &[WalEntry]) -> io::Result<()> {
+    fn replay_session_wal_entries(&self, entries: &[WalEntry]) -> Result<(), EngineError> {
         if entries.is_empty() {
             return Ok(());
         }
@@ -559,7 +487,7 @@ impl InfiniteDb {
         &self,
         session: crate::infinitedb_core::hlc::SessionId,
         entries: &[WalEntry],
-    ) -> io::Result<()> {
+    ) -> Result<(), EngineError> {
         let revisions: Vec<RevisionId> = entries.iter().filter_map(wal_entry_revision).collect();
         let Some(first) = revisions.iter().min().copied() else {
             return Ok(());
@@ -583,9 +511,7 @@ impl InfiniteDb {
             last,
             entries.len(),
         );
-        let _ = self
-            .persist_operation_errors(source_space, record)
-            .map_err(engine_to_io)?;
+        let _ = self.persist_operation_errors(source_space, record)?;
         self.sync()?;
         Ok(())
     }
@@ -606,7 +532,7 @@ impl InfiniteDb {
         &self.conflicts
     }
 
-    /// On-disk format version (2, 3, or 4) for this database directory.
+    /// On-disk format version (4 or 5) for this database directory.
     pub fn format_version(&self) -> u32 {
         self.format_version
     }
@@ -725,7 +651,7 @@ impl InfiniteDb {
     }
 
     /// Replay durable assertions with revision above derivation watermarks (crash recovery, M4).
-    fn recover_derivation_on_open(&self) -> io::Result<()> {
+    fn recover_derivation_on_open(&self) -> Result<(), EngineError> {
         use std::collections::HashMap;
 
         let wm_vector = self.derivation.min_watermark_vector();
@@ -750,28 +676,24 @@ impl InfiniteDb {
                 }
                 if record.tombstone {
                     if let Some(edge) = live_edges.remove(&id) {
-                        self.derivation
-                            .submit(AssertionEvent::delete(
-                                space,
-                                edge,
-                                record.revision,
-                                BranchId::MAIN,
-                            ))
-                            .map_err(engine_to_io)?;
+                        self.derivation.submit(AssertionEvent::delete(
+                            space,
+                            edge,
+                            record.revision,
+                            BranchId::MAIN,
+                        ))?;
                     }
                 } else if let Ok(edge) = decode_edge_record(&record.data) {
                     if edge.id != id {
                         continue;
                     }
                     live_edges.insert(edge.id, edge.clone());
-                    self.derivation
-                        .submit(AssertionEvent::upsert(
-                            space,
-                            edge,
-                            record.revision,
-                            BranchId::MAIN,
-                        ))
-                        .map_err(engine_to_io)?;
+                    self.derivation.submit(AssertionEvent::upsert(
+                        space,
+                        edge,
+                        record.revision,
+                        BranchId::MAIN,
+                    ))?;
                 }
             }
         }
@@ -784,7 +706,7 @@ impl InfiniteDb {
         &self,
         branch: BranchId,
         space: SpaceId,
-    ) -> io::Result<Vec<Record>> {
+    ) -> Result<Vec<Record>, EngineError> {
         let ctx = self.query_ctx();
         let branch_id = if branch == BranchId::MAIN {
             None
@@ -794,18 +716,85 @@ impl InfiniteDb {
         query_inner(
             &self.store,
             &self.snapshots,
-            ctx.live_tail,
-            ctx.space_tails,
+            None,
             &self.spaces.read(),
             &self.session_watermarks,
             space,
             None,
             None,
+            None,
             true,
-            ctx.hilbert_tails,
+            Some(ctx.hilbert_tails),
             Some(&self.branch_overlays),
             branch_id,
         )
+        .map_err(EngineError::from)
+    }
+
+    /// Query with optional scalar ceiling or per-session vector pin.
+    pub fn query_on_branch_pinned(
+        &self,
+        branch: BranchId,
+        space: SpaceId,
+        as_of: Option<RevisionId>,
+        pinned_vector: Option<&VersionVector>,
+    ) -> Result<Vec<Record>, EngineError> {
+        let ctx = self.query_ctx();
+        let branch_id = if branch == BranchId::MAIN {
+            None
+        } else {
+            Some(branch)
+        };
+        query_inner(
+            &self.store,
+            &self.snapshots,
+            None,
+            &self.spaces.read(),
+            &self.session_watermarks,
+            space,
+            None,
+            as_of,
+            pinned_vector,
+            false,
+            Some(ctx.hilbert_tails),
+            Some(&self.branch_overlays),
+            branch_id,
+        )
+        .map_err(EngineError::from)
+    }
+
+    /// Bounding-box query with optional scalar ceiling or per-session vector pin.
+    pub fn query_bbox_on_branch_pinned(
+        &self,
+        branch: BranchId,
+        space: SpaceId,
+        min: DimensionVector,
+        max: DimensionVector,
+        as_of: Option<RevisionId>,
+        pinned_vector: Option<&VersionVector>,
+    ) -> Result<Vec<Record>, EngineError> {
+        let ctx = self.query_ctx();
+        let branch_id = if branch == BranchId::MAIN {
+            None
+        } else {
+            Some(branch)
+        };
+        query_bbox(
+            &self.store,
+            &self.snapshots,
+            None,
+            &self.spaces.read(),
+            &self.session_watermarks,
+            space,
+            min,
+            max,
+            as_of,
+            pinned_vector,
+            Some(ctx.hilbert_tails),
+            Some(&self.branch_overlays),
+            branch_id,
+        )
+        .map_err(EngineError::from)
     }
 
     fn check_derivation_backpressure(&self) -> Result<(), EngineError> {
@@ -824,7 +813,11 @@ impl InfiniteDb {
     }
 
     /// Insert or update a hyperedge assertion and maintain the endpoint index.
-    pub fn insert_hyperedge(&self, space: SpaceId, edge: Hyperedge) -> io::Result<RevisionId> {
+    pub fn insert_hyperedge(
+        &self,
+        space: SpaceId,
+        edge: Hyperedge,
+    ) -> Result<RevisionId, EngineError> {
         self.insert_hyperedge_on_branch(BranchId::MAIN, space, edge)
     }
 
@@ -834,43 +827,32 @@ impl InfiniteDb {
         branch: BranchId,
         space: SpaceId,
         mut edge: Hyperedge,
-    ) -> io::Result<RevisionId> {
-        edge.validate()
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("{:?}", e)))?;
-        self.ensure_endpoint_index_space()
-            .map_err(|e| engine_to_io(e))?;
-        self.ensure_flow_vector_index_space()
-            .map_err(|e| engine_to_io(e))?;
+    ) -> Result<RevisionId, EngineError> {
+        edge.validate().map_err(EngineError::from)?;
+        self.ensure_endpoint_index_space()?;
+        self.ensure_flow_vector_index_space()?;
         if branch == BranchId::MAIN {
-            self.check_derivation_backpressure()
-                .map_err(engine_to_io)?;
-            let rev = self.default_write_session.stamp();
+            self.check_derivation_backpressure()?;
+            let rev = self.default_write_session.stamp()?;
             if let Some(ref prov) = edge.authoring_frame {
-                validate_authoring_provenance(prov, rev)
-                    .map_err(|e| engine_to_io(EngineError::from(e)))?;
+                validate_authoring_provenance(prov, rev)?;
             }
             if let Some(ref comp) = edge.computation {
-                self.validate_computation_inputs(comp)
-                    .map_err(engine_to_io)?;
+                self.validate_computation_inputs(comp)?;
             }
             edge.valid_from = rev;
-            let row = prepare_assertion_write(space, &edge)?;
+            let row = prepare_assertion_write(space, &edge).map_err(EngineError::from)?;
             let records = rows_to_records(&[row], rev);
             self.apply_records_on_branch(branch, records)?;
-            self.derivation.submit(AssertionEvent::upsert(
-                space,
-                edge,
-                rev,
-                branch,
-            ))
-            .map_err(engine_to_io)?;
+            self.derivation
+                .submit(AssertionEvent::upsert(space, edge, rev, branch))?;
             Ok(rev)
         } else {
             let count = 1 + edge.endpoints.len();
-            let range = self.default_write_session.stamp_n(count as u64);
+            let range = self.default_write_session.stamp_n(count as u64)?;
             edge.valid_from = range.first();
             let index_layout = registry_index_layout(&self.spaces.read());
-            let rows = prepare_writes(space, &edge, index_layout)?;
+            let rows = prepare_writes(space, &edge, index_layout).map_err(EngineError::from)?;
             let records = rows_to_records(&rows, range.first());
             self.apply_records_on_branch(branch, records)?;
             Ok(range.first())
@@ -889,20 +871,26 @@ impl InfiniteDb {
         metadata: std::collections::BTreeMap<String, String>,
         valid_to: Option<RevisionId>,
         catalog: Option<&KindCatalog>,
-    ) -> io::Result<RevisionId> {
+    ) -> Result<RevisionId, EngineError> {
         let kind_label = kind.label().to_string();
         if let Some(catalog) = catalog {
             catalog
                 .validate_edge_kind(&kind_label)
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
+                .map_err(|e| EngineError::InvalidSpaceConfig {
+                    message: e.to_string(),
+                })?;
             for ep in &endpoints {
                 catalog
                     .validate_endpoint_role(&ep.role)
-                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
+                    .map_err(|e| EngineError::InvalidSpaceConfig {
+                        message: e.to_string(),
+                    })?;
             }
             catalog
                 .validate_edge_directionality(&kind_label, directionality)
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
+                .map_err(|e| EngineError::InvalidSpaceConfig {
+                    message: e.to_string(),
+                })?;
         }
         let edge = Hyperedge {
             id,
@@ -916,13 +904,16 @@ impl InfiniteDb {
             authoring_frame: None,
             computation: None,
         };
-        edge.validate()
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("{:?}", e)))?;
+        edge.validate().map_err(EngineError::from)?;
         self.insert_hyperedge(space, edge)
     }
 
     /// Logically delete a hyperedge by id (payload + endpoint index rows).
-    pub fn delete_hyperedge(&self, space: SpaceId, id: HyperedgeId) -> io::Result<RevisionId> {
+    pub fn delete_hyperedge(
+        &self,
+        space: SpaceId,
+        id: HyperedgeId,
+    ) -> Result<RevisionId, EngineError> {
         self.delete_hyperedge_on_branch(BranchId::MAIN, space, id)
     }
 
@@ -932,14 +923,14 @@ impl InfiniteDb {
         branch: BranchId,
         space: SpaceId,
         id: HyperedgeId,
-    ) -> io::Result<RevisionId> {
-        self.ensure_endpoint_index_space()
-            .map_err(engine_to_io)?;
-        let edge = self.fetch_hyperedge_by_id_on_branch(branch, space, id, None)?;
+    ) -> Result<RevisionId, EngineError> {
+        self.ensure_endpoint_index_space()?;
+        let edge = self
+            .fetch_hyperedge_by_id_on_branch(branch, space, id, None)
+            .map_err(EngineError::from)?;
         if branch == BranchId::MAIN {
-            self.check_derivation_backpressure()
-                .map_err(engine_to_io)?;
-            let rev = self.default_write_session.stamp();
+            self.check_derivation_backpressure()?;
+            let rev = self.default_write_session.stamp()?;
             let row = if let Some(ref e) = edge {
                 prepare_assertion_tombstone(space, e.id)
             } else {
@@ -949,8 +940,7 @@ impl InfiniteDb {
             self.apply_records_on_branch(branch, records)?;
             if let Some(e) = edge {
                 self.derivation
-                    .submit(AssertionEvent::delete(space, e, rev, branch))
-                    .map_err(engine_to_io)?;
+                    .submit(AssertionEvent::delete(space, e, rev, branch))?;
             }
             Ok(rev)
         } else {
@@ -960,7 +950,7 @@ impl InfiniteDb {
                 None => vec![prepare_assertion_tombstone(space, id)],
             };
             let count = rows.len() as u64;
-            let range = self.default_write_session.stamp_n(count);
+            let range = self.default_write_session.stamp_n(count)?;
             let records = rows_to_records(&rows, range.first());
             self.apply_records_on_branch(branch, records)?;
             Ok(range.first())
@@ -973,7 +963,7 @@ impl InfiniteDb {
         space: SpaceId,
         id: HyperedgeId,
         as_of: Option<RevisionId>,
-    ) -> io::Result<Option<Hyperedge>> {
+    ) -> Result<Option<Hyperedge>, EngineError> {
         self.fetch_hyperedge_by_id_on_branch(BranchId::MAIN, space, id, as_of)
     }
 
@@ -983,7 +973,7 @@ impl InfiniteDb {
         space: SpaceId,
         id: HyperedgeId,
         as_of: Option<RevisionId>,
-    ) -> io::Result<Option<Hyperedge>> {
+    ) -> Result<Option<Hyperedge>, EngineError> {
         let point = Hyperedge::storage_point(id);
         let records = self.query_bbox_on_branch(branch, space, point.clone(), point, as_of)?;
         if let Some(latest) = records.iter().max_by_key(|r| r.revision) {
@@ -1010,7 +1000,7 @@ impl InfiniteDb {
         &self,
         space: SpaceId,
         as_of: Option<RevisionId>,
-    ) -> io::Result<Vec<Hyperedge>> {
+    ) -> Result<Vec<Hyperedge>, EngineError> {
         Ok(self
             .query_on_branch(BranchId::MAIN, space, as_of)?
             .into_iter()
@@ -1025,7 +1015,7 @@ impl InfiniteDb {
         edge_space: SpaceId,
         endpoint: &EndpointRef,
         as_of: Option<RevisionId>,
-    ) -> io::Result<Vec<Hyperedge>> {
+    ) -> Result<Vec<Hyperedge>, EngineError> {
         self.query_hyperedges_for_endpoint_directed(
             edge_space,
             endpoint,
@@ -1041,7 +1031,7 @@ impl InfiniteDb {
         endpoint: &EndpointRef,
         as_of: Option<RevisionId>,
         direction: DirectionFilter,
-    ) -> io::Result<Vec<Hyperedge>> {
+    ) -> Result<Vec<Hyperedge>, EngineError> {
         self.query_hyperedges_for_endpoint_directed_with_options(
             edge_space,
             endpoint,
@@ -1059,8 +1049,8 @@ impl InfiniteDb {
         as_of: Option<RevisionId>,
         direction: DirectionFilter,
         options: QueryOptions,
-    ) -> io::Result<Vec<Hyperedge>> {
-        self.ensure_endpoint_index_space().map_err(engine_to_io)?;
+    ) -> Result<Vec<Hyperedge>, EngineError> {
+        self.ensure_endpoint_index_space()?;
         let registry_layout = self.endpoint_index_layout();
         let wm_vec = self.derivation.endpoint_index_watermark_vector();
         let wm = wm_vec.scalar_meet();
@@ -1133,7 +1123,7 @@ impl InfiniteDb {
         &self,
         endpoint: &EndpointRef,
         as_of: Option<RevisionId>,
-    ) -> io::Result<usize> {
+    ) -> Result<usize, EngineError> {
         self.count_incident_edges_for_endpoint_directed(endpoint, as_of, DirectionFilter::Any)
     }
 
@@ -1143,7 +1133,7 @@ impl InfiniteDb {
         endpoint: &EndpointRef,
         as_of: Option<RevisionId>,
         direction: DirectionFilter,
-    ) -> io::Result<usize> {
+    ) -> Result<usize, EngineError> {
         self.count_incident_edges_for_endpoint_directed_with_options(
             endpoint,
             as_of,
@@ -1159,8 +1149,8 @@ impl InfiniteDb {
         as_of: Option<RevisionId>,
         direction: DirectionFilter,
         options: QueryOptions,
-    ) -> io::Result<usize> {
-        self.ensure_endpoint_index_space().map_err(engine_to_io)?;
+    ) -> Result<usize, EngineError> {
+        self.ensure_endpoint_index_space()?;
         let registry_layout = self.endpoint_index_layout();
         let wm_vec = self.derivation.endpoint_index_watermark_vector();
         let wm = wm_vec.scalar_meet();
@@ -1246,14 +1236,14 @@ impl InfiniteDb {
     }
 
     /// Rewrite V1 endpoint-index rows to M2 layout and compact the index space.
-    pub fn compact_endpoint_index(&self, edge_spaces: &[SpaceId]) -> io::Result<()> {
+    pub fn compact_endpoint_index(&self, edge_spaces: &[SpaceId]) -> Result<(), EngineError> {
         self.sync_derivation();
-        self.ensure_endpoint_index_space().map_err(engine_to_io)?;
+        self.ensure_endpoint_index_space()?;
         if self.endpoint_index_layout() != EndpointIndexLayout::V2PolarityDim {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "endpoint index layout must be upgraded to V2 before compaction rewrite",
-            ));
+            return Err(EngineError::InvalidSpaceConfig {
+                message: "endpoint index layout must be upgraded to V2 before compaction rewrite"
+                    .into(),
+            });
         }
         self.sync()?;
         let index_records =
@@ -1272,7 +1262,7 @@ impl InfiniteDb {
             None
         });
         if !rewrite_rows.is_empty() {
-            let range = self.default_write_session.stamp_n(rewrite_rows.len() as u64);
+            let range = self.default_write_session.stamp_n(rewrite_rows.len() as u64)?;
             let records = rows_to_records(&rewrite_rows, range.first());
             self.apply_records_on_branch(BranchId::MAIN, records)?;
             self.sync()?;
@@ -1287,7 +1277,7 @@ impl InfiniteDb {
         registry_layout: EndpointIndexLayout,
         index_records: &[Record],
         _as_of: Option<RevisionId>,
-    ) -> io::Result<Vec<HyperedgeId>> {
+    ) -> Result<Vec<HyperedgeId>, EngineError> {
         let prefix = hypergraph::endpoint_prefix(endpoint);
         match registry_layout {
             EndpointIndexLayout::V2PolarityDim => Ok(incident_edge_ids_directed(
@@ -1309,7 +1299,7 @@ impl InfiniteDb {
         space: SpaceId,
         kind: &str,
         as_of: Option<RevisionId>,
-    ) -> io::Result<Vec<Hyperedge>> {
+    ) -> Result<Vec<Hyperedge>, EngineError> {
         Ok(self
             .query_hyperedges(space, as_of)?
             .into_iter()
@@ -1318,7 +1308,7 @@ impl InfiniteDb {
     }
 
     /// Directional hypergraph traversal from a starting endpoint (M3).
-    pub fn traverse_hypergraph(&self, spec: &TraversalSpec) -> io::Result<TraversalResult> {
+    pub fn traverse_hypergraph(&self, spec: &TraversalSpec) -> Result<TraversalResult, EngineError> {
         self.traverse_hypergraph_with_options(spec, QueryOptions::default())
     }
 
@@ -1327,8 +1317,8 @@ impl InfiniteDb {
         &self,
         spec: &TraversalSpec,
         options: QueryOptions,
-    ) -> io::Result<TraversalResult> {
-        self.ensure_endpoint_index_space().map_err(engine_to_io)?;
+    ) -> Result<TraversalResult, EngineError> {
+        self.ensure_endpoint_index_space()?;
         let registry_layout = self.endpoint_index_layout();
         let rev_ceiling = spec.as_of.unwrap_or_else(|| self.revision());
         let wm_vec = self.derivation.endpoint_index_watermark_vector();
@@ -1357,6 +1347,7 @@ impl InfiniteDb {
                 .flatten()
                 .filter(|edge| edge.is_active_at(rev_ceiling))
         })
+        .map_err(EngineError::from)
     }
 
     /// Per-kind acyclicity check over directed hyperedges in `edge_space` (M3).
@@ -1365,7 +1356,7 @@ impl InfiniteDb {
         edge_space: SpaceId,
         kinds: &[HyperedgeKind],
         as_of: Option<RevisionId>,
-    ) -> io::Result<bool> {
+    ) -> Result<bool, EngineError> {
         let rev_ceiling = as_of.unwrap_or_else(|| self.revision());
         let edges: Vec<Hyperedge> = self
             .query_hyperedges(edge_space, as_of)?
@@ -1382,7 +1373,7 @@ impl InfiniteDb {
         space: SpaceId,
         point: DimensionVector,
         data: Vec<u8>,
-    ) -> io::Result<RevisionId> {
+    ) -> Result<RevisionId, EngineError> {
         self.insert_on_branch(BranchId::MAIN, space, point, data)
     }
 
@@ -1393,7 +1384,7 @@ impl InfiniteDb {
         space: SpaceId,
         point: DimensionVector,
         data: Vec<u8>,
-    ) -> io::Result<RevisionId> {
+    ) -> Result<RevisionId, EngineError> {
         let rev = self.next_revision();
         let address = Address::new(space, point.clone());
         let hilbert_key = HilbertKey(space_key(&self.spaces.read(), space, &point));
@@ -1413,7 +1404,11 @@ impl InfiniteDb {
     }
 
     /// Fire-and-forget delete on `main`.
-    pub fn delete(&self, space: SpaceId, point: DimensionVector) -> io::Result<RevisionId> {
+    pub fn delete(
+        &self,
+        space: SpaceId,
+        point: DimensionVector,
+    ) -> Result<RevisionId, EngineError> {
         self.delete_on_branch(BranchId::MAIN, space, point)
     }
 
@@ -1423,7 +1418,7 @@ impl InfiniteDb {
         branch: BranchId,
         space: SpaceId,
         point: DimensionVector,
-    ) -> io::Result<RevisionId> {
+    ) -> Result<RevisionId, EngineError> {
         let rev = self.next_revision();
         let address = Address::new(space, point.clone());
         let hilbert_key = HilbertKey(space_key(&self.spaces.read(), space, &point));
@@ -1510,7 +1505,7 @@ impl InfiniteDb {
         let mut last_rev = RevisionId::ZERO;
         for item in queued {
             let mut edge = item.edge;
-            let rev = self.default_write_session.stamp();
+            let rev = self.default_write_session.stamp()?;
             edge.valid_from = rev;
             let row = prepare_assertion_write(space, &edge)?;
             let records = rows_to_records(&[row], rev);
@@ -1540,7 +1535,7 @@ impl InfiniteDb {
     ) -> Result<RevisionId, EngineError> {
         ErrorKindCatalog::default().validate_kind(&record.kind)?;
         let error_space = self.error_space_for_data(data_space)?;
-        let rev = self.default_write_session.stamp();
+        let rev = self.default_write_session.stamp()?;
         let row = prepare_error_write(error_space, &record)
             .map_err(|e| EngineError::ErrorRecordEncode {
                 message: e.to_string(),
@@ -1556,10 +1551,8 @@ impl InfiniteDb {
         data_space: SpaceId,
         range: Option<OperationRevisionRange>,
         as_of: Option<RevisionId>,
-    ) -> io::Result<Vec<OperationErrorRecord>> {
-        let error_space = self
-            .error_space_for(data_space)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "error space missing"))?;
+    ) -> Result<Vec<OperationErrorRecord>, EngineError> {
+        let error_space = self.error_space_for_data(data_space)?;
         let records = self.query_on_branch(BranchId::MAIN, error_space, as_of)?;
         let mut out = Vec::new();
         for r in records {
@@ -1586,11 +1579,77 @@ impl InfiniteDb {
         range_start: RevisionId,
     ) -> Result<(), EngineError> {
         let error_space = self.error_space_for_data(data_space)?;
-        let rev = self.default_write_session.stamp();
+        let rev = self.default_write_session.stamp()?;
         let row = prepare_error_tombstone(error_space, range_start);
         let records = rows_to_records(&[row], rev);
         self.apply_records_on_branch(BranchId::MAIN, records)?;
         Ok(())
+    }
+
+    /// Compact resolved error records beyond the data space's [`ErrorRetentionPolicy`].
+    pub fn purge_resolved_errors(&self, data_space: SpaceId) -> Result<usize, EngineError> {
+        use std::collections::HashMap;
+
+        let keep = {
+            let registry = self.spaces.read();
+            let config = registry
+                .get(data_space)
+                .ok_or(EngineError::SpaceNotFound(data_space))?;
+            match config.error_retention.as_ref().and_then(|p| p.max_resolved_keep) {
+                Some(k) => k,
+                None => return Ok(0),
+            }
+        };
+        let error_space = self.error_space_for_data(data_space)?;
+        self.sync()?;
+        let history = self.query_history_on_branch(BranchId::MAIN, error_space)?;
+
+        let mut by_point: HashMap<DimensionVector, Vec<&Record>> = HashMap::new();
+        for record in &history {
+            by_point
+                .entry(record.address.point.clone())
+                .or_default()
+                .push(record);
+        }
+
+        let mut resolved = Vec::new();
+        let mut unresolved = Vec::new();
+        for (point, records) in &by_point {
+            let latest = records
+                .iter()
+                .max_by_key(|r| r.revision)
+                .expect("non-empty group");
+            if latest.tombstone {
+                resolved.push((point.clone(), latest.revision));
+            } else {
+                unresolved.push(latest.revision);
+            }
+        }
+        resolved.sort_by_key(|(_, rev)| *rev);
+        if resolved.len() <= keep {
+            return Ok(0);
+        }
+        let purge_count = resolved.len() - keep;
+        let cutoff = resolved[purge_count].1;
+        for rev in unresolved {
+            if rev < cutoff {
+                return Err(EngineError::InvalidSpaceConfig {
+                    message: format!(
+                        "cannot purge resolved errors: unresolved error at revision {:?} \
+                         is older than retention cutoff {:?}",
+                        rev, cutoff
+                    ),
+                });
+            }
+        }
+        self.compact_with(
+            error_space,
+            Some(CompactionPolicy::RetentionWindow {
+                version_horizon: cutoff,
+                tombstone_horizon: cutoff,
+            }),
+        )?;
+        Ok(purge_count)
     }
 
     /// Register a named durable frame definition (M6).
@@ -1821,24 +1880,22 @@ impl InfiniteDb {
     pub fn traverse_in_frame(
         &self,
         spec: &FrameTraversalSpec,
-    ) -> io::Result<FrameTraversalResult> {
-        let def = self.get_frame(spec.frame_id).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::NotFound, format!("frame {:?} not found", spec.frame_id))
-        })?;
+    ) -> Result<FrameTraversalResult, EngineError> {
+        let def = self
+            .get_frame(spec.frame_id)
+            .ok_or(EngineError::FrameNotFound(spec.frame_id))?;
         let pin = self.resolve_frame_pin(
             spec.as_of.or(spec.base.as_of),
             spec.version_vector.clone(),
             def.default_as_of,
         );
         let pin_ceiling = pin.scalar_ceiling();
-        let judgments_cache = self
-            .collect_frame_judgments(
-                &def.judgment_overlay,
-                &DimensionVector::new(vec![0, 0]),
-                &DimensionVector::new(vec![u32::MAX, u32::MAX]),
-                pin_ceiling,
-            )
-            .map_err(engine_to_io)?;
+        let judgments_cache = self.collect_frame_judgments(
+            &def.judgment_overlay,
+            &DimensionVector::new(vec![0, 0]),
+            &DimensionVector::new(vec![u32::MAX, u32::MAX]),
+            pin_ceiling,
+        )?;
         let consulted = ConsultedFrame {
             frame_id: def.id,
             as_of: pin_ceiling,
@@ -1885,7 +1942,7 @@ impl InfiniteDb {
                 .map(|e| !e.suppressed)
                 .unwrap_or(false)
         };
-        self.ensure_endpoint_index_space().map_err(engine_to_io)?;
+        self.ensure_endpoint_index_space()?;
         let registry_layout = self.endpoint_index_layout();
         let rev_ceiling = spec.base.as_of.unwrap_or(pin_ceiling);
         let wm_vec = self.derivation.endpoint_index_watermark_vector();
@@ -1925,7 +1982,8 @@ impl InfiniteDb {
                 }
                 Some(edge)
             },
-        )?;
+        )
+        .map_err(EngineError::from)?;
         for edge in &traversal.edges {
             let (min, max) = {
                 let p = Hyperedge::storage_point(edge.id);
@@ -1971,6 +2029,9 @@ impl InfiniteDb {
         name: impl Into<String>,
         dims: usize,
     ) -> Result<ArbiterStream, EngineError> {
+        if id.0 < RESERVED_ARBITER_ID_THRESHOLD {
+            return Err(EngineError::ReservedArbiterId(id.0));
+        }
         if self.arbiter_streams.read().contains_key(&id) {
             return Err(EngineError::ArbiterStreamExists(id.0));
         }
@@ -2006,7 +2067,7 @@ impl InfiniteDb {
             .map_err(|e| EngineError::Other {
                 message: e.to_string(),
             })?;
-        let range = self.default_write_session.stamp_n(rows.len() as u64);
+        let range = self.default_write_session.stamp_n(rows.len() as u64)?;
         let rev = range.first();
         if let Some(ref prov) = record.authoring_frame {
             validate_authoring_provenance(prov, rev)?;
@@ -2022,13 +2083,13 @@ impl InfiniteDb {
         stream: ArbiterId,
         id: JudgmentId,
         as_of: Option<RevisionId>,
-    ) -> io::Result<Option<JudgmentRecord>> {
+    ) -> Result<Option<JudgmentRecord>, EngineError> {
         let assertion_space = self
             .arbiter_streams
             .read()
             .get(&stream)
             .map(|s| s.assertion_space)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "arbiter stream not found"))?;
+            .ok_or(EngineError::ArbiterStreamNotFound(stream.0))?;
         let point = crate::infinitedb_core::judgment::judgment_storage_point(id);
         let records = self.query_bbox_on_branch(
             BranchId::MAIN,
@@ -2057,13 +2118,13 @@ impl InfiniteDb {
         min: DimensionVector,
         max: DimensionVector,
         as_of: Option<RevisionId>,
-    ) -> io::Result<Vec<JudgmentRecord>> {
+    ) -> Result<Vec<JudgmentRecord>, EngineError> {
         let assertion_space = self
             .arbiter_streams
             .read()
             .get(&stream)
             .map(|s| s.assertion_space)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "arbiter stream not found"))?;
+            .ok_or(EngineError::ArbiterStreamNotFound(stream.0))?;
         let (min, max) = Self::pad_judgment_index_bbox(min, max);
         let index_records =
             self.query_bbox_on_branch(BranchId::MAIN, JUDGMENT_INDEX_SPACE, min, max, as_of)?;
@@ -2091,7 +2152,7 @@ impl InfiniteDb {
         stream: ArbiterId,
         pin: &SubjectPin,
         as_of: Option<RevisionId>,
-    ) -> io::Result<Vec<JudgmentRecord>> {
+    ) -> Result<Vec<JudgmentRecord>, EngineError> {
         let prefix = subject_spatial_prefix(pin);
         let index_records =
             self.query_on_branch(BranchId::MAIN, JUDGMENT_INDEX_SPACE, as_of)?;
@@ -2118,19 +2179,9 @@ impl InfiniteDb {
         Ok(out)
     }
 
-    /// Endpoint index derivation watermark (scalar meet across sessions, M4).
-    pub fn endpoint_index_watermark(&self) -> RevisionId {
-        self.derivation.endpoint_index_watermark()
-    }
-
     /// Per-session endpoint index derivation watermark (Phase 6).
     pub fn endpoint_index_watermark_vector(&self) -> VersionVector {
         self.derivation.endpoint_index_watermark_vector()
-    }
-
-    /// Flow-vector index derivation watermark (M7).
-    pub fn flow_vector_index_watermark(&self) -> RevisionId {
-        self.derivation.flow_vector_index_watermark()
     }
 
     /// Per-session flow-vector index derivation watermark (Phase 6).
@@ -2145,9 +2196,8 @@ impl InfiniteDb {
         max_dir: QuantizedDirection,
         as_of: Option<RevisionId>,
         options: QueryOptions,
-    ) -> io::Result<Vec<FlowVectorRecord>> {
-        self.ensure_flow_vector_index_space()
-            .map_err(engine_to_io)?;
+    ) -> Result<Vec<FlowVectorRecord>, EngineError> {
+        self.ensure_flow_vector_index_space()?;
         let rev_ceiling = as_of.unwrap_or_else(|| self.revision());
         let wm_vec = self.derivation.flow_vector_index_watermark_vector();
         let _wm = wm_vec.scalar_meet();
@@ -2212,7 +2262,7 @@ impl InfiniteDb {
         edge_space: SpaceId,
         id: HyperedgeId,
         as_of: Option<RevisionId>,
-    ) -> io::Result<Option<FlowVectorRecord>> {
+    ) -> Result<Option<FlowVectorRecord>, EngineError> {
         let rev_ceiling = as_of.unwrap_or_else(|| self.revision());
         let Some(edge) = self.fetch_hyperedge_by_id(edge_space, id, as_of)? else {
             return Ok(None);
@@ -2237,18 +2287,15 @@ impl InfiniteDb {
         edge_space: SpaceId,
         id: HyperedgeId,
         as_of: Option<RevisionId>,
-    ) -> io::Result<FreshnessReport> {
+    ) -> Result<FreshnessReport, EngineError> {
         let edge = self
             .fetch_hyperedge_by_id(edge_space, id, as_of)?
-            .ok_or_else(|| {
-                io::Error::new(io::ErrorKind::NotFound, format!("hyperedge {:?} not found", id))
+            .ok_or(EngineError::Other {
+                message: format!("hyperedge {:?} not found", id),
             })?;
         check_computation_freshness(&edge, &|pin| self.fetch_subject_revision_at(pin, as_of))
-            .ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "hyperedge has no computation provenance",
-                )
+            .ok_or(EngineError::InvalidSpaceConfig {
+                message: "hyperedge has no computation provenance".into(),
             })
     }
 
@@ -2259,7 +2306,7 @@ impl InfiniteDb {
         edge_space: SpaceId,
         max_depth: usize,
         as_of: Option<RevisionId>,
-    ) -> io::Result<Vec<StaleTarget>> {
+    ) -> Result<Vec<StaleTarget>, EngineError> {
         self.query_staleness_by_source_revision(subject, edge_space, max_depth, as_of)
     }
 
@@ -2270,7 +2317,7 @@ impl InfiniteDb {
         edge_space: SpaceId,
         max_depth: usize,
         as_of: Option<RevisionId>,
-    ) -> io::Result<Vec<StaleTarget>> {
+    ) -> Result<Vec<StaleTarget>, EngineError> {
         let rev_ceiling = as_of.unwrap_or_else(|| self.revision());
         let wm_vec = self.derivation.endpoint_index_watermark_vector();
         let wm = wm_vec.scalar_meet();
@@ -2305,6 +2352,7 @@ impl InfiniteDb {
             &|pin| self.fetch_subject_revision_at(pin, as_of),
             &seeds,
         )
+        .map_err(EngineError::from)
     }
 
     fn validate_frame_request(
@@ -2441,8 +2489,7 @@ impl InfiniteDb {
         let mut judgments_by_subject: HashMap<SubjectPin, Vec<JudgmentRecord>> = HashMap::new();
         for layer in layers {
             let js = self
-                .query_judgments_in_region(layer.arbiter, min.clone(), max.clone(), Some(as_of))
-                .map_err(EngineError::from)?;
+                .query_judgments_in_region(layer.arbiter, min.clone(), max.clone(), Some(as_of))?;
             for j in js {
                 judgments_by_subject
                     .entry(j.subject.clone())
@@ -2598,15 +2645,14 @@ impl InfiniteDb {
         source: BranchId,
         strategy: MergeStrategy,
         resolver: Option<Box<dyn Fn(MergeConflict) -> Record + Send + Sync>>,
-    ) -> io::Result<MergeResult> {
+    ) -> Result<MergeResult, EngineError> {
         self.sync()?;
         let ctx = self.query_ctx();
         let mut result = merge_branches(
             &self.store,
             &self.snapshots,
-            ctx.live_tail,
-            ctx.space_tails,
-            ctx.hilbert_tails,
+            None,
+            Some(ctx.hilbert_tails),
             &self.branch_overlays,
             &self.spaces.read(),
             &self.session_watermarks,
@@ -2615,13 +2661,16 @@ impl InfiniteDb {
             source,
             strategy,
             resolver.as_deref(),
-        )?;
+        )
+        .map_err(EngineError::from)?;
         if strategy == MergeStrategy::Interactive && !result.conflicts.is_empty() {
             return Ok(result);
         }
         let applied = std::mem::take(&mut result.applied_records);
         self.apply_records_on_branch(target, applied)?;
-        self.branch_overlays.clear_branch(source, &self.root)?;
+        self.branch_overlays
+            .clear_branch(source, &self.root)
+            .map_err(EngineError::from)?;
         self.sync()?;
         Ok(result)
     }
@@ -2632,28 +2681,8 @@ impl InfiniteDb {
         branch: BranchId,
         space: SpaceId,
         as_of: Option<RevisionId>,
-    ) -> io::Result<Vec<Record>> {
-        let ctx = self.query_ctx();
-        let branch_id = if branch == BranchId::MAIN {
-            None
-        } else {
-            Some(branch)
-        };
-        query_inner(
-            &self.store,
-            &self.snapshots,
-            ctx.live_tail,
-            ctx.space_tails,
-            &self.spaces.read(),
-            &self.session_watermarks,
-            space,
-            None,
-            as_of,
-            false,
-            ctx.hilbert_tails,
-            Some(&self.branch_overlays),
-            branch_id,
-        )
+    ) -> Result<Vec<Record>, EngineError> {
+        self.query_on_branch_pinned(branch, space, as_of, None)
     }
 
     /// Enqueue writes across multiple spaces (ordered by space id).
@@ -2662,7 +2691,7 @@ impl InfiniteDb {
     /// [`RevisionWatermark::allocate`] or [`RevisionWatermark::allocate_n`]
     /// (via `insert`, `insert_many`, etc.) so the revision is already
     /// registered as outstanding.
-    pub fn enqueue_batch(&self, jobs: Vec<WriteJob>) -> io::Result<()> {
+    pub fn enqueue_batch(&self, jobs: Vec<WriteJob>) -> Result<(), EngineError> {
         let mut main_jobs = Vec::with_capacity(jobs.len());
         let mut branch_batches: std::collections::BTreeMap<OverlayKey, Vec<Record>> =
             std::collections::BTreeMap::new();
@@ -2688,7 +2717,7 @@ impl InfiniteDb {
                 for rev in &revs {
                     self.session_watermarks.retire_failed(*rev, e.to_string());
                 }
-                return result;
+                return result.map_err(EngineError::from);
             }
             for rev in revs {
                 self.session_watermarks.retire(rev);
@@ -2698,16 +2727,10 @@ impl InfiniteDb {
             return Ok(());
         }
         let main_revs: Vec<RevisionId> = main_jobs.iter().map(|j| j.revision).collect();
-        let result = match &mut *self.backend.lock() {
-            WriteBackend::V4 { coordinator } => coordinator.enqueue_batch(main_jobs),
-            WriteBackend::V3 { coordinator } => coordinator.enqueue_batch(main_jobs),
-            WriteBackend::V2 { queue, .. } => {
-                for job in main_jobs {
-                    queue.enqueue_write(job)?;
-                }
-                Ok(())
-            }
-        };
+        let result = self
+            .coordinator
+            .enqueue_batch(main_jobs)
+            .map_err(EngineError::from);
         if let Err(ref e) = result {
             for rev in &main_revs {
                 self.session_watermarks.retire_failed(*rev, e.to_string());
@@ -2721,7 +2744,7 @@ impl InfiniteDb {
         &self,
         space: SpaceId,
         as_of: Option<RevisionId>,
-    ) -> io::Result<Vec<Record>> {
+    ) -> Result<Vec<Record>, EngineError> {
         self.query_on_branch(BranchId::MAIN, space, as_of)
     }
 
@@ -2732,7 +2755,7 @@ impl InfiniteDb {
         min: DimensionVector,
         max: DimensionVector,
         as_of: Option<RevisionId>,
-    ) -> io::Result<Vec<Record>> {
+    ) -> Result<Vec<Record>, EngineError> {
         self.query_bbox_on_branch(BranchId::MAIN, space, min, max, as_of)
     }
 
@@ -2744,48 +2767,22 @@ impl InfiniteDb {
         min: DimensionVector,
         max: DimensionVector,
         as_of: Option<RevisionId>,
-    ) -> io::Result<Vec<Record>> {
-        let ctx = self.query_ctx();
-        let branch_id = if branch == BranchId::MAIN {
-            None
-        } else {
-            Some(branch)
-        };
-        query_bbox(
-            &self.store,
-            &self.snapshots,
-            ctx.live_tail,
-            ctx.space_tails,
-            &self.spaces.read(),
-            &self.session_watermarks,
-            space,
-            min,
-            max,
-            as_of,
-            ctx.hilbert_tails,
-            Some(&self.branch_overlays),
-            branch_id,
-        )
+    ) -> Result<Vec<Record>, EngineError> {
+        self.query_bbox_on_branch_pinned(branch, space, min, max, as_of, None)
     }
 
     /// Flush pending writes for one space to durable storage without syncing all spaces.
-    pub fn flush(&self, space: SpaceId) -> io::Result<()> {
-        match &*self.backend.lock() {
-            WriteBackend::V4 { coordinator } => coordinator.flush_space(space)?,
-            WriteBackend::V3 { coordinator } => coordinator.flush_space(space)?,
-            WriteBackend::V2 { queue, .. } => queue.request_flush(space)?,
-        }
+    pub fn flush(&self, space: SpaceId) -> Result<(), EngineError> {
+        self.coordinator
+            .flush_space(space)
+            .map_err(EngineError::from)?;
         self.persist_meta()
     }
 
     /// Flush all write queues and persist metadata. Call after writes to make data queryable.
-    pub fn sync(&self) -> io::Result<()> {
+    pub fn sync(&self) -> Result<(), EngineError> {
         self.derivation.flush();
-        match &*self.backend.lock() {
-            WriteBackend::V4 { coordinator } => coordinator.sync_all()?,
-            WriteBackend::V3 { coordinator } => coordinator.sync_all()?,
-            WriteBackend::V2 { queue, .. } => queue.request_sync()?,
-        }
+        self.coordinator.sync_all().map_err(EngineError::from)?;
         self.persist_meta()
     }
 
@@ -2793,7 +2790,9 @@ impl InfiniteDb {
     ///
     /// Revisions are registered as outstanding until the write path retires them.
     pub fn allocate_revisions(&self, count: u64) -> RevisionRange {
-        self.default_write_session.stamp_n(count)
+        self.default_write_session
+            .stamp_n(count)
+            .expect("global session stamp_n")
     }
 
     /// Open a new asserting write session with a locally minted `SessionId` (D-P2).
@@ -2819,8 +2818,8 @@ impl InfiniteDb {
         space: SpaceId,
         point: DimensionVector,
         data: Vec<u8>,
-    ) -> io::Result<RevisionId> {
-        let rev = session.stamp();
+    ) -> Result<RevisionId, EngineError> {
+        let rev = session.stamp()?;
         let address = Address::new(space, point.clone());
         let entry = WalEntry::Write {
             address: address.clone(),
@@ -2831,9 +2830,7 @@ impl InfiniteDb {
         if session.uses_session_wal() {
             if !self.timed_fast_path.enabled {
                 self.session_wal_store
-                    .append_frame(session.id(), &entry)
-                    .map_err(EngineError::from)
-                    .map_err(engine_to_io)?;
+                    .append_frame(session.id(), &entry)?;
             }
             self.session_wal_store.update_highest_revision(session.id(), rev);
             session.note_buffered_write(
@@ -2851,41 +2848,34 @@ impl InfiniteDb {
     /// Insert a hyperedge through an explicit write session (Phase 5 session WAL path).
     ///
     /// Appends to the session WAL only; call [`Self::sync_session_wal`] then
-    /// [`Self::commit_session_intent`] (or [`Self::sync_session`]) to publish.
+    /// [`Self::commit_session_intent`] to publish.
     pub fn insert_hyperedge_with_session(
         &self,
         session: &WriteSession,
         space: SpaceId,
         mut edge: Hyperedge,
-    ) -> io::Result<RevisionId> {
+    ) -> Result<RevisionId, EngineError> {
         if !session.uses_session_wal() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "insert_hyperedge_with_session requires an explicit session WAL",
-            ));
+            return Err(EngineError::InvalidSpaceConfig {
+                message: "insert_hyperedge_with_session requires an explicit session WAL".into(),
+            });
         }
-        edge.validate()
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("{:?}", e)))?;
-        self.ensure_endpoint_index_space()
-            .map_err(engine_to_io)?;
-        self.ensure_flow_vector_index_space()
-            .map_err(engine_to_io)?;
+        edge.validate().map_err(EngineError::from)?;
+        self.ensure_endpoint_index_space()?;
+        self.ensure_flow_vector_index_space()?;
         self.check_derivation_backpressure_for(
             session.id(),
             self.session_watermarks.watermark_for(session.id()).allocated(),
-        )
-            .map_err(engine_to_io)?;
-        let rev = session.stamp();
+        )?;
+        let rev = session.stamp()?;
         if let Some(ref prov) = edge.authoring_frame {
-            validate_authoring_provenance(prov, rev)
-                .map_err(|e| engine_to_io(EngineError::from(e)))?;
+            validate_authoring_provenance(prov, rev)?;
         }
         if let Some(ref comp) = edge.computation {
-            self.validate_computation_inputs(comp)
-                .map_err(engine_to_io)?;
+            self.validate_computation_inputs(comp)?;
         }
         edge.valid_from = rev;
-        let row = prepare_assertion_write(space, &edge)?;
+        let row = prepare_assertion_write(space, &edge).map_err(EngineError::from)?;
         let record = Record {
             address: Address::new(row.space, row.point.clone()),
             revision: rev,
@@ -2901,9 +2891,7 @@ impl InfiniteDb {
         };
         if !self.timed_fast_path.enabled {
             self.session_wal_store
-                .append_frame(session.id(), &entry)
-                .map_err(EngineError::from)
-                .map_err(engine_to_io)?;
+                .append_frame(session.id(), &entry)?;
         }
         self.session_wal_store.update_highest_revision(session.id(), rev);
         let event = AssertionEvent::upsert(space, edge, rev, BranchId::MAIN);
@@ -2918,38 +2906,31 @@ impl InfiniteDb {
     }
 
     /// Fsync durable storage without publishing to the live store (Phase 4/7).
-    pub fn sync_session_wal(&self, session: &WriteSession) -> io::Result<DurableIntent> {
+    pub fn sync_session_wal(
+        &self,
+        session: &WriteSession,
+    ) -> Result<DurableIntent, EngineError> {
         if session.uses_session_wal() {
             if self.timed_fast_path.enabled {
                 let entries = session.peek_pending_entries();
                 if !entries.is_empty() {
-                    match self
-                        .session_wal_store
-                        .try_fast_seal(
-                            session.id(),
-                            &entries,
-                            self.timed_fast_path.direct_seal_deadline,
-                        )
-                        .map_err(EngineError::from)
-                        .map_err(engine_to_io)?
-                    {
+                    match self.session_wal_store.try_fast_seal(
+                        session.id(),
+                        &entries,
+                        self.timed_fast_path.direct_seal_deadline,
+                    )? {
                         FastSealOutcome::Sealed => {
                             self.persist_meta()?;
                             return Ok(session.mark_durable(DurabilityMedium::FastSegment));
                         }
                         FastSealOutcome::TimedOut => {
                             self.session_wal_store
-                                .append_buffered_to_wal(session.id(), &entries)
-                                .map_err(EngineError::from)
-                                .map_err(engine_to_io)?;
+                                .append_buffered_to_wal(session.id(), &entries)?;
                         }
                     }
                 }
             }
-            self.session_wal_store
-                .sync_group(session.id())
-                .map_err(EngineError::from)
-                .map_err(engine_to_io)?;
+            self.session_wal_store.sync_group(session.id())?;
             self.persist_meta()?;
             return Ok(session.mark_durable(DurabilityMedium::SessionWal));
         }
@@ -2964,7 +2945,7 @@ impl InfiniteDb {
         &self,
         session: &WriteSession,
         durable: &DurableIntent,
-    ) -> Result<IntentCheckpoint, EngineError> {
+    ) -> Result<crate::engine::collision::IntentCommitOutcome, EngineError> {
         if !session.uses_session_wal() {
             return Err(EngineError::InvalidSpaceConfig {
                 message: "commit_session_intent requires an explicit session WAL".into(),
@@ -2986,18 +2967,20 @@ impl InfiniteDb {
         self.session_wal_store
             .update_highest_revision(session.id(), checkpoint.last_revision);
 
-        if let Some(collision_space) = self.detect_checkpoint_collisions(session.id(), &buffered)? {
+        let collisions =
+            self.detect_checkpoint_collisions(session.id(), &checkpoint, &buffered)?;
+        for eval in &collisions {
             let record = operation_record_checkpoint_collision(
-                collision_space,
+                eval.address.space,
                 &checkpoint,
                 format!(
-                    "address overlap at intent checkpoint for session {}",
-                    session.id().0
+                    "address overlap at {:?} sessions {:?} revisions {:?}",
+                    eval.address.point, eval.sessions, eval.revisions
                 ),
             );
-            self.persist_operation_errors(collision_space, record)?;
+            self.persist_operation_errors(eval.address.space, record)?;
         }
-        self.mark_session_wal_collision_evaluated(session.id());
+        self.mark_session_wal_collision_evaluated_through(session.id(), checkpoint.last_revision);
 
         let mut jobs = Vec::with_capacity(buffered.len());
         let mut assertion_events = Vec::new();
@@ -3025,14 +3008,18 @@ impl InfiniteDb {
                 }
             })?;
         }
-        self.derivation.flush();
+        self.derivation
+            .wait_for_session(session.id(), checkpoint.last_revision);
         if medium == DurabilityMedium::FastSegment {
             self.session_wal_store
                 .reset_fast_after_commit(session.id())
                 .map_err(EngineError::from)?;
         }
         self.persist_meta()?;
-        Ok(checkpoint)
+        Ok(crate::engine::collision::IntentCommitOutcome {
+            checkpoint,
+            collisions,
+        })
     }
 
     /// Session fast-path counters (Phase 7).
@@ -3043,61 +3030,81 @@ impl InfiniteDb {
     fn detect_checkpoint_collisions(
         &self,
         session: crate::infinitedb_core::hlc::SessionId,
+        checkpoint: &IntentCheckpoint,
         buffered: &[crate::engine::session::BufferedSessionWrite],
-    ) -> Result<Option<SpaceId>, EngineError> {
+    ) -> Result<Vec<CollisionEvaluation>, EngineError> {
+        use std::collections::HashSet;
+        let ceiling = checkpoint.last_revision;
+        let mut seen = HashSet::new();
+        let mut out = Vec::new();
         for item in buffered {
-            let (space, point) = match &item.entry {
+            let address = match &item.entry {
                 WalEntry::Write { address, .. } | WalEntry::Tombstone { address, .. } => {
-                    (&address.space, &address.point)
+                    address.clone()
                 }
                 _ => continue,
             };
-            let rows = self
-                .query(*space, None)
-                .map_err(|e| EngineError::Other {
-                    message: e.to_string(),
-                })?;
+            if !seen.insert((address.space, address.point.clone())) {
+                continue;
+            }
+            let rows = self.query_bbox_on_branch(
+                BranchId::MAIN,
+                address.space,
+                address.point.clone(),
+                address.point.clone(),
+                Some(ceiling),
+            )?;
+            let mut sessions = vec![session];
+            let mut revisions = Vec::new();
             for row in rows {
-                if row.address.point == *point && row.revision.session() != session.0 {
-                    return Ok(Some(*space));
+                if row.revision.session() != session.0 {
+                    let sid = SessionId(row.revision.session());
+                    if !sessions.contains(&sid) {
+                        sessions.push(sid);
+                    }
+                    revisions.push(row.revision);
                 }
             }
+            if !revisions.is_empty() {
+                out.push(CollisionEvaluation::new(address, sessions, revisions));
+            }
         }
-        Ok(None)
+        Ok(out)
     }
 
-    /// Durably sync one session's WAL (legacy alias — prefer [`Self::sync_session_wal`] +
-    /// [`Self::commit_session_intent`]).
-    pub fn sync_session(&self, session: &WriteSession) -> io::Result<()> {
-        let durable = self.sync_session_wal(session)?;
-        if session.has_pending_intent() {
-            self.commit_session_intent(session, &durable)
-                .map_err(engine_to_io)?;
-        } else {
-            self.sync()?;
+    /// Mark retirement gates for a session WAL through an explicit revision.
+    pub fn mark_session_wal_sealed(&self, session: SessionId, through: RevisionId) {
+        self.session_wal_store
+            .mark_sealed_through(session, through);
+        if self.replication_gate == ReplicationGatePolicy::NotApplicable {
+            self.session_wal_store
+                .mark_replication_confirmed_through(session, through);
         }
-        Ok(())
     }
 
-    /// Mark retirement gates for a session WAL (Phase 3).
-    pub fn mark_session_wal_sealed(&self, session: SessionId) {
-        self.session_wal_store.mark_sealed(session);
+    pub fn mark_session_wal_replication_confirmed(
+        &self,
+        session: SessionId,
+        through: RevisionId,
+    ) {
+        self.session_wal_store
+            .mark_replication_confirmed_through(session, through);
     }
 
-    pub fn mark_session_wal_replication_confirmed(&self, session: SessionId) {
-        self.session_wal_store.mark_replication_confirmed(session);
-    }
-
-    pub fn mark_session_wal_collision_evaluated(&self, session: SessionId) {
-        self.session_wal_store.mark_collision_evaluated(session);
+    pub fn mark_session_wal_collision_evaluated_through(
+        &self,
+        session: SessionId,
+        through: RevisionId,
+    ) {
+        self.session_wal_store
+            .mark_collision_evaluated_through(session, through);
     }
 
     /// Delete a session WAL when all retirement gates are satisfied.
-    pub fn try_retire_session_wal(&self, session: SessionId) -> io::Result<bool> {
+    pub fn retire_session_wal(&self, session: SessionId) -> Result<bool, EngineError> {
         self.session_wal_store
             .try_retire_wal(session)
             .map_err(EngineError::from)
-            .map_err(engine_to_io)
     }
 
     /// Capture per-session stable ceilings for repeatable-read pinning (Phase 2).
@@ -3131,24 +3138,9 @@ impl InfiniteDb {
         crate::concurrent::read_txn::ReadTxn::new(self)
     }
 
-    /// I/O queue depth and write-path counters across all backend threads.
+    /// I/O queue depth and write-path counters across all Hilbert-shard threads.
     pub fn io_stats(&self) -> IoStats {
-        let mut stats = match &*self.backend.lock() {
-            WriteBackend::V4 { coordinator } => coordinator.io_stats(),
-            WriteBackend::V3 { coordinator } => coordinator.io_stats(),
-            WriteBackend::V2 { queue, io_handle, .. } => {
-                let handle = io_handle.lock();
-                IoStats {
-                    queue_depth: queue.queued_count(),
-                    direct_writes: handle.direct_writes(),
-                    staged_writes: handle.staged_writes(),
-                    staging_wal_frames: 0,
-                    fast_path_seal_success: 0,
-                    fast_path_seal_timeout: 0,
-                    fast_path_wal_fallback: 0,
-                }
-            }
-        };
+        let mut stats = self.coordinator.io_stats();
         let ws = self.session_wal_store.write_stats();
         stats.fast_path_seal_success = ws.fast_path_seal_success;
         stats.fast_path_seal_timeout = ws.fast_path_seal_timeout;
@@ -3156,20 +3148,14 @@ impl InfiniteDb {
         stats
     }
 
-    /// Number of I/O shards (1 for format v2, per-space or per-Hilbert-shard for v3/v4).
+    /// Number of Hilbert I/O shards across registered spaces.
     pub fn space_shard_count(&self) -> usize {
-        match &*self.backend.lock() {
-            WriteBackend::V4 { coordinator } => coordinator.shard_count(),
-            WriteBackend::V3 { coordinator } => coordinator.shard_count(),
-            WriteBackend::V2 { .. } => 1,
-        }
+        self.coordinator.shard_count()
     }
 
     pub(crate) fn query_ctx(&self) -> QueryCtx<'_> {
         QueryCtx {
-            live_tail: self.v2_live_tail.as_deref(),
-            space_tails: self.v3_space_tails.as_deref(),
-            hilbert_tails: self.v4_hilbert_tails.as_deref(),
+            hilbert_tails: &self.hilbert_tails,
         }
     }
 
@@ -3178,7 +3164,7 @@ impl InfiniteDb {
         &self,
         space: SpaceId,
         rows: Vec<(DimensionVector, Vec<u8>)>,
-    ) -> io::Result<(RevisionId, RevisionId)> {
+    ) -> Result<(RevisionId, RevisionId), EngineError> {
         self.insert_many_on_branch(BranchId::MAIN, space, rows)
     }
 
@@ -3188,16 +3174,15 @@ impl InfiniteDb {
         branch: BranchId,
         space: SpaceId,
         rows: Vec<(DimensionVector, Vec<u8>)>,
-    ) -> io::Result<(RevisionId, RevisionId)> {
+    ) -> Result<(RevisionId, RevisionId), EngineError> {
         if rows.is_empty() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "insert_many requires at least one row",
-            ));
+            return Err(EngineError::InvalidSpaceConfig {
+                message: "insert_many requires at least one row".into(),
+            });
         }
         const CHUNK: usize = 4096;
         let count = rows.len() as u64;
-        let range = self.default_write_session.stamp_n(count);
+        let range = self.default_write_session.stamp_n(count)?;
         let mut jobs = Vec::with_capacity(rows.len().min(CHUNK));
         let spaces = self.spaces.read();
         for (idx, (point, data)) in rows.into_iter().enumerate() {
@@ -3228,7 +3213,7 @@ impl InfiniteDb {
     }
 
     /// Manually compact small blocks in `space` using the space's configured policy.
-    pub fn compact(&self, space: SpaceId) -> io::Result<()> {
+    pub fn compact(&self, space: SpaceId) -> Result<(), EngineError> {
         self.compact_with(space, None)
     }
 
@@ -3237,23 +3222,29 @@ impl InfiniteDb {
         &self,
         space: SpaceId,
         policy: Option<CompactionPolicy>,
-    ) -> io::Result<()> {
+    ) -> Result<(), EngineError> {
+        let force = policy.is_some();
         if let Some(p) = policy {
             self.compaction_overrides.lock().insert(space, p);
         }
         let result = (|| {
             self.sync()?;
-            match &*self.backend.lock() {
-                WriteBackend::V4 { coordinator } => coordinator.compact_space(space),
-                WriteBackend::V3 { coordinator } => coordinator.compact_space(space),
-                WriteBackend::V2 { .. } => Ok(()),
+            if force {
+                self.coordinator
+                    .force_compact_space(space)
+                    .map_err(EngineError::from)
+            } else {
+                self.coordinator
+                    .compact_space(space)
+                    .map_err(EngineError::from)
             }
         })();
         self.compaction_overrides.lock().remove(&space);
         result
     }
 
-    fn enqueue(&self, job: WriteJob) -> io::Result<()> {
+    /// Enqueue a write job on `main` or a branch overlay.
+    pub fn enqueue(&self, job: WriteJob) -> Result<(), EngineError> {
         let rev = job.revision;
         if job.branch_id != BranchId::MAIN {
             let branch_id = job.branch_id;
@@ -3266,16 +3257,15 @@ impl InfiniteDb {
                 &self.root,
             ) {
                 self.session_watermarks.retire_failed(rev, e.to_string());
-                return Err(e);
+                return Err(EngineError::from(e));
             }
             self.session_watermarks.retire(rev);
             return Ok(());
         }
-        let result = match &*self.backend.lock() {
-            WriteBackend::V4 { coordinator } => coordinator.enqueue_write(job),
-            WriteBackend::V3 { coordinator } => coordinator.enqueue_write(job),
-            WriteBackend::V2 { queue, .. } => queue.enqueue_write(job),
-        };
+        let result = self
+            .coordinator
+            .enqueue_write(job)
+            .map_err(EngineError::from);
         if let Err(ref e) = result {
             self.session_watermarks.retire_failed(rev, e.to_string());
         }
@@ -3293,7 +3283,9 @@ impl InfiniteDb {
     }
 
     fn next_revision(&self) -> RevisionId {
-        self.default_write_session.stamp()
+        self.default_write_session
+            .stamp()
+            .expect("global session stamp")
     }
 
     /// Apply many records on a branch through one allocation and batch enqueue.
@@ -3301,7 +3293,7 @@ impl InfiniteDb {
         &self,
         branch: BranchId,
         records: Vec<Record>,
-    ) -> io::Result<()> {
+    ) -> Result<(), EngineError> {
         if records.is_empty() {
             return Ok(());
         }
@@ -3371,7 +3363,7 @@ impl InfiniteDb {
         ids: Vec<HyperedgeId>,
         rev_ceiling: RevisionId,
         watermark: &VersionVector,
-    ) -> io::Result<Vec<HyperedgeId>> {
+    ) -> Result<Vec<HyperedgeId>, EngineError> {
         self.merge_incident_ids_from_assertion_delta_multi_space(
             &[edge_space],
             endpoint,
@@ -3392,7 +3384,7 @@ impl InfiniteDb {
         rev_ceiling: RevisionId,
         watermark: &VersionVector,
         admitted_sessions: Option<&[SessionId]>,
-    ) -> io::Result<Vec<HyperedgeId>> {
+    ) -> Result<Vec<HyperedgeId>, EngineError> {
         use std::collections::HashSet;
         let mut set: HashSet<HyperedgeId> = ids.drain(..).collect();
         let index_layout = registry_index_layout(&self.spaces.read());
@@ -3433,7 +3425,7 @@ impl InfiniteDb {
         rev_ceiling: RevisionId,
         watermark: &VersionVector,
         index_only: bool,
-    ) -> io::Result<Option<Hyperedge>> {
+    ) -> Result<Option<Hyperedge>, EngineError> {
         for &space in edge_spaces {
             if let Some(edge) = self.fetch_hyperedge_by_id(space, id, as_of)? {
                 return Ok(Some(edge));
@@ -3465,7 +3457,7 @@ impl InfiniteDb {
         &self,
         rev_ceiling: RevisionId,
         watermark: &VersionVector,
-    ) -> io::Result<Vec<Record>> {
+    ) -> Result<Vec<Record>, EngineError> {
         let q = default_flow_vector_quantization();
         let edge_spaces = edge_spaces_from_registry(&self.spaces.read());
         let mut synthetic = Vec::new();
@@ -3501,7 +3493,7 @@ impl InfiniteDb {
         watermark: &VersionVector,
         index_layout: EndpointIndexLayout,
         admitted_sessions: Option<&[SessionId]>,
-    ) -> io::Result<Vec<Record>> {
+    ) -> Result<Vec<Record>, EngineError> {
         let records = self.query_on_branch(BranchId::MAIN, edge_space, Some(rev_ceiling))?;
         let mut synthetic = Vec::new();
         for r in records {
@@ -3529,19 +3521,31 @@ impl InfiniteDb {
         Ok(synthetic)
     }
 
-    fn persist_meta(&self) -> io::Result<()> {
+    fn persist_meta(&self) -> Result<(), EngineError> {
         let spaces_bytes = encode_to_vec(&*self.spaces.read(), standard())
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-        self.store.write_meta("spaces.bin", &spaces_bytes)?;
+            .map_err(|e| EngineError::Other {
+                message: e.to_string(),
+            })?;
+        self.store
+            .write_meta("spaces.bin", &spaces_bytes)
+            .map_err(EngineError::from)?;
 
         let branches_bytes = encode_to_vec(&*self.branches.read(), standard())
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-        self.store.write_meta("branches.bin", &branches_bytes)?;
+            .map_err(|e| EngineError::Other {
+                message: e.to_string(),
+            })?;
+        self.store
+            .write_meta("branches.bin", &branches_bytes)
+            .map_err(EngineError::from)?;
 
         let snapshots = snapshots_map_for_persist(&self.snapshots);
         let snapshots_bytes = encode_to_vec(&snapshots, standard())
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-        self.store.write_meta("snapshots.bin", &snapshots_bytes)?;
+            .map_err(|e| EngineError::Other {
+                message: e.to_string(),
+            })?;
+        self.store
+            .write_meta("snapshots.bin", &snapshots_bytes)
+            .map_err(EngineError::from)?;
 
         let counters = PersistedCounters::new(
             self.session_watermarks.allocated().legacy_sequence(),
@@ -3551,24 +3555,40 @@ impl InfiniteDb {
             self.session_watermarks.next_session_counter(),
         );
         let counters_bytes = encode_to_vec(&counters, standard())
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-        self.store.write_meta("counters.bin", &counters_bytes)?;
+            .map_err(|e| EngineError::Other {
+                message: e.to_string(),
+            })?;
+        self.store
+            .write_meta("counters.bin", &counters_bytes)
+            .map_err(EngineError::from)?;
 
         let branch_bases = self.branch_overlays.export_bases();
         let branch_bases_bytes = encode_to_vec(&branch_bases, standard())
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-        self.store.write_meta("branch_bases.bin", &branch_bases_bytes)?;
+            .map_err(|e| EngineError::Other {
+                message: e.to_string(),
+            })?;
+        self.store
+            .write_meta("branch_bases.bin", &branch_bases_bytes)
+            .map_err(EngineError::from)?;
 
         let arbiter_streams_bytes = encode_to_vec(&*self.arbiter_streams.read(), standard())
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+            .map_err(|e| EngineError::Other {
+                message: e.to_string(),
+            })?;
         self.store
-            .write_meta("arbiter_streams.bin", &arbiter_streams_bytes)?;
+            .write_meta("arbiter_streams.bin", &arbiter_streams_bytes)
+            .map_err(EngineError::from)?;
 
         let frames_bytes = encode_to_vec(&*self.frames.read(), standard())
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-        self.store.write_meta("frames.bin", &frames_bytes)?;
+            .map_err(|e| EngineError::Other {
+                message: e.to_string(),
+            })?;
+        self.store
+            .write_meta("frames.bin", &frames_bytes)
+            .map_err(EngineError::from)?;
 
-        persist_session_wal_meta(&self.root.join("meta"), &self.session_wal_store.meta())?;
+        persist_session_wal_meta(&self.root.join("meta"), &self.session_wal_store.meta())
+            .map_err(EngineError::from)?;
         Ok(())
     }
 }
@@ -3577,18 +3597,7 @@ impl Drop for InfiniteDb {
     fn drop(&mut self) {
         self.derivation.shutdown();
         let _ = self.persist_meta();
-        match &*self.backend.lock() {
-            WriteBackend::V4 { coordinator } => {
-                let _ = coordinator.shutdown_all();
-            }
-            WriteBackend::V3 { coordinator } => {
-                let _ = coordinator.shutdown_all();
-            }
-            WriteBackend::V2 { queue, io_handle, .. } => {
-                let _ = queue.shutdown();
-                let _ = io_handle.lock().join();
-            }
-        }
+        let _ = self.coordinator.shutdown_all();
     }
 }
 
@@ -3649,9 +3658,7 @@ fn load_meta(store: &BlockStore) -> Option<MetaTuple> {
 }
 
 pub(crate) struct QueryCtx<'a> {
-    pub live_tail: Option<&'a LiveTailView>,
-    pub space_tails: Option<&'a SpaceLiveTails>,
-    pub hilbert_tails: Option<&'a HilbertLiveTails>,
+    pub hilbert_tails: &'a HilbertLiveTails,
 }
 
 fn default_meta() -> MetaTuple {

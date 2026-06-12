@@ -129,28 +129,34 @@ pub fn project_api_error(err: EngineError) -> ApiError {
     match err {
         EngineError::SpaceNotFound(id) => ApiError::SpaceNotFound(id),
         EngineError::InvalidHyperedge(e) => ApiError::InvalidRequest(format!("{e:?}")),
-        EngineError::InvalidSpaceConfig { message }
-        | EngineError::BranchExists(_)
-        | EngineError::BranchNotFound(_)
-        | EngineError::RegistrySpace(crate::infinitedb_core::space::SpaceError::DuplicateId(_))
-        | EngineError::RegistrySpace(crate::infinitedb_core::space::SpaceError::DuplicateName(_))
-        | EngineError::RegistryBranch(
-            crate::infinitedb_core::branch::BranchError::DuplicateName(_),
-        )
-        | EngineError::RegistryBranch(crate::infinitedb_core::branch::BranchError::NotFound(_))
-        | EngineError::EndpointIndexMissing
-        | EngineError::ErrorSpaceMissing(_)
-        | EngineError::InvalidJudgment(_)
-        | EngineError::InvalidProvenance(_)
-        | EngineError::ArbiterStreamExists(_)
-        | EngineError::ArbiterStreamNotFound(_)
-        | EngineError::FrameExists(_)
-        | EngineError::FrameNotFound(_)
-        | EngineError::InvalidFrame(_)
-        | EngineError::InvalidComputation(_) => ApiError::InvalidRequest(err.to_string()),
-        EngineError::DerivationBackpressure { .. } => {
-            ApiError::InvalidRequest(err.to_string())
-        }
+        e @ (
+            EngineError::InvalidSpaceConfig { .. }
+            | EngineError::BranchExists(_)
+            | EngineError::BranchNotFound(_)
+            | EngineError::RegistrySpace(crate::infinitedb_core::space::SpaceError::DuplicateId(_))
+            | EngineError::RegistrySpace(crate::infinitedb_core::space::SpaceError::DuplicateName(_))
+            | EngineError::RegistryBranch(
+                crate::infinitedb_core::branch::BranchError::DuplicateName(_),
+            )
+            | EngineError::RegistryBranch(crate::infinitedb_core::branch::BranchError::NotFound(_))
+            | EngineError::EndpointIndexMissing
+            | EngineError::ErrorSpaceMissing(_)
+            | EngineError::InvalidJudgment(_)
+            | EngineError::InvalidProvenance(_)
+            | EngineError::ArbiterStreamExists(_)
+            | EngineError::ArbiterStreamNotFound(_)
+            | EngineError::ReservedArbiterId(_)
+            | EngineError::FrameExists(_)
+            | EngineError::FrameNotFound(_)
+            | EngineError::InvalidFrame(_)
+            | EngineError::InvalidComputation(_)
+        ) => ApiError::InvalidRequest(e.to_string()),
+        EngineError::DerivationBackpressure {
+            pending_tasks,
+            derivation_lag,
+        } => ApiError::Busy {
+            retry_hint_ms: EngineError::derivation_retry_hint_ms(pending_tasks, derivation_lag),
+        },
         EngineError::ErrorKindCatalog(_) => ApiError::InvalidRequest(err.to_string()),
         EngineError::Storage(_)
         | EngineError::RegistrySpace(_)
@@ -171,6 +177,8 @@ pub enum ApiError {
     SpaceNotFound(SpaceId),
     /// Request could not be validated.
     InvalidRequest(String),
+    /// Transient overload — client should retry after `retry_hint_ms`.
+    Busy { retry_hint_ms: u64 },
     /// Internal failure while handling request.
     Internal(String),
 }
@@ -586,5 +594,17 @@ mod tests {
             |_| Ok(SnapshotId(1)),
         );
         assert!(matches!(r, Response::Error(ApiError::Unauthorised)));
+    }
+
+    #[test]
+    fn project_backpressure_to_busy() {
+        let err = EngineError::DerivationBackpressure {
+            pending_tasks: 4,
+            derivation_lag: 200,
+        };
+        match project_api_error(err) {
+            ApiError::Busy { retry_hint_ms } => assert!(retry_hint_ms >= 50),
+            other => panic!("expected Busy, got {other:?}"),
+        }
     }
 }

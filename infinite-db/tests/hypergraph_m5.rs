@@ -91,7 +91,7 @@ fn judgment_pin_rejects_wrong_revision() {
     let edge = directed_edge(9, hub.clone(), node(entity, 6));
     let rev = db.insert_hyperedge(edge_space, edge).unwrap();
     db.sync().unwrap();
-    db.register_arbiter_stream(ArbiterId(1), "validator", 2)
+    db.register_arbiter_stream(ArbiterId(10), "validator", 2)
         .unwrap();
     let bad_pin = SubjectPin {
         kind: SubjectKind::Hyperedge,
@@ -101,13 +101,13 @@ fn judgment_pin_rejects_wrong_revision() {
     };
     let record = JudgmentRecord {
         id: JudgmentId(1),
-        arbiter: ArbiterId(1),
+        arbiter: ArbiterId(10),
         subject: bad_pin,
         verdict: JudgmentVerdict::Pass,
         rationale: None,
         authoring_frame: None,
     };
-    let err = db.assert_judgment(ArbiterId(1), record).unwrap_err();
+    let err = db.assert_judgment(ArbiterId(10), record).unwrap_err();
     assert!(matches!(
         err,
         EngineError::InvalidJudgment(JudgmentValidationError::SubjectNotFound { .. })
@@ -123,7 +123,7 @@ fn judgment_region_query_finds_colocated_record() {
     let edge = directed_edge(3, hub.clone(), node(entity, 8));
     let rev = db.insert_hyperedge(edge_space, edge).unwrap();
     db.sync().unwrap();
-    db.register_arbiter_stream(ArbiterId(2), "code", 2).unwrap();
+    db.register_arbiter_stream(ArbiterId(11), "code", 2).unwrap();
     let pin = SubjectPin {
         kind: SubjectKind::Hyperedge,
         space: edge_space,
@@ -131,10 +131,10 @@ fn judgment_region_query_finds_colocated_record() {
         subject_revision: rev,
     };
     db.assert_judgment(
-        ArbiterId(2),
+        ArbiterId(11),
         JudgmentRecord {
             id: JudgmentId(10),
-            arbiter: ArbiterId(2),
+            arbiter: ArbiterId(11),
             subject: pin,
             verdict: JudgmentVerdict::Pass,
             rationale: None,
@@ -146,7 +146,7 @@ fn judgment_region_query_finds_colocated_record() {
     let storage = Hyperedge::storage_point(HyperedgeId(3));
     let found = db
         .query_judgments_in_region(
-            ArbiterId(2),
+            ArbiterId(11),
             storage.clone(),
             storage,
             None,

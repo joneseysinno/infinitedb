@@ -14,7 +14,6 @@ use super::query::query_inner;
 use super::hilbert_live_tails::HilbertLiveTails;
 use super::live_tail::LiveTailView;
 use super::snapshot_store::SnapshotStore;
-use super::space_live_tails::SpaceLiveTails;
 use crate::infinitedb_core::space::SpaceRegistry;
 use crate::infinitedb_storage::nvme::BlockStore;
 use super::session::SessionWatermarks;
@@ -78,7 +77,6 @@ pub fn merge_branches(
     store: &BlockStore,
     snapshots: &SnapshotStore,
     live_tail: Option<&LiveTailView>,
-    space_tails: Option<&SpaceLiveTails>,
     hilbert_tails: Option<&HilbertLiveTails>,
     branch_overlays: &BranchOverlayStore,
     spaces: &SpaceRegistry,
@@ -108,12 +106,12 @@ pub fn merge_branches(
             store,
             snapshots,
             live_tail,
-            space_tails,
             spaces,
             watermark,
             *space,
             None,
             Some(forked_at),
+            None,
             true,
             hilbert_tails,
             None,
@@ -129,10 +127,10 @@ pub fn merge_branches(
             store,
             snapshots,
             live_tail,
-            space_tails,
             spaces,
             watermark,
             *space,
+            None,
             None,
             None,
             true,

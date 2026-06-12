@@ -3,44 +3,27 @@
 use std::io;
 use std::path::Path;
 
-/// Networked multi-master cluster metadata (`meta/cluster.bin`).
+/// HLC revision wire + Hilbert shards + branch overlays (current).
 pub const FORMAT_VERSION_V5: u32 = 5;
 
-/// Hilbert shards + branch overlays (`spaces/<id>/shards/<shard>/hot.seg`).
+/// Hilbert shards + branch overlays.
 pub const FORMAT_VERSION_V4: u32 = 4;
-
-/// Per-space I/O threads (`spaces/<id>/hot.seg` + staging WAL).
-pub const FORMAT_VERSION_V3: u32 = 3;
-
-/// Single global I/O thread (`hot/<id>.seg` at db root).
-pub const FORMAT_VERSION_V2: u32 = 2;
-
-/// Legacy single-threaded layout (`wal.log` at db root).
-pub const FORMAT_VERSION_V1: u32 = 1;
 
 /// Persisted format marker written to `meta/format_version.bin`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FormatVersion(pub u32);
 
 impl FormatVersion {
-    /// Intra-space Hilbert sharding + branch merge (Phase C).
     pub fn v4() -> Self {
         Self(FORMAT_VERSION_V4)
     }
 
-    /// Per-space parallel writes (Phase B).
-    pub fn v3() -> Self {
-        Self(FORMAT_VERSION_V3)
+    pub fn v5() -> Self {
+        Self(FORMAT_VERSION_V5)
     }
 
-    /// Single I/O thread layout (Phase A).
-    pub fn v2() -> Self {
-        Self(FORMAT_VERSION_V2)
-    }
-
-    /// Original on-disk format v1 WAL layout (opening no longer supported).
-    pub fn v1() -> Self {
-        Self(FORMAT_VERSION_V1)
+    pub fn is_supported(self) -> bool {
+        matches!(self.0, FORMAT_VERSION_V4 | FORMAT_VERSION_V5)
     }
 
     /// Read `meta/format_version.bin` when present.

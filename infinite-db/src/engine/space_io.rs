@@ -39,7 +39,6 @@ use super::write_queue::{IoCommand, WriteQueueSender};
 pub struct SpaceIoHandle {
     join: Option<JoinHandle<io::Result<()>>>,
     direct_writes: Arc<AtomicU64>,
-    staged_writes: Arc<AtomicU64>,
 }
 
 impl SpaceIoHandle {
@@ -59,9 +58,7 @@ impl SpaceIoHandle {
         branch_overlays: Option<Arc<BranchOverlayStore>>,
     ) -> Self {
         let direct_writes = Arc::new(AtomicU64::new(0));
-        let staged_writes = Arc::new(AtomicU64::new(0));
         let direct_clone = Arc::clone(&direct_writes);
-        let staged_clone = Arc::clone(&staged_writes);
         let watermark_clone = Arc::clone(&watermark);
         let overrides_clone = Arc::clone(&compaction_overrides);
         let overlays_clone = branch_overlays;
@@ -85,7 +82,6 @@ impl SpaceIoHandle {
                     overrides_clone,
                     overlays_clone,
                     direct_clone,
-                    staged_clone,
                 )
             })
             .expect("spawn space io thread");
@@ -93,16 +89,11 @@ impl SpaceIoHandle {
         Self {
             join: Some(join),
             direct_writes,
-            staged_writes,
         }
     }
 
     pub fn direct_writes(&self) -> u64 {
         self.direct_writes.load(Ordering::Relaxed)
-    }
-
-    pub fn staged_writes(&self) -> u64 {
-        self.staged_writes.load(Ordering::Relaxed)
     }
 
     pub fn join(&mut self) -> io::Result<()> {
@@ -182,7 +173,6 @@ fn run_space_io_loop(
     compaction_overrides: CompactionPolicyOverrides,
     branch_overlays: Option<Arc<BranchOverlayStore>>,
     group_commits: Arc<AtomicU64>,
-    _staged_writes: Arc<AtomicU64>,
 ) -> io::Result<()> {
     let staging_path = space_dir.join("wal").join("staging.log");
     let mut state = SpaceIoState {

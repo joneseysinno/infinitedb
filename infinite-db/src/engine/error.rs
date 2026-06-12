@@ -46,6 +46,7 @@ pub enum EngineError {
     ErrorKindCatalog(ErrorKindCatalogError),
     ArbiterStreamExists(u64),
     ArbiterStreamNotFound(u64),
+    ReservedArbiterId(u64),
     FrameExists(String),
     FrameNotFound(FrameId),
     InvalidFrame(FrameValidationError),
@@ -56,6 +57,25 @@ pub enum EngineError {
 }
 
 impl EngineError {
+    /// Suggested client backoff when [`Self::is_retryable`] is true.
+    pub fn retry_hint_ms(&self) -> Option<u64> {
+        match self {
+            EngineError::DerivationBackpressure {
+                pending_tasks,
+                derivation_lag,
+            } => Some(Self::derivation_retry_hint_ms(*pending_tasks, *derivation_lag)),
+            EngineError::Storage(e) if e.is_retryable() => Some(100),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn derivation_retry_hint_ms(pending_tasks: usize, derivation_lag: u64) -> u64 {
+        (pending_tasks as u64)
+            .saturating_mul(25)
+            .saturating_add(derivation_lag.saturating_mul(5))
+            .clamp(50, 30_000)
+    }
+
     pub fn is_retryable(&self) -> bool {
         match self {
             EngineError::Storage(e) => e.is_retryable(),
@@ -81,6 +101,7 @@ impl EngineError {
                 | EngineError::InvalidProvenance(_)
                 | EngineError::ArbiterStreamNotFound(_)
                 | EngineError::ArbiterStreamExists(_)
+                | EngineError::ReservedArbiterId(_)
                 | EngineError::FrameExists(_)
                 | EngineError::FrameNotFound(_)
                 | EngineError::InvalidFrame(_)
@@ -124,6 +145,10 @@ impl std::fmt::Display for EngineError {
             EngineError::ErrorKindCatalog(e) => write!(f, "{e:?}"),
             EngineError::ArbiterStreamExists(id) => write!(f, "arbiter stream {} exists", id),
             EngineError::ArbiterStreamNotFound(id) => write!(f, "arbiter stream {} not found", id),
+            EngineError::ReservedArbiterId(id) => write!(
+                f,
+                "arbiter id {id} is below the reserved threshold"
+            ),
             EngineError::FrameExists(name) => write!(f, "frame name already taken: {name}"),
             EngineError::FrameNotFound(id) => write!(f, "frame {:?} not found", id),
             EngineError::InvalidFrame(e) => write!(f, "{e}"),
@@ -195,14 +220,15 @@ impl From<ComputationValidationError> for EngineError {
     }
 }
 
-/// Map engine errors to `io::Error` for APIs that still return `io::Result`.
-pub fn engine_to_io(err: EngineError) -> std::io::Error {
-    let kind = if err.is_caller_correctable() {
-        std::io::ErrorKind::InvalidInput
-    } else if err.is_retryable() {
-        std::io::ErrorKind::WouldBlock
-    } else {
-        std::io::ErrorKind::Other
-    };
-    std::io::Error::new(kind, err.to_string())
+impl From<crate::engine::hlc_clock::ClockSkewError> for EngineError {
+    fn from(err: crate::engine::hlc_clock::ClockSkewError) -> Self {
+        clock_skew_to_engine(err)
+    }
+}
+
+/// Map clock skew refusal to [`EngineError`].
+pub fn clock_skew_to_engine(err: crate::engine::hlc_clock::ClockSkewError) -> EngineError {
+    EngineError::InvalidSpaceConfig {
+        message: format!("clock skew: {err:?}"),
+    }
 }

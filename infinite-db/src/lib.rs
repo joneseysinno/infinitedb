@@ -5,7 +5,7 @@
 //!
 //! ## Database entry point
 //!
-//! [`InfiniteDb`] is the CRCW embedded database (formats v2–v4, v4 default):
+//! [`InfiniteDb`] is the CRCW embedded database (format v4/v5, Hilbert-sharded):
 //! concurrent reads, fire-and-forget writes, branch overlays, and merge.
 //! It is `Send`/`Sync`. Use [`OpenOptions`] to tune I/O threads and format version.
 //!
@@ -14,13 +14,6 @@
 //! - `embedded` (default) — [`InfiniteDb`], storage engine
 //! - `server` — TCP API (`embedded` + tokio)
 //! - `sync` — replication, conflict queue, branch merge helpers (`server`)
-//!
-//! ## Migrating from 0.2.0
-//!
-//! 0.3.0 replaces the single-threaded WAL [`InfiniteDb`] with a CRCW engine. Bulk session APIs
-//! from 0.2.0 are removed; hypergraph write/query APIs are restored in Milestone 1.
-//! Hyperedge and signal types remain in [`infinitedb_core`]; use [`InfiniteDb::insert_hyperedge`]
-//! or record-level [`InfiniteDb::insert`] / [`InfiniteDb::query`]. See `README.md` and `CHANGELOG.md`.
 //!
 //! ## Semantic Vocabulary
 //! - `Space`: named N-dimensional dataset with fixed dimensionality.
@@ -68,6 +61,12 @@ pub use engine::timed_fast_path::{
     SessionWriteStatsSnapshot, TimedFastPathPolicy,
 };
 #[cfg(feature = "embedded")]
+pub use engine::collision::{CollisionEvaluation, IntentCommitOutcome};
+#[cfg(feature = "embedded")]
+pub use engine::hlc_clock::ClockSkewError;
+#[cfg(feature = "embedded")]
+pub use engine::replication_gate::ReplicationGatePolicy;
+#[cfg(feature = "embedded")]
 pub use engine::error::EngineError;
 #[cfg(feature = "embedded")]
 pub use engine::import::{
@@ -84,7 +83,11 @@ pub use infinitedb_core::{
         JudgmentOverlayLayer, OverlayPolicy, TestimonySource, VerdictFilter,
     },
     frame_query::{FrameQuery, FrameQueryOptions, FrameVersionPin},
-    judgment::{ArbiterId, ArbiterStream, JudgmentId, JudgmentRecord, JudgmentVerdict, SubjectPin},
+    judgment::{
+        ArbiterId, ArbiterStream, JudgmentId, JudgmentRecord, JudgmentVerdict,
+        RESERVED_ARBITER_ID_THRESHOLD, SubjectPin,
+    },
+    space::ErrorRetentionPolicy,
     provenance::{AuthoringFrameProvenance, FrameId},
     computation::ComputationProvenance,
     flow_vector::{FlowVector, FlowVectorQuantization, QuantizedDirection},
@@ -105,7 +108,7 @@ pub use infinitedb_core::revision_codec::{
 };
 
 pub use infinitedb_storage::format::{
-    FormatVersion, FORMAT_VERSION_V2, FORMAT_VERSION_V3, FORMAT_VERSION_V4, FORMAT_VERSION_V5,
+    FormatVersion, FORMAT_VERSION_V4, FORMAT_VERSION_V5,
 };
 
 #[cfg(feature = "server")]
@@ -134,13 +137,10 @@ pub use infinitedb_sync::replicate::{
 pub use infinitedb_core::merge::{MergeConflict, MergeResult, MergeStrategy};
 
 #[cfg(feature = "embedded")]
-pub use engine::coordinator::SpaceCoordinator;
-
-#[cfg(feature = "embedded")]
 pub use engine::hilbert_coordinator::HilbertCoordinator;
 
 #[cfg(feature = "embedded")]
-pub use engine::io_thread::{IoThreadConfig, WriteRoute};
+pub use engine::io_thread::IoThreadConfig;
 
 #[cfg(feature = "embedded")]
 pub use engine::write_queue::WriteJob;

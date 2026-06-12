@@ -19,6 +19,15 @@ use infinite_db::infinitedb_core::{
 };
 use tempfile::TempDir;
 
+fn commit_session(db: &InfiniteDb, session: &WriteSession) {
+    let durable = db.sync_session_wal(session).unwrap();
+    if session.has_pending_intent() {
+        db.commit_session_intent(session, &durable).unwrap();
+    } else {
+        db.sync().unwrap();
+    }
+}
+
 fn open_db() -> (InfiniteDb, TempDir, SpaceId) {
     let dir = TempDir::new().unwrap();
     let db = OpenOptions {
@@ -75,7 +84,7 @@ fn commit_hyperedge(
     let rev = db
         .insert_hyperedge_with_session(session, space, edge)
         .unwrap();
-    db.sync_session(session).unwrap();
+    commit_session(db, session);
     rev
 }
 
@@ -140,7 +149,7 @@ fn cross_session_supersession_by_authorship_not_arrival() {
 
     let edge_b = directed_edge(800, node(entity, 20, 0), node(entity, 21, 0));
     let rev_b = commit_hyperedge(&db, &s_b, edge_space, edge_b);
-    db.sync_session(&s_a).unwrap();
+    commit_session(&db, &s_a);
 
     assert!(
         rev_b > rev_a,

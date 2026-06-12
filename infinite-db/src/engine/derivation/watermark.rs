@@ -163,15 +163,6 @@ impl DerivationSessionWatermark {
         )
     }
 
-    pub fn scalar_meet(&self) -> RevisionId {
-        self.sessions
-            .lock()
-            .values()
-            .map(|wm| wm.get())
-            .min()
-            .unwrap_or(RevisionId::ZERO)
-    }
-
     pub fn total_outstanding(&self) -> usize {
         self.sessions
             .lock()
@@ -273,21 +264,22 @@ impl WatermarkRegistry {
         }
     }
 
-    /// Scalar meet across sessions for one subscriber (backward compat).
-    pub fn get(&self, id: &str) -> Option<RevisionId> {
-        self.subscribers
-            .lock()
-            .iter()
-            .find(|s| s.id == id)
-            .map(|s| s.watermark.scalar_meet())
-    }
-
     pub fn get_vector(&self, id: &str) -> Option<VersionVector> {
         self.subscribers
             .lock()
             .iter()
             .find(|s| s.id == id)
             .map(|s| s.watermark.capture_vector())
+    }
+
+    /// Minimum complete-through revision across subscribers for one session.
+    pub fn min_complete_for_session(&self, session: SessionId) -> RevisionId {
+        self.subscribers
+            .lock()
+            .iter()
+            .map(|s| s.watermark.get(session))
+            .min()
+            .unwrap_or(RevisionId::ZERO)
     }
 
     pub fn lag_for_session(&self, session: SessionId, head: RevisionId) -> u64 {
@@ -339,6 +331,7 @@ impl Default for WatermarkRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::infinitedb_core::hlc::HlcStamp;
 
     #[test]
     fn complete_waits_on_outstanding_gap() {
@@ -380,15 +373,30 @@ mod tests {
         let wm = DerivationSessionWatermark::new(RevisionId::ZERO);
         let s1 = SessionId(1);
         let s2 = SessionId(2);
-        let r1a = RevisionId::new(s1, 1);
-        let r1b = RevisionId::new(s1, 2);
-        let r2a = RevisionId::new(s2, 1);
+        let r1a = RevisionId::from_stamp(HlcStamp {
+            physical_ms: 1,
+            logical: 0,
+            session: s1.0,
+            sequence: 1,
+        });
+        let r1b = RevisionId::from_stamp(HlcStamp {
+            physical_ms: 1,
+            logical: 0,
+            session: s1.0,
+            sequence: 2,
+        });
+        let r2a = RevisionId::from_stamp(HlcStamp {
+            physical_ms: 1,
+            logical: 0,
+            session: s2.0,
+            sequence: 1,
+        });
         wm.register(s1, r1a);
         wm.register(s1, r1b);
         wm.register(s2, r2a);
         wm.retire(s2, r2a);
         assert_eq!(wm.get(s2), r2a);
-        assert_eq!(wm.get(s1), RevisionId::ZERO);
+        assert_eq!(wm.get(s1), r1a.predecessor());
         wm.retire(s1, r1a);
         assert_eq!(wm.get(s1), r1a);
         let vec = wm.capture_vector();

@@ -23,23 +23,23 @@ use crate::infinitedb_storage::{
     wal::WalEntry,
 };
 
-/// Retirement gates for deleting a session WAL (Phase 3).
+/// Retirement gates for deleting a session WAL (Phase 3, revision-ranged hardening).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Encode, Decode)]
 pub struct SessionWalRetirement {
     /// Packed [`HlcStamp`] for the highest revision observed in this session WAL.
     pub highest_revision_packed: u128,
-    pub sealed: bool,
-    pub replication_confirmed: bool,
-    pub collision_evaluated: bool,
+    pub sealed_through_packed: Option<u128>,
+    pub replication_confirmed_through_packed: Option<u128>,
+    pub collision_evaluated_through_packed: Option<u128>,
 }
 
 impl SessionWalRetirement {
     pub fn new(highest_revision: RevisionId) -> Self {
         Self {
             highest_revision_packed: highest_revision.stamp().pack(),
-            sealed: false,
-            replication_confirmed: false,
-            collision_evaluated: false,
+            sealed_through_packed: None,
+            replication_confirmed_through_packed: None,
+            collision_evaluated_through_packed: None,
         }
     }
 
@@ -47,8 +47,40 @@ impl SessionWalRetirement {
         RevisionId::from_stamp(HlcStamp::unpack(self.highest_revision_packed))
     }
 
+    fn certified_through_min(&self) -> Option<RevisionId> {
+        let stamps = [
+            self.sealed_through_packed,
+            self.replication_confirmed_through_packed,
+            self.collision_evaluated_through_packed,
+        ];
+        if stamps.iter().any(|s| s.is_none()) {
+            return None;
+        }
+        stamps
+            .into_iter()
+            .flatten()
+            .map(|p| RevisionId::from_stamp(HlcStamp::unpack(p)))
+            .min()
+    }
+
     pub fn eligible_for_deletion(&self) -> bool {
-        self.sealed && self.replication_confirmed && self.collision_evaluated
+        self.certified_through_min()
+            .is_some_and(|min_cert| self.highest_revision() <= min_cert)
+    }
+
+    pub fn sealed_through(&self) -> Option<RevisionId> {
+        self.sealed_through_packed
+            .map(|p| RevisionId::from_stamp(HlcStamp::unpack(p)))
+    }
+
+    pub fn replication_confirmed_through(&self) -> Option<RevisionId> {
+        self.replication_confirmed_through_packed
+            .map(|p| RevisionId::from_stamp(HlcStamp::unpack(p)))
+    }
+
+    pub fn collision_evaluated_through(&self) -> Option<RevisionId> {
+        self.collision_evaluated_through_packed
+            .map(|p| RevisionId::from_stamp(HlcStamp::unpack(p)))
     }
 }
 
@@ -191,51 +223,50 @@ impl SessionWalStore {
         }
     }
 
-    pub fn mark_sealed(&self, session: SessionId) {
+    pub fn mark_sealed_through(&self, session: SessionId, through: RevisionId) {
         let mut meta = self.meta.write();
         let entry = meta
             .retirements
             .entry(session.0)
-            .or_insert_with(|| SessionWalRetirement::new(RevisionId::ZERO));
-        entry.sealed = true;
+            .or_insert_with(|| SessionWalRetirement::new(through));
+        entry.sealed_through_packed = Some(through.stamp().pack());
     }
 
-    pub fn mark_replication_confirmed(&self, session: SessionId) {
+    pub fn mark_replication_confirmed_through(&self, session: SessionId, through: RevisionId) {
         let mut meta = self.meta.write();
         let entry = meta
             .retirements
             .entry(session.0)
-            .or_insert_with(|| SessionWalRetirement::new(RevisionId::ZERO));
-        entry.replication_confirmed = true;
+            .or_insert_with(|| SessionWalRetirement::new(through));
+        entry.replication_confirmed_through_packed = Some(through.stamp().pack());
     }
 
-    pub fn mark_collision_evaluated(&self, session: SessionId) {
+    pub fn mark_collision_evaluated_through(&self, session: SessionId, through: RevisionId) {
         let mut meta = self.meta.write();
         let entry = meta
             .retirements
             .entry(session.0)
-            .or_insert_with(|| SessionWalRetirement::new(RevisionId::ZERO));
-        entry.collision_evaluated = true;
+            .or_insert_with(|| SessionWalRetirement::new(through));
+        entry.collision_evaluated_through_packed = Some(through.stamp().pack());
     }
 
-    /// Delete the WAL file when all three retirement gates are satisfied.
+    /// Delete the WAL file when all three retirement gates certify through `highest_revision`.
     pub fn try_retire_wal(&self, session: SessionId) -> Result<bool, StorageError> {
-        let eligible = self
-            .meta
-            .read()
-            .retirements
-            .get(&session.0)
-            .map(|r| r.eligible_for_deletion())
-            .unwrap_or(false);
-        if !eligible {
+        let mut writers = self.writers.lock();
+        let mut meta = self.meta.write();
+        let Some(entry) = meta.retirements.get(&session.0).copied() else {
+            return Ok(false);
+        };
+        if !entry.eligible_for_deletion() {
             return Ok(false);
         }
-        self.writers.lock().remove(&session.0);
+        writers.remove(&session.0);
+        drop(writers);
         let path = self.wal_path(session);
         if path.exists() {
             std::fs::remove_file(&path).map_err(|e| StorageError::from_io(e, Some(path)))?;
         }
-        self.meta.write().retirements.remove(&session.0);
+        meta.retirements.remove(&session.0);
         Ok(true)
     }
 

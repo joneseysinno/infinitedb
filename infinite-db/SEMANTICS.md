@@ -85,22 +85,36 @@ Each device's store mints `SessionId` values from its own counter persisted in m
 
 This mirrors the session-prefixed entity identifier principle from design §4.1 — same axis, second dimension.
 
-### D-P3 — Clock discipline
+### D-P3 — Clock discipline (hardening Wave D)
 
-- **Skew bound:** physical component clamped to `last_issued_time + max_drift` (default 5 minutes). Stamps outside the bound are rejected at write time and surfaced as error records.
-- **Monotonicity:** `hlc.now = max(physical, last_physical, last_logical+1)` per session. Property: stamps from one session are strictly increasing under any physical clock behavior, including backwards wall-clock jumps.
+- **Forward trust:** `physical = max(wall, last_physical)` — forward wall jumps (sleep/resume) are trusted.
+- **Backward guard:** if `last_physical > wall + max_drift` (default 5 minutes), stamping refuses with `ClockSkewError` (detect-and-surface, never silently false times).
+- **Monotonicity:** equal physical bumps `logical`; `logical` exhaustion bumps `physical_ms` by one (no wrap).
+- **Pre-epoch wall:** wall reads below `LEGACY_PHYSICAL_CEILING` refuse to stamp (T17).
+- **`receive(observed)`:** standard HLC absorption for replication apply (T16).
 
-### D-P4 — Legacy revision embedding
+### D-P4 — Legacy revision embedding (lossless spill)
 
 Dense `u64` revisions embed losslessly into HLC space:
 
-- `legacy(n)` → `(time = 0, logical = 0, session = 0, sequence = n)`
+- `legacy(n)` → `(physical = n >> 32, logical = 0, session = 0, sequence = n as u32)`
+- `legacy_sequence()` → `(physical << 32) | sequence`
+- `is_legacy_embedded` → `session == 0 ∧ logical == 0 ∧ physical < LEGACY_PHYSICAL_CEILING`
 
 Consequences:
 
-- All pre-HLC history sorts strictly before all HLC-era history.
+- Order-isomorphic across the full dense `u64` range (no `u32` wrap).
+- All embedded legacy stamps sort strictly before real wall-clock HLC-era stamps.
 - Session `0` is reserved as the pre-HLC global stream.
 - Sealed blocks are never rewritten; embedding is decode-time only.
+
+### D-P6 — ReadTxn vector pin (hardening Wave A)
+
+Under a pinned `VersionVector`, a record is visible iff `record.revision ≤ vector[record.session]` **and** the session is present in the pin. Absent sessions are **invisible** (minted after capture violates repeatability). Scalar `as_of` on `ReadTxn` remains an explicit single-ceiling opt-in with a within-one-stream caveat.
+
+### D-P8 — Replication gate policy
+
+`OpenOptions.replication_gate`: `Required` (explicit replication marks) vs `NotApplicable` (embedded-only — auto-certifies replication through the sealed revision). WAL retirement requires all three gates certified **through** `highest_revision` (revision-ranged, not file-level booleans).
 
 ### D-P5 — Intent checkpoint recovery (Phase 4)
 

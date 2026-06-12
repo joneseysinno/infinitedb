@@ -153,42 +153,6 @@ impl TraversalResult {
             .map(|n| n.level)
     }
 
-    /// Collapse to legacy [`Subgraph`] (nodes without level/arrival metadata).
-    pub fn subgraph(&self) -> Subgraph {
-        let mut sg = Subgraph::default();
-        for n in &self.nodes {
-            sg.add_node(n.endpoint.clone());
-        }
-        for e in &self.edges {
-            sg.add_edge(e.clone());
-        }
-        sg
-    }
-}
-
-/// The nodes and edges collected during a traversal (legacy view).
-#[derive(Debug, Clone, Default)]
-pub struct Subgraph {
-    /// Distinct endpoints visited.
-    pub nodes: Vec<EndpointRef>,
-    /// Hyperedges traversed (deduplicated by id).
-    pub edges: Vec<Hyperedge>,
-}
-
-impl Subgraph {
-    /// Record an endpoint if not already present (matched by space + coords).
-    pub fn add_node(&mut self, ep: EndpointRef) {
-        if !self.nodes.iter().any(|n| endpoints_equal(n, &ep)) {
-            self.nodes.push(ep);
-        }
-    }
-
-    /// Record a hyperedge if not already present.
-    pub fn add_edge(&mut self, edge: Hyperedge) {
-        if !self.edges.iter().any(|e| e.id == edge.id) {
-            self.edges.push(edge);
-        }
-    }
 }
 
 /// Endpoint identity key (space + coordinates).

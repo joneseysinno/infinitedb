@@ -184,13 +184,28 @@ impl HilbertCoordinator {
     }
 
     pub fn compact_space(&self, space: SpaceId) -> io::Result<()> {
+        self.flush_space(space)
+    }
+
+    /// Run compaction immediately on every shard (honours per-space policy overrides).
+    pub fn force_compact_space(&self, space: SpaceId) -> io::Result<()> {
+        self.flush_space(space)?;
         let shard_bits = self.shard_bits_for_space(space);
         let count = shard_count(shard_bits);
         for shard_id in 0..count {
-            let key = ShardKey::new(space, shard_id);
-            if let Some(shard) = self.shards.get(&key) {
-                shard.queue.request_flush(space)?;
-            }
+            let live_tail = self.live_tails.get_or_create(space, shard_id);
+            super::compactor::compact_space_now(
+                &self.store,
+                &self.snapshots,
+                &live_tail,
+                &self.spaces,
+                &self.next_block_id,
+                space,
+                Some(ShardRef::new(shard_id, shard_bits)),
+                Some(&self.compaction_overrides),
+                Some(&self.branch_overlays),
+                1,
+            )?;
         }
         Ok(())
     }
@@ -246,7 +261,6 @@ impl HilbertCoordinator {
             let handle = entry.value().io_handle.lock();
             stats.queue_depth += entry.value().queue.queued_count();
             stats.direct_writes += handle.direct_writes();
-            stats.staged_writes += handle.staged_writes();
         }
         stats
     }

@@ -6,6 +6,8 @@ use infinite_db::{
     DerivationBackpressurePolicy, ImportBudget, InfiniteDb, OpenOptions, QueryOptions,
 };
 use infinite_db::infinitedb_core::{
+    address::{DimensionVector, RevisionId, SpaceId},
+    hlc::SessionId,
     hyperedge::{
         Directionality, EndpointPolarity, EndpointRef, EndpointRole, Hyperedge, HyperedgeId,
         HyperedgeKind,
@@ -13,7 +15,6 @@ use infinite_db::infinitedb_core::{
     query::DirectionFilter,
     space::SpaceConfig,
 };
-use infinite_db::infinitedb_core::address::{DimensionVector, RevisionId, SpaceId};
 use tempfile::TempDir;
 
 fn open_db() -> (InfiniteDb, TempDir, SpaceId) {
@@ -180,8 +181,10 @@ fn delete_not_visible_after_delta_merge_before_derivation() {
         .unwrap();
     db.sync().unwrap();
     let delete_rev = db.delete_hyperedge(edge_space, HyperedgeId(1)).unwrap();
+    let delete_session = SessionId(delete_rev.session());
+    let wm_before = db.endpoint_index_watermark_vector();
     assert!(
-        db.endpoint_index_watermark() < delete_rev,
+        wm_before.get(delete_session).unwrap_or(RevisionId::ZERO) < delete_rev,
         "watermark must not advance past un-derived delete"
     );
     assert!(
@@ -201,7 +204,12 @@ fn delete_not_visible_after_delta_merge_before_derivation() {
     let _ = insert_rev;
     db.sync().unwrap();
     assert_eq!(db.derivation_stats().outstanding_derivations, 0);
-    assert_eq!(db.endpoint_index_watermark(), delete_rev);
+    assert_eq!(
+        db.endpoint_index_watermark_vector()
+            .get(delete_session)
+            .unwrap(),
+        delete_rev
+    );
     assert!(
         db.query_hyperedges_for_endpoint_directed(edge_space, &hub, None, DirectionFilter::Any)
             .unwrap()

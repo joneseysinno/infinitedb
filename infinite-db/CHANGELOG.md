@@ -4,6 +4,13 @@
 
 ### Added
 
+- **Peer track hardening — epoch-safe reads:** `ReadTxn` pins per-session `VersionVector` (D-P6); `query_inner` strict vector visibility; dormant-session reopen tests.
+- **Hardening — testimony preservation:** revision-ranged WAL retirement gates (`mark_*_through`); `ReplicationGatePolicy` (D-P8); lossless legacy embedding spill in `HlcStamp::legacy` (D-P4).
+- **Hardening — commit boundary:** point-scoped collision detection; `CollisionEvaluation` / `IntentCommitOutcome`; session-scoped `derivation.wait_for_session`; condvar-based `derivation.flush`.
+- **Hardening — clock discipline:** forward-trust HLC; poisoned-clock refusal; logical exhaustion bump; `HlcClock::receive`.
+- **Hardening — Wave E (typed surface):** additive `try_*` APIs returning `EngineError`; `ApiError::Busy { retry_hint_ms }` for derivation backpressure; `ErrorRetentionPolicy` + `purge_resolved_errors`; `RESERVED_ARBITER_ID_THRESHOLD` enforced in `register_arbiter_stream`.
+- Integration tests: `tests/hardening_epoch_reads.rs`, `tests/hardening_retirement.rs`, `tests/hardening_legacy_embed.rs`, `tests/hardening_wave_e.rs`.
+
 - **Peer track Phase 7 — timed fast path:** optional `TimedFastPathPolicy` on `OpenOptions` (default off); when enabled, `sync_session_wal` attempts durable seal to `sessions/{id}.fast` within `direct_seal_deadline` (from `IoThreadConfig::direct_write_timeout`, default 2ms) and falls back to session WAL append on timeout; `DurableIntent` carries `DurabilityMedium` (`SessionWal` / `FastSegment`); no `live_tail` publish before `commit_session_intent`; durable-but-uncommitted `.fast` bytes quarantined on recovery as `InterruptedSessionIntent`; `session_write_stats()` / `io_stats()` fast-path counters.
 - Integration tests: `tests/fast_path_phase7.rs`.
 

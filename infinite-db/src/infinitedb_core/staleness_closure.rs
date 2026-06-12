@@ -164,7 +164,7 @@ mod tests {
         use crate::infinitedb_core::hlc::HlcStamp;
         let (edge, _) = sample_edge(RevisionId::legacy(3), RevisionId::legacy(3));
         let hlc_observed = RevisionId::from_stamp(HlcStamp {
-            physical_ms: 1,
+            physical_ms: 0,
             logical: 0,
             session: 2,
             sequence: 3,

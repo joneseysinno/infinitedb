@@ -8,6 +8,9 @@ use serde::{Deserialize, Serialize};
 /// Reserved session for the pre-HLC global allocation stream (D-P4).
 pub const GLOBAL_SESSION: u32 = 0;
 
+/// Legacy-epoch physical ceiling — embedded stamps stay below real wall-clock HLC era.
+pub const LEGACY_PHYSICAL_CEILING: u64 = 31_536_000_000; // ~year 2970, well above spill range
+
 /// Asserting stream identity (D-P2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, Encode, Decode)]
 pub struct SessionId(pub u32);
@@ -45,10 +48,10 @@ impl HlcStamp {
         sequence: 0,
     };
 
-    /// Embed a dense pre-HLC `u64` revision (D-P4).
+    /// Embed a dense pre-HLC `u64` revision (D-P4, lossless via physical spill).
     pub const fn legacy(sequence: u64) -> Self {
         Self {
-            physical_ms: 0,
+            physical_ms: sequence >> 32,
             logical: 0,
             session: GLOBAL_SESSION,
             sequence: sequence as u32,
@@ -66,11 +69,13 @@ impl HlcStamp {
     }
 
     pub fn is_legacy_embedded(self) -> bool {
-        self.physical_ms == 0 && self.logical == 0 && self.session == GLOBAL_SESSION
+        self.logical == 0
+            && self.session == GLOBAL_SESSION
+            && self.physical_ms < LEGACY_PHYSICAL_CEILING
     }
 
     pub fn legacy_sequence(self) -> u64 {
-        self.sequence as u64
+        (self.physical_ms << 32) | (self.sequence as u64)
     }
 
     /// Pack into a single `u128` (codec membrane only).
