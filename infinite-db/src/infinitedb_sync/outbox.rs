@@ -237,7 +237,7 @@ mod tests {
                 crate::infinitedb_core::address::SpaceId(1),
                 crate::infinitedb_core::address::DimensionVector::new(vec![1, 2]),
             ),
-            revision: crate::infinitedb_core::address::RevisionId(3),
+            revision: crate::infinitedb_core::address::RevisionId::legacy(3),
         });
         save_outbox(&path, &s).unwrap();
         let loaded = load_outbox(&path).unwrap();
@@ -252,7 +252,7 @@ mod tests {
                 crate::infinitedb_core::address::SpaceId(1),
                 crate::infinitedb_core::address::DimensionVector::new(vec![4, 5]),
             ),
-            revision: crate::infinitedb_core::address::RevisionId(7),
+            revision: crate::infinitedb_core::address::RevisionId::legacy(7),
             data: vec![1],
         });
         let report = s.process_once(&AlwaysAck, 16);
@@ -268,7 +268,7 @@ mod tests {
                 crate::infinitedb_core::address::SpaceId(1),
                 crate::infinitedb_core::address::DimensionVector::new(vec![9, 9]),
             ),
-            revision: crate::infinitedb_core::address::RevisionId(1),
+            revision: crate::infinitedb_core::address::RevisionId::legacy(1),
             data: vec![2],
         });
         let now = now_ms();

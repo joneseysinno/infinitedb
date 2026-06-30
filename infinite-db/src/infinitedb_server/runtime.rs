@@ -1,7 +1,11 @@
 //! Tokio TCP server wiring [`crate::InfiniteDb`] to the API layer.
+//!
+//! Socket I/O runs on the tokio runtime; blocking database work is offloaded to
+//! [`super::executor::RequestExecutor`] (see D-BLOCKING-CONTRACT in `SEMANTICS.md`).
 
 use std::io;
 use std::net::SocketAddr;
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -12,20 +16,38 @@ use crate::infinitedb_core::branch::BranchId;
 use crate::infinitedb_core::snapshot::SnapshotId;
 use crate::InfiniteDb;
 
-use super::api::{handle_request, Request, Response};
+use super::api::{ApiError, Request, Response};
+use super::executor::{RequestExecutor, SubmitError};
 use super::session::{AccessLevel, Session, SpaceGrant};
+
+/// Retry hint for executor queue-full shedding (D-EXEC-4b).
+const BUSY_RETRY_MS: u64 = 100;
+
+fn default_executor_threads() -> usize {
+    std::thread::available_parallelism()
+        .map(NonZeroUsize::get)
+        .unwrap_or(4)
+}
+
 /// TCP server configuration.
 #[derive(Debug, Clone)]
 pub struct ServerConfig {
     pub max_connections: usize,
     pub default_branch: BranchId,
+    /// OS threads in the request executor pool (D-EXEC-3).
+    pub executor_threads: usize,
+    /// Bounded job channel capacity; defaults to `max_connections` (D-EXEC-4a).
+    pub request_queue_capacity: usize,
 }
 
 impl Default for ServerConfig {
     fn default() -> Self {
+        let max_connections = 128;
         Self {
-            max_connections: 128,
+            max_connections,
             default_branch: BranchId::MAIN,
+            executor_threads: default_executor_threads(),
+            request_queue_capacity: max_connections,
         }
     }
 }
@@ -37,6 +59,7 @@ pub struct Server {
     config: ServerConfig,
     grants: Vec<SpaceGrant>,
     limiter: Arc<Semaphore>,
+    executor: Arc<RequestExecutor>,
 }
 
 impl Server {
@@ -49,12 +72,18 @@ impl Server {
     ) -> io::Result<Self> {
         let listener = TcpListener::bind(addr).await?;
         let limiter = Arc::new(Semaphore::new(config.max_connections));
+        let executor = Arc::new(RequestExecutor::start(
+            Arc::clone(&db),
+            config.executor_threads,
+            config.request_queue_capacity,
+        ));
         Ok(Self {
             listener,
             db,
             config,
             grants,
             limiter,
+            executor,
         })
     }
 
@@ -71,11 +100,12 @@ impl Server {
                 .await
                 .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
             let db = Arc::clone(&self.db);
+            let executor = Arc::clone(&self.executor);
             let grants = self.grants.clone();
             let branch = self.config.default_branch;
             tokio::spawn(async move {
                 let _permit = permit;
-                let _ = serve_connection(stream, db, branch, grants).await;
+                let _ = serve_connection(stream, db, executor, branch, grants).await;
             });
         }
     }
@@ -84,6 +114,7 @@ impl Server {
 async fn serve_connection(
     mut stream: TcpStream,
     db: Arc<InfiniteDb>,
+    executor: Arc<RequestExecutor>,
     branch: BranchId,
     grants: Vec<SpaceGrant>,
 ) -> io::Result<()> {
@@ -91,11 +122,27 @@ async fn serve_connection(
         .branch_head(branch)
         .unwrap_or(SnapshotId(0));
     let opened_at = db.revision();
-    let session = Session::open_at_revision(branch, pinned, opened_at, grants);
+    let session = Arc::new(Session::open_at_revision(
+        branch,
+        pinned,
+        opened_at,
+        grants,
+    ));
 
     loop {
         let request: Request = read_frame_async(&mut stream).await?;
-        let response = handle_request(&db, &session, request);
+        let response = match executor
+            .submit(request, Arc::clone(&session))
+            .await
+        {
+            Ok(r) => r,
+            Err(SubmitError::Busy) => Response::Error(ApiError::Busy {
+                retry_hint_ms: BUSY_RETRY_MS,
+            }),
+            Err(SubmitError::Stopped) => Response::Error(ApiError::Internal(
+                "request executor stopped".into(),
+            )),
+        };
         write_frame_async(&mut stream, &response).await?;
         if matches!(response, Response::Error(_)) {
             // keep connection alive for clients

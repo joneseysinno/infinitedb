@@ -86,7 +86,9 @@ pub fn import_branch_overlay(
     name: &str,
 ) -> Result<BranchId, String> {
     remote.sync().map_err(|e| e.to_string())?;
-    let branch = local.create_branch(name, BranchId::MAIN)?;
+    let branch = local
+        .create_branch(name, BranchId::MAIN)
+        .map_err(|e| e.to_string())?;
     let records = remote.branch_overlays.all_live_records(remote_branch);
     local
         .apply_records_on_branch(branch, records)

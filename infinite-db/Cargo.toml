@@ -104,6 +104,11 @@ name = "server_phase_d"
 path = "tests/server_phase_d.rs"
 required-features = ["sync"]
 
+[[test]]
+name = "server_executor"
+path = "tests/server_executor.rs"
+required-features = ["sync"]
+
 [[bin]]
 name = "infinite-db-test"
 path = "src/bin/infinite-db-test.rs"

@@ -35,7 +35,7 @@ fn main() {
                 SpaceId(1),
                 DimensionVector::new(vec![0, 0]),
             ),
-            revision: infinite_db::infinitedb_core::address::RevisionId(1),
+            revision: infinite_db::infinitedb_core::address::RevisionId::legacy(1),
             data: vec![1, 2, 3],
         },
         other => panic!("unknown command {other}"),

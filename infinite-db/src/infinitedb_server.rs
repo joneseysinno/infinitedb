@@ -8,3 +8,5 @@ pub mod session;
 pub mod tcp;
 /// Tokio TCP server runtime.
 pub mod runtime;
+/// Off-runtime request execution pool.
+pub mod executor;

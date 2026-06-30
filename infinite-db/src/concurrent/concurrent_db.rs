@@ -158,6 +158,9 @@ impl OpenOptions {
 }
 
 /// Thread-safe embedded database with concurrent reads and fire-and-forget writes.
+///
+/// **Blocking API:** methods may block on disk I/O, locks, and queue backpressure. Async
+/// callers must offload them (see [`crate::RequestExecutor`] under the `server` feature).
 pub struct InfiniteDb {
     root: PathBuf,
     format_version: u32,

@@ -74,7 +74,7 @@ fn tcp_query_write_roundtrip() {
                     SpaceId(1),
                     DimensionVector::new(vec![1, 2]),
                 ),
-                revision: infinite_db::infinitedb_core::address::RevisionId(1),
+                revision: infinite_db::infinitedb_core::address::RevisionId::legacy(1),
                 data: vec![42],
             },
         ))
@@ -121,7 +121,7 @@ fn concurrent_connections_parallel_writes() {
                             SpaceId(1),
                             DimensionVector::new(vec![i as u32, i as u32 + 10]),
                         ),
-                        revision: infinite_db::infinitedb_core::address::RevisionId(1),
+                        revision: infinite_db::infinitedb_core::address::RevisionId::legacy(1),
                         data: vec![i as u8],
                     },
                 ))

@@ -115,10 +115,13 @@ pub use infinitedb_storage::format::{
 pub use infinitedb_server::api::{handle_request, project_api_error, ApiError, Request, Response, WireConflict};
 
 #[cfg(feature = "server")]
+pub use infinitedb_server::executor::{RequestExecutor, SubmitError};
+
+#[cfg(feature = "server")]
 pub use infinitedb_server::runtime::{admin_grants, client_roundtrip, Server, ServerConfig};
 
 #[cfg(feature = "server")]
-pub use infinitedb_server::session::{AccessLevel, Session, SessionId, SpaceGrant};
+pub use infinitedb_server::session::{AccessLevel, Session, SpaceGrant};
 
 #[cfg(feature = "sync")]
 pub use infinitedb_storage::cluster::ClusterMeta;
