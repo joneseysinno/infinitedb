@@ -232,6 +232,56 @@ fn spawn_server(db: Arc<InfiniteDb>, space_ids: &[u64]) -> (std::net::SocketAddr
     (addr, handle)
 }
 
+fn spawn_server_single_worker_with_handler<F>(
+    db: Arc<InfiniteDb>,
+    grants: Vec<SpaceGrant>,
+    handler: F,
+) -> (std::net::SocketAddr, thread::JoinHandle<()>)
+where
+    F: Fn(&InfiniteDb, &Session, Request) -> Response + Send + Sync + Clone + 'static,
+{
+    let (tx, rx) = mpsc::channel();
+    let handle = thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let executor = Arc::new(RequestExecutor::start_with_handler(
+                Arc::clone(&db),
+                handler,
+                2,
+                8,
+            ));
+            let server = Server::bind_with_executor(
+                "127.0.0.1:0".parse().unwrap(),
+                db,
+                ServerConfig::default(),
+                grants,
+                executor,
+            )
+            .await
+            .unwrap();
+            tx.send(server.local_addr().unwrap()).unwrap();
+            let _ = server.run().await;
+        });
+    });
+    let addr = rx.recv().unwrap();
+    thread::sleep(Duration::from_millis(30));
+    (addr, handle)
+}
+
+fn query_space_at(as_of: RevisionId) -> Request {
+    Request::Query {
+        space: SpaceId(1),
+        snapshot: SnapshotId(0),
+        key_range: None,
+        as_of: Some(as_of),
+        include_tombstones: false,
+    }
+}
+
 async fn roundtrip_on_stream(stream: &mut TcpStream, request: Request) -> std::io::Result<Response> {
     let payload = bincode::encode_to_vec(&request, bincode::config::standard())
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
@@ -248,6 +298,58 @@ async fn roundtrip_on_stream(stream: &mut TcpStream, request: Request) -> std::i
     let (msg, _) = bincode::decode_from_slice::<Response, _>(&payload, bincode::config::standard())
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
     Ok(msg)
+}
+
+#[test]
+fn tcp_no_head_of_line_blocking_on_single_tokio_worker() {
+    let arrived = Arc::new(Barrier::new(2));
+    let release = Arc::new(Barrier::new(2));
+    let arrived_c = Arc::clone(&arrived);
+    let release_c = Arc::clone(&release);
+
+    let dir = TempDir::new().unwrap();
+    let db = Arc::new(InfiniteDb::open(dir.path()).unwrap());
+    let grants = admin_grants(&[]);
+
+    let (addr, server) = spawn_server_single_worker_with_handler(
+        Arc::clone(&db),
+        grants,
+        move |_db, _session, request| {
+            if matches!(request, Request::Ping) {
+                arrived_c.wait();
+                release_c.wait();
+            }
+            Response::Pong
+        },
+    );
+
+    let blocked = {
+        let connect_addr = addr;
+        thread::spawn(move || {
+            let rt = Runtime::new().unwrap();
+            rt.block_on(async {
+                let mut stream = TcpStream::connect(connect_addr).await.unwrap();
+                roundtrip_on_stream(&mut stream, Request::Ping)
+                    .await
+                    .unwrap();
+            });
+        })
+    };
+
+    arrived.wait();
+
+    let rt = Runtime::new().unwrap();
+    rt.block_on(async {
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        let resp = roundtrip_on_stream(&mut stream, Request::GetConflicts)
+            .await
+            .unwrap();
+        assert!(matches!(resp, Response::Pong));
+        release.wait();
+    });
+
+    blocked.join().unwrap();
+    drop(server);
 }
 
 #[test]
@@ -275,12 +377,19 @@ fn per_connection_request_order() {
         )
         .await
         .unwrap();
-        assert!(matches!(w0, Response::WriteAck { .. }));
+        let rev0 = match w0 {
+            Response::WriteAck { revision } => revision,
+            other => panic!("expected write ack, got {other:?}"),
+        };
 
-        let p0 = roundtrip_on_stream(&mut stream, Request::Ping)
+        db.sync().unwrap();
+        let q0 = roundtrip_on_stream(&mut stream, query_space_at(rev0))
             .await
             .unwrap();
-        assert!(matches!(p0, Response::Pong));
+        match q0 {
+            Response::Records(records) => assert_eq!(records.len(), 1),
+            other => panic!("expected records after first write, got {other:?}"),
+        }
 
         let w1 = roundtrip_on_stream(
             &mut stream,
@@ -295,12 +404,19 @@ fn per_connection_request_order() {
         )
         .await
         .unwrap();
-        assert!(matches!(w1, Response::WriteAck { .. }));
+        let rev1 = match w1 {
+            Response::WriteAck { revision } => revision,
+            other => panic!("expected write ack, got {other:?}"),
+        };
 
-        let p1 = roundtrip_on_stream(&mut stream, Request::Ping)
+        db.sync().unwrap();
+        let q1 = roundtrip_on_stream(&mut stream, query_space_at(rev1))
             .await
             .unwrap();
-        assert!(matches!(p1, Response::Pong));
+        match q1 {
+            Response::Records(records) => assert_eq!(records.len(), 2),
+            other => panic!("expected two records after second write, got {other:?}"),
+        }
     });
 
     drop(server);

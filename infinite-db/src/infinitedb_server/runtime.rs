@@ -1,7 +1,7 @@
 //! Tokio TCP server wiring [`crate::InfiniteDb`] to the API layer.
 //!
 //! Socket I/O runs on the tokio runtime; blocking database work is offloaded to
-//! [`super::executor::RequestExecutor`] (see D-BLOCKING-CONTRACT in `SEMANTICS.md`).
+//! [`crate::RequestExecutor`] (see D-BLOCKING-CONTRACT in `SEMANTICS.md`).
 
 use std::io;
 use std::net::SocketAddr;
@@ -77,6 +77,31 @@ impl Server {
             config.executor_threads,
             config.request_queue_capacity,
         ));
+        Self::from_parts(listener, db, config, grants, limiter, executor)
+    }
+
+    /// Bind with a pre-built executor (integration tests).
+    #[doc(hidden)]
+    pub async fn bind_with_executor(
+        addr: SocketAddr,
+        db: Arc<InfiniteDb>,
+        config: ServerConfig,
+        grants: Vec<SpaceGrant>,
+        executor: Arc<RequestExecutor>,
+    ) -> io::Result<Self> {
+        let listener = TcpListener::bind(addr).await?;
+        let limiter = Arc::new(Semaphore::new(config.max_connections));
+        Self::from_parts(listener, db, config, grants, limiter, executor)
+    }
+
+    fn from_parts(
+        listener: TcpListener,
+        db: Arc<InfiniteDb>,
+        config: ServerConfig,
+        grants: Vec<SpaceGrant>,
+        limiter: Arc<Semaphore>,
+        executor: Arc<RequestExecutor>,
+    ) -> io::Result<Self> {
         Ok(Self {
             listener,
             db,
@@ -98,7 +123,7 @@ impl Server {
             let permit = Arc::clone(&self.limiter)
                 .acquire_owned()
                 .await
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+                .map_err(|e| io::Error::other(e.to_string()))?;
             let db = Arc::clone(&self.db);
             let executor = Arc::clone(&self.executor);
             let grants = self.grants.clone();
@@ -174,7 +199,7 @@ async fn write_frame_async<T: bincode::Encode + Send + Sync>(
     msg: &T,
 ) -> io::Result<()> {
     let payload = bincode::encode_to_vec(msg, bincode::config::standard())
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        .map_err(io::Error::other)?;
     let len = payload.len() as u64;
     stream.write_all(&len.to_le_bytes()).await?;
     stream.write_all(&payload).await?;
