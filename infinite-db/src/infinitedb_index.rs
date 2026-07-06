@@ -19,12 +19,20 @@ pub mod center;
 /// Placement composition utilities (T11).
 pub mod placement;
 
-pub use center::is_dyadic_center;
+pub use center::{dyadic_center_level, is_dyadic_center, parity_center_for_extent};
 pub use composite::{CompositeKey, Dimension, KeyConfig};
 pub use curve_address::CurveAddress;
 pub use hilbert::{decode, encode};
 pub use key::{hilbert_key_for, hilbert_raw_index};
 pub use placement::{
-    compose, nearest_common_ancestor, placement_path_to_ancestor, point_to_ancestor_space,
-    to_ancestor, Placement, PlacementError,
+    bbox_to_child, compose, extent_in_parent, nearest_common_ancestor, placement_path_to_ancestor,
+    point_to_ancestor_space, to_ancestor, Placement, PlacementError,
 };
+
+use crate::infinitedb_core::hilbert_key::HilbertKey;
+
+impl From<CurveAddress> for HilbertKey {
+    fn from(addr: CurveAddress) -> Self {
+        HilbertKey::from_raw(addr.raw())
+    }
+}

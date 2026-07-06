@@ -12,7 +12,9 @@
 
 /// N-dimensional Hilbert curve encoding using Skilling's algorithm.
 /// Maps a `DimensionVector` to a single `u128` index key.
-/// Coordinates are truncated to `bits_per_dim` bits (max 8 for u128 with 16 dims).
+/// Coordinates use `bits_per_dim` precision per axis (`bits_per_dim` ∈ [1, 32],
+/// `dims × bits_per_dim` ≤ 128). Raise effective depth via the space tower, not
+/// by exceeding 32 bits per dimension.
 ///
 /// Key property: spatially close points map to numerically close keys,
 /// so spatial range queries become contiguous key scans.
@@ -20,7 +22,7 @@
 /// Encode an N-dimensional point into a 1D Hilbert index.
 ///
 /// - `coords`: unsigned coordinates, one per dimension.
-/// - `bits_per_dim`: precision bits per coordinate (1–8). Total key bits = dims × bits_per_dim ≤ 128.
+/// - `bits_per_dim`: precision bits per coordinate (1–32). Total key bits = dims × bits_per_dim ≤ 128.
 pub fn encode(coords: &[u32], bits_per_dim: u32) -> u128 {
     let n = coords.len();
     assert!(n > 0, "At least one dimension required");
@@ -182,6 +184,17 @@ mod tests {
         let key = encode(&pt, 4);
         let decoded = decode(key, 3, 4);
         assert_eq!(pt, decoded);
+    }
+
+    #[test]
+    fn encode_decode_roundtrip_bits32() {
+        let pt2 = vec![0xFFFF_FFFFu32, 0xFFFF_FFFF];
+        let key2 = encode(&pt2, 32);
+        assert_eq!(decode(key2, 2, 32), pt2);
+
+        let pt4 = vec![1u32, 2, 3, 4];
+        let key4 = encode(&pt4, 32);
+        assert_eq!(decode(key4, 4, 32), pt4);
     }
 
     /// Hilbert locality sanity: identical points share a key; small steps stay bounded.

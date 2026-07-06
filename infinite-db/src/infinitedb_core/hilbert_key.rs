@@ -12,12 +12,12 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, Encode, Decode,
 )]
-pub struct HilbertKey(pub u128);
+pub struct HilbertKey(pub(crate) u128);
 
 impl HilbertKey {
     pub const ZERO: Self = Self(0);
 
-    pub fn from_raw(raw: u128) -> Self {
+    pub(crate) fn from_raw(raw: u128) -> Self {
         Self(raw)
     }
 
@@ -29,6 +29,8 @@ impl HilbertKey {
 /// Optional Hilbert key cached on a record (unset = compute from coordinates).
 ///
 /// On disk this serializes as `u128` with `0` meaning unset (legacy compatibility).
+/// Key `0` is both the origin cell's address and the unset sentinel; consumers must
+/// treat unset as recompute, which yields the identical key — benign by construction.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
 pub struct CachedHilbertKey(Option<HilbertKey>);
 
@@ -92,5 +94,22 @@ impl<'de, Context> BorrowDecode<'de, Context> for CachedHilbertKey {
     ) -> Result<Self, DecodeError> {
         let raw = u128::borrow_decode(decoder)?;
         Ok(Self::from_encoded(raw))
+    }
+}
+
+#[cfg(test)]
+mod inv_key_construction {
+    //! INV-KEY-CONSTRUCTION: bare `HilbertKey(_)` / `from_raw` stay crate-internal.
+
+    #[test]
+    fn curve_address_is_public_bridge() {
+        use crate::infinitedb_core::address::DimensionVector;
+        use crate::infinitedb_core::hilbert_key::HilbertKey;
+        use crate::infinitedb_index::{composite::KeyConfig, CurveAddress};
+
+        let key: HilbertKey =
+            CurveAddress::from_point(&DimensionVector::new(vec![1, 2]), KeyConfig { bits_per_dim: 8 })
+                .into();
+        assert!(key.raw() > 0);
     }
 }

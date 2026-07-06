@@ -1,8 +1,8 @@
 //! Placement composition re-exports for the index module (T11).
 
 pub use crate::infinitedb_core::placement::{
-    compose, nearest_common_ancestor, placement_path_to_ancestor, point_to_ancestor_space,
-    to_ancestor, Placement, PlacementError,
+    bbox_to_child, compose, extent_in_parent, nearest_common_ancestor, placement_path_to_ancestor,
+    point_to_ancestor_space, to_ancestor, Placement, PlacementError,
 };
 
 #[cfg(test)]
@@ -13,6 +13,20 @@ mod tests {
         placement::Placement,
         space::{SpaceConfig, SpaceRegistry},
     };
+
+    #[test]
+    fn compose_golden_triple_maps_4_to_55() {
+        let a = Placement::axis_aligned(vec![5], 2, 1, vec![32]);
+        let b = Placement::axis_aligned(vec![10], 3, 1, vec![16]);
+        let c = Placement::axis_aligned(vec![1], 1, 1, vec![8]);
+        let left = compose(&[compose(&[a.clone(), b.clone()]).unwrap(), c.clone()]).unwrap();
+        let right = compose(&[a.clone(), compose(&[b.clone(), c.clone()]).unwrap()]).unwrap();
+        let flat = compose(&[a, b, c]).unwrap();
+        let pt = vec![4u32];
+        assert_eq!(to_ancestor(&pt, std::slice::from_ref(&left)).unwrap(), vec![55]);
+        assert_eq!(to_ancestor(&pt, std::slice::from_ref(&right)).unwrap(), vec![55]);
+        assert_eq!(to_ancestor(&pt, std::slice::from_ref(&flat)).unwrap(), vec![55]);
+    }
 
     #[test]
     fn compose_is_associative_on_points() {

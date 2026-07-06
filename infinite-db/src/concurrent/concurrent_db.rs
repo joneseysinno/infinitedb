@@ -427,7 +427,47 @@ impl InfiniteDb {
         db.apply_recovered_session_wal(&recovered_session_wal)?;
         db.apply_recovered_fast_segments()?;
         db.recover_derivation_on_open()?;
+        db.rebuild_density_on_open()?;
         Ok(db)
+    }
+
+    fn rebuild_density_on_open(&self) -> Result<(), EngineError> {
+        use crate::engine::query::record_hilbert_key;
+        use crate::infinitedb_index::composite::KeyConfig;
+
+        let spaces = self.spaces.read();
+        for space_id in spaces.space_ids() {
+            let Some(config) = spaces.get(space_id).cloned() else {
+                continue;
+            };
+            let key_config = KeyConfig {
+                bits_per_dim: config.bits_per_dim,
+            };
+            let mut keys = Vec::new();
+            if let Some(snap) = self.snapshots.get(space_id) {
+                for entry in snap.blocks.values() {
+                    let block = self
+                        .store
+                        .read_block(entry.block_id)
+                        .map_err(EngineError::from)?;
+                    for rec in &block.records {
+                        if !rec.tombstone {
+                            keys.push(record_hilbert_key(&spaces, rec).raw());
+                        }
+                    }
+                }
+            }
+            for view in self.hilbert_tails.views_for_space(space_id) {
+                for rec in view.tail_iter() {
+                    if !rec.tombstone {
+                        keys.push(record_hilbert_key(&spaces, rec).raw());
+                    }
+                }
+            }
+            self.density
+                .rebuild_from_keys(space_id, keys, key_config, config.dims);
+        }
+        Ok(())
     }
 
     /// Replay committed session-WAL intent groups recovered on open (HLC merge order).
@@ -637,10 +677,105 @@ impl InfiniteDb {
     }
 
     fn sync_placement_mirror(&self, config: &SpaceConfig) -> Result<(), EngineError> {
-        if let Some(row) = crate::engine::placement_mirror::prepare_placement_mirror_row(config) {
+        let Some(parent_id) = config.parent else {
+            return Ok(());
+        };
+        let parent_bits = self
+            .spaces
+            .read()
+            .get(parent_id)
+            .map(|p| p.bits_per_dim)
+            .ok_or(EngineError::SpaceNotFound(parent_id))?;
+        if let Some(row) =
+            crate::engine::placement_mirror::prepare_placement_mirror_row(config, parent_bits)
+        {
             let rev = self.default_write_session.stamp()?;
             self.apply_mirror_rows(vec![row], rev)?;
         }
+        Ok(())
+    }
+
+    fn sync_placement_mirror_lifecycle(
+        &self,
+        old: Option<&SpaceConfig>,
+        new: Option<&SpaceConfig>,
+    ) -> Result<(), EngineError> {
+        let mut rows = Vec::new();
+        if let Some(prev) = old {
+            if let Some(parent_id) = prev.parent {
+                let parent_bits = self
+                    .spaces
+                    .read()
+                    .get(parent_id)
+                    .map(|p| p.bits_per_dim)
+                    .ok_or(EngineError::SpaceNotFound(parent_id))?;
+                if let Some(row) =
+                    crate::engine::placement_mirror::prepare_placement_mirror_tombstone(
+                        prev, parent_bits,
+                    )
+                {
+                    rows.push(row);
+                }
+            }
+        }
+        if let Some(next) = new {
+            if let Some(parent_id) = next.parent {
+                let parent_bits = self
+                    .spaces
+                    .read()
+                    .get(parent_id)
+                    .map(|p| p.bits_per_dim)
+                    .ok_or(EngineError::SpaceNotFound(parent_id))?;
+                if let Some(row) =
+                    crate::engine::placement_mirror::prepare_placement_mirror_row(
+                        next, parent_bits,
+                    )
+                {
+                    rows.push(row);
+                }
+            }
+        }
+        if !rows.is_empty() {
+            let rev = self.default_write_session.stamp()?;
+            self.apply_mirror_rows(rows, rev)?;
+        }
+        Ok(())
+    }
+
+    /// Update an existing space configuration (e.g. placement revision).
+    pub fn update_space(&self, config: SpaceConfig) -> Result<(), EngineError> {
+        let _guard = self.registration.lock();
+        self.validate_space_config(&config)?;
+        let old = self.spaces.read().get(config.id).cloned();
+        self.spaces
+            .write()
+            .update(config.clone())
+            .map_err(|e| EngineError::InvalidSpaceConfig {
+                message: e.to_string(),
+            })?;
+        self.persist_meta()?;
+        if let Some(ref prev) = old {
+            if prev.placement != config.placement || prev.parent != config.parent {
+                self.sync_placement_mirror_lifecycle(Some(prev), Some(&config))?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Remove a leaf space and tombstone its placement mirror in the parent.
+    pub fn remove_space(&self, id: SpaceId) -> Result<(), EngineError> {
+        let _guard = self.registration.lock();
+        let old = self
+            .spaces
+            .write()
+            .remove(id)
+            .map_err(|e| EngineError::InvalidSpaceConfig {
+                message: e.to_string(),
+            })?;
+        if let Some(ref prev) = old {
+            self.sync_placement_mirror_lifecycle(Some(prev), None)?;
+        }
+        self.persist_meta()?;
         Ok(())
     }
 

@@ -43,11 +43,11 @@ impl CurveAddress {
         self.0 >> shift
     }
 
-    /// Prefix at dyadic level `level` (1 = coarsest within space precision).
-    pub fn cell_prefix(self, level: u32, config: KeyConfig, dims: usize) -> u128 {
+    /// Prefix at `prefix_bits` from the top of the used key window (raw bit count).
+    pub fn cell_prefix(self, prefix_bits: u32, config: KeyConfig, dims: usize) -> u128 {
         let total = dims as u32 * config.bits_per_dim;
-        let level = level.min(total);
-        let keep = total - level;
+        let prefix_bits = prefix_bits.min(total);
+        let keep = total - prefix_bits;
         if keep >= 128 {
             return 0;
         }
@@ -57,6 +57,12 @@ impl CurveAddress {
             u128::MAX << keep
         };
         self.0 & mask
+    }
+
+    /// Prefix at dyadic tower `level` (level 1 = coarsest cell within space precision).
+    pub fn cell_prefix_level(self, level: u32, config: KeyConfig, dims: usize) -> u128 {
+        let prefix_bits = level.saturating_mul(dims as u32);
+        self.cell_prefix(prefix_bits, config, dims)
     }
 
     /// Owning interval as `(lo, hi)` inclusive top-aligned keys.
@@ -82,6 +88,15 @@ pub fn top_align_shift(config: KeyConfig, dims: usize) -> u32 {
 mod tests {
     use super::*;
     use crate::infinitedb_core::address::DimensionVector;
+
+    #[test]
+    fn cell_prefix_level_golden_2d_bits8() {
+        let config = KeyConfig { bits_per_dim: 8 };
+        let pt = DimensionVector::new(vec![5, 7]);
+        let addr = CurveAddress::from_point(&pt, config);
+        assert_eq!(addr.cell_prefix_level(1, config, 2), addr.cell_prefix(2, config, 2));
+        assert_eq!(addr.cell_prefix_level(8, config, 2), addr.raw());
+    }
 
     #[test]
     fn truncation_prefix_property() {

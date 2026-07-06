@@ -299,16 +299,87 @@ fn compose_pair(outer: &Placement, inner: &Placement) -> Result<Placement, Place
     })
 }
 
-/// Parent-space coordinate for the placement mirror (child extent center).
-pub fn placement_mirror_center(p: &Placement) -> Result<Vec<u32>, PlacementError> {
+/// Parent-space transformed extent bounds `(min, max)` per parent axis.
+pub fn extent_in_parent(p: &Placement) -> (Vec<i64>, Vec<i64>) {
     let n = p.offset.len();
-    let mut coords = Vec::with_capacity(n);
+    let parent_dims = n
+        .max(
+            p.fixed_axes
+                .iter()
+                .map(|&(axis, _)| axis + 1)
+                .max()
+                .unwrap_or(0),
+        );
+    let mut mins = vec![i64::MAX; parent_dims];
+    let mut maxs = vec![i64::MIN; parent_dims];
     for i in 0..n {
-        let center_child = (p.extent[i] / 2) as u64;
-        let parent = transform_coord(p.offset[i], center_child, p.scale_num[i], p.scale_den[i])
-            .ok_or(PlacementError::Overflow)?;
-        coords.push(parent as u32);
+        let min_p = transform_coord(p.offset[i], 0, p.scale_num[i], p.scale_den[i])
+            .expect("extent min transform");
+        let max_p = transform_coord(p.offset[i], p.extent[i] as u64, p.scale_num[i], p.scale_den[i])
+            .expect("extent max transform");
+        mins[i] = min_p as i64;
+        maxs[i] = max_p as i64;
     }
+    for &(axis, val) in &p.fixed_axes {
+        mins[axis] = val as i64;
+        maxs[axis] = val as i64;
+    }
+    (mins, maxs)
+}
+
+/// Inverse-transform a parent-frame bbox into child coordinates, clamped to extent.
+pub fn bbox_to_child(
+    p: &Placement,
+    min: &[u32],
+    max: &[u32],
+) -> Option<(Vec<u32>, Vec<u32>)> {
+    let n = p.offset.len();
+    if min.len() < n || max.len() < n {
+        return None;
+    }
+    for &(axis, val) in &p.fixed_axes {
+        if axis < min.len() && (min[axis] > val || max[axis] < val) {
+            return None;
+        }
+    }
+    let mut child_min = Vec::with_capacity(n);
+    let mut child_max = Vec::with_capacity(n);
+    for i in 0..n {
+        let inv = |parent: u32| -> Option<u32> {
+            let num = p.scale_num[i] as i128;
+            let den = p.scale_den[i] as i128;
+            if num == 0 {
+                return None;
+            }
+            let shifted = (parent as i128 - p.offset[i] as i128).checked_mul(den)?;
+            if shifted < 0 {
+                return None;
+            }
+            let child = shifted / num;
+            u32::try_from(child).ok()
+        };
+        let c0 = inv(min[i])?;
+        let c1 = inv(max[i])?;
+        let lo = c0.min(c1).min(p.extent[i]);
+        let hi = c0.max(c1).min(p.extent[i]);
+        if lo > hi {
+            return None;
+        }
+        child_min.push(lo);
+        child_max.push(hi);
+    }
+    Some((child_min, child_max))
+}
+
+/// Parent-space coordinate for the placement mirror (child extent parity center).
+///
+/// Prefer [`crate::infinitedb_index::center::parity_center_for_extent`] with
+/// [`extent_in_parent`] when parent precision is known at the call site.
+pub fn placement_mirror_center(p: &Placement, parent_bits: u32) -> Result<Vec<u32>, PlacementError> {
+    let (min_i, max_i) = extent_in_parent(p);
+    let min: Vec<u32> = min_i.into_iter().map(|v| v as u32).collect();
+    let max: Vec<u32> = max_i.into_iter().map(|v| v as u32).collect();
+    let mut coords = mirror_parity_center(&min, &max, parent_bits);
     for &(axis, val) in &p.fixed_axes {
         if axis >= coords.len() {
             coords.resize(axis + 1, 0);
@@ -316,6 +387,43 @@ pub fn placement_mirror_center(p: &Placement) -> Result<Vec<u32>, PlacementError
         coords[axis] = val;
     }
     Ok(coords)
+}
+
+fn mirror_parity_center(min: &[u32], max: &[u32], bits: u32) -> Vec<u32> {
+    assert_eq!(min.len(), max.len());
+    let levels: Vec<u32> = min
+        .iter()
+        .zip(max.iter())
+        .map(|(&lo, &hi)| mirror_containing_level(lo, hi, bits))
+        .collect();
+    let k = levels.into_iter().max().unwrap_or(1).max(1).min(bits - 1);
+    let shift = bits - k;
+    let half = 1u32 << (shift - 1);
+    min.iter()
+        .zip(max.iter())
+        .map(|(&lo, _)| {
+            let cell_base = (lo >> shift) << shift;
+            cell_base + half
+        })
+        .collect()
+}
+
+fn mirror_containing_level(min: u32, max: u32, bits: u32) -> u32 {
+    let (min, max) = if min <= max { (min, max) } else { (max, min) };
+    let half_domain = 1u32 << (bits - 1);
+    if min < half_domain && max >= half_domain {
+        return 1;
+    }
+    let mut shared = 0u32;
+    for bit in (0..bits).rev() {
+        let mask = 1u32 << bit;
+        if (min & mask) == (max & mask) {
+            shared += 1;
+        } else {
+            break;
+        }
+    }
+    shared.max(1)
 }
 
 #[cfg(test)]
@@ -338,19 +446,21 @@ mod tests {
     }
 
     #[test]
-    fn compose_associative_on_uniform_scale() {
-        let a = Placement::axis_aligned(vec![0], 2, 1, vec![64]);
-        let b = Placement::axis_aligned(vec![10], 3, 1, vec![32]);
-        let ab = compose(&[a.clone(), b.clone()]).unwrap();
-        let bc = compose(&[b, a]).unwrap();
-        let _ = (ab, bc);
-        // Round-trip: compose [a,b] then map point
-        let inner = Placement::axis_aligned(vec![0], 1, 1, vec![16]);
-        let outer = Placement::axis_aligned(vec![5], 2, 1, vec![32]);
-        let composed = compose(&[outer.clone(), inner.clone()]).unwrap();
-        let pt = vec![8u32];
-        let step = to_ancestor(&pt, &[inner, outer]).unwrap();
-        let direct = transform_point(&pt, &composed).unwrap();
-        assert_eq!(step, direct);
+    fn compose_associative_golden_triple() {
+        let a = Placement::axis_aligned(vec![5], 2, 1, vec![32]);
+        let b = Placement::axis_aligned(vec![10], 3, 1, vec![16]);
+        let c = Placement::axis_aligned(vec![1], 1, 1, vec![8]);
+        let left = compose(&[compose(&[a.clone(), b.clone()]).unwrap(), c.clone()]).unwrap();
+        let right = compose(&[a.clone(), compose(&[b.clone(), c.clone()]).unwrap()]).unwrap();
+        let flat = compose(&[a, b, c]).unwrap();
+        assert_eq!(left.offset, right.offset);
+        assert_eq!(left.offset, flat.offset);
+        let pt = vec![4u32];
+        let via_left = to_ancestor(&pt, std::slice::from_ref(&left)).unwrap();
+        let via_right = to_ancestor(&pt, std::slice::from_ref(&right)).unwrap();
+        let via_flat = transform_point(&pt, &flat).unwrap();
+        assert_eq!(via_left, vec![55]);
+        assert_eq!(via_right, vec![55]);
+        assert_eq!(via_flat, vec![55]);
     }
 }

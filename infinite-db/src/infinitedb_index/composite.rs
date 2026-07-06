@@ -30,7 +30,8 @@ impl Dimension {
 /// Precision configuration for a composite key.
 #[derive(Debug, Clone, Copy)]
 pub struct KeyConfig {
-    /// Bits allocated per dimension (1–8). All dimensions share the same precision.
+    /// Bits allocated per dimension (1–32). All dimensions share the same precision.
+    /// Total key bits = `dims × bits_per_dim` must be ≤ 128.
     pub bits_per_dim: u32,
 }
 

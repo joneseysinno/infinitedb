@@ -683,7 +683,7 @@ fn sync_barrier_publishes_enqueued_writes() {
 #[test]
 fn origin_point_hilbert_key_cached_on_insert() {
     use infinite_db::infinitedb_core::hilbert_key::HilbertKey;
-    use infinite_db::infinitedb_index::{composite::KeyConfig, key::hilbert_key_for};
+    use infinite_db::infinitedb_index::{composite::KeyConfig, CurveAddress};
 
     let dir = TempDir::new().unwrap();
     let db = InfiniteDb::open(dir.path()).unwrap();
@@ -697,6 +697,7 @@ fn origin_point_hilbert_key_cached_on_insert() {
     let results = db.query(space_id, None).unwrap();
     assert_eq!(results.len(), 1);
     assert!(!results[0].hilbert_key.is_unset());
-    let expected = HilbertKey(hilbert_key_for(&origin, KeyConfig { bits_per_dim: 8 }));
+    let expected: HilbertKey =
+        CurveAddress::from_point(&origin, KeyConfig { bits_per_dim: 8 }).into();
     assert_eq!(results[0].hilbert_key.get(), Some(expected));
 }

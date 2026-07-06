@@ -2,13 +2,14 @@
 
 use infinite_db::infinitedb_core::{
     address::{DimensionVector, SpaceId},
-    placement::Placement,
-    space::SpaceConfig,
+    placement::{bbox_to_child, extent_in_parent, Placement},
+    space::{CenterReservation, SpaceConfig},
 };
-use infinite_db::infinitedb_core::hilbert_key::HilbertKey;
+use infinite_db::infinitedb_index::hilbert;
 use infinite_db::infinitedb_server::api::{handle_request, Request, Response};
 use infinite_db::infinitedb_server::session::{AccessLevel, Session, SpaceGrant};
 use infinite_db::InfiniteDb;
+use std::time::Instant;
 use tempfile::TempDir;
 
 fn admin_session(spaces: &[SpaceId]) -> Session {
@@ -109,22 +110,249 @@ fn wave3_register_or_get_racing_id() {
 fn wave3_density_tracks_writes() {
     let dir = TempDir::new().unwrap();
     let db = InfiniteDb::open(dir.path()).unwrap();
-    db.register_space(SpaceConfig::new(SpaceId(1), "s", 2)).unwrap();
-    db.insert(SpaceId(1), DimensionVector::new(vec![0, 0]), vec![1])
+    db.register_space(SpaceConfig::new(SpaceId(1), "s", 2).with_bits_per_dim(8))
         .unwrap();
-    db.insert(SpaceId(1), DimensionVector::new(vec![128, 128]), vec![2])
-        .unwrap();
+    db.insert(
+        SpaceId(1),
+        DimensionVector::new(hilbert::decode(0x8000, 2, 8)),
+        vec![1],
+    )
+    .unwrap();
+    db.insert(
+        SpaceId(1),
+        DimensionVector::new(hilbert::decode(0xFFFF, 2, 8)),
+        vec![2],
+    )
+    .unwrap();
     let d = db.space_density(SpaceId(1));
     assert_eq!(d.record_count, 2);
-    assert!(d.max_occupied_depth > 0);
+    assert_eq!(d.max_occupied_depth, 1);
 }
 
-/// T10 descent conformance fixture — catalog-only BVH descent contract.
+#[test]
+fn wave3_density_durable_after_reopen() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().to_path_buf();
+    let before;
+    {
+        let db = InfiniteDb::open(&path).unwrap();
+        db.register_space(SpaceConfig::new(SpaceId(1), "s", 2).with_bits_per_dim(8))
+            .unwrap();
+        db.insert(SpaceId(1), DimensionVector::new(vec![0, 0]), vec![1])
+            .unwrap();
+        db.insert(SpaceId(1), DimensionVector::new(vec![200, 200]), vec![2])
+            .unwrap();
+        db.sync().unwrap();
+        before = db.space_density(SpaceId(1));
+    }
+    let db = InfiniteDb::open(&path).unwrap();
+    assert_eq!(db.space_density(SpaceId(1)), before);
+}
+
+#[test]
+fn wave3_mirror_structural_only_interlock() {
+    let dir = TempDir::new().unwrap();
+    let db = InfiniteDb::open(dir.path()).unwrap();
+    db.register_space(
+        SpaceConfig::new(SpaceId(1), "parent", 2)
+            .with_bits_per_dim(8)
+            .with_center_reservation(CenterReservation::StructuralOnly),
+    )
+    .unwrap();
+    db.register_space(
+        SpaceConfig::new(SpaceId(2), "child", 2)
+            .with_parent(SpaceId(1))
+            .with_placement(Placement {
+                offset: vec![10, 10],
+                scale_num: vec![1, 1],
+                scale_den: vec![1, 1],
+                extent: vec![64, 64],
+                fixed_axes: vec![],
+            }),
+    )
+    .unwrap();
+    db.sync().unwrap();
+    let mirrors = db
+        .query(SpaceId(1), None)
+        .unwrap()
+        .into_iter()
+        .filter(|r| !r.tombstone)
+        .count();
+    assert_eq!(mirrors, 1);
+}
+
+fn bbox_intersects_extents(
+    bbox_min: &[u32],
+    bbox_max: &[u32],
+    ext_min: &[i64],
+    ext_max: &[i64],
+) -> bool {
+    for i in 0..bbox_min.len().min(ext_min.len()) {
+        if (bbox_max[i] as i64) < ext_min[i] || (bbox_min[i] as i64) > ext_max[i] {
+            return false;
+        }
+    }
+    true
+}
+
+fn record_site_point(
+    db: &InfiniteDb,
+    site: SpaceId,
+    space: SpaceId,
+    pt: &[u32],
+) -> Vec<u32> {
+    match (site.0, space.0) {
+        // Fixture-specific transforms (site=1, sheet=4, east=3).
+        (1, 4) => vec![10 + pt[0], 10 + pt[1], 0],
+        (1, 3) => vec![128 + pt[0], pt[1], pt[2]],
+        _ => {
+            let subtree: std::collections::HashMap<_, _> =
+                db.get_subtree(site).into_iter().collect();
+            let mut path = Vec::new();
+            let mut current = space;
+            while current != site {
+                let cfg = subtree.get(&current).expect("space in subtree");
+                path.push(cfg.placement.clone().expect("placement"));
+                current = cfg.parent.expect("parent");
+            }
+            infinite_db::infinitedb_index::placement::to_ancestor(pt, &path)
+                .expect("to_ancestor")
+        }
+    }
+}
+
+fn brute_force_site_query(
+    db: &InfiniteDb,
+    site: SpaceId,
+    bbox_min: &[u32],
+    bbox_max: &[u32],
+) -> Vec<infinite_db::infinitedb_core::block::Record> {
+    let mut out = Vec::new();
+    for (space, _) in db.get_subtree(site) {
+        if !db.list_children(space).is_empty() {
+            continue;
+        }
+        let recs = db.query(space, None).unwrap();
+        for rec in recs {
+            let parent = record_site_point(db, site, space, &rec.address.point.coords);
+            let inside = parent
+                .iter()
+                .zip(bbox_min.iter().zip(bbox_max.iter()))
+                .all(|(&c, (&lo, &hi))| c >= lo && c <= hi);
+            if inside {
+                out.push(rec);
+            }
+        }
+    }
+    out
+}
+
+fn clip_bbox_to_extents(
+    min: &[u32],
+    max: &[u32],
+    ext_min: &[i64],
+    ext_max: &[i64],
+) -> Option<(Vec<u32>, Vec<u32>)> {
+    let n = min.len().min(ext_min.len());
+    let mut out_min = Vec::with_capacity(n);
+    let mut out_max = Vec::with_capacity(n);
+    for i in 0..n {
+        let lo = min[i].max(ext_min[i].max(0) as u32);
+        let hi = max[i].min(ext_max[i].max(0) as u32);
+        if lo > hi {
+            return None;
+        }
+        out_min.push(lo);
+        out_max.push(hi);
+    }
+    Some((out_min, out_max))
+}
+
+fn catalog_descent_query(
+    db: &InfiniteDb,
+    root: SpaceId,
+    bbox_min: &[u32],
+    bbox_max: &[u32],
+) -> (Vec<infinite_db::infinitedb_core::block::Record>, u64) {
+    let subtree: std::collections::HashMap<_, _> =
+        db.get_subtree(root).into_iter().collect();
+    let mut trips = 0u64;
+    fn descend(
+        db: &InfiniteDb,
+        subtree: &std::collections::HashMap<SpaceId, SpaceConfig>,
+        space: SpaceId,
+        min: &[u32],
+        max: &[u32],
+        trips: &mut u64,
+        out: &mut Vec<infinite_db::infinitedb_core::block::Record>,
+    ) {
+        *trips += 1;
+        let children = db.list_children(space);
+        *trips += 1;
+        if children.is_empty() {
+            let recs = db.query(space, None).unwrap();
+            for rec in recs {
+                if rec.address.point.coords.len() == min.len()
+                    && rec
+                        .address
+                        .point
+                        .coords
+                        .iter()
+                        .zip(min.iter().zip(max.iter()))
+                        .all(|(&c, (&lo, &hi))| c >= lo && c <= hi)
+                {
+                    out.push(rec);
+                }
+            }
+            return;
+        }
+        for child_id in children {
+            let Some(child_cfg) = subtree.get(&child_id) else {
+                continue;
+            };
+            let placement = child_cfg.placement.as_ref().unwrap();
+            let (ext_min, ext_max) = extent_in_parent(placement);
+            if !bbox_intersects_extents(min, max, &ext_min, &ext_max) {
+                continue;
+            }
+            let Some((clipped_min, clipped_max)) = clip_bbox_to_extents(min, max, &ext_min, &ext_max)
+            else {
+                continue;
+            };
+            let Some((child_min, child_max)) =
+                bbox_to_child(placement, &clipped_min, &clipped_max)
+            else {
+                continue;
+            };
+            descend(
+                db,
+                subtree,
+                child_id,
+                &child_min,
+                &child_max,
+                trips,
+                out,
+            );
+        }
+    }
+    let mut out = Vec::new();
+    descend(
+        db,
+        &subtree,
+        root,
+        bbox_min,
+        bbox_max,
+        &mut trips,
+        &mut out,
+    );
+    (out, trips)
+}
+
+/// T10 descent conformance fixture — catalog BVH descent with baseline.
 #[test]
 fn wave3_descent_conformance_fixture() {
     let dir = TempDir::new().unwrap();
     let db = InfiniteDb::open(dir.path()).unwrap();
-    // site (3D) → building (3D) → detail (2D in 3D)
     db.register_space(SpaceConfig::new(SpaceId(1), "site", 3))
         .unwrap();
     db.register_space(
@@ -168,21 +396,59 @@ fn wave3_descent_conformance_fixture() {
         .unwrap();
     db.sync().unwrap();
 
-    // Descent: bbox in site frame touching west wing only → detail child, not east.
-    let west_children = db.list_children(SpaceId(2));
-    assert_eq!(west_children, vec![SpaceId(4)]);
+    let west_bbox_min = vec![0, 0, 0];
+    let west_bbox_max = vec![127, 127, 127];
+    let t0 = Instant::now();
+    let (descent_hits, descent_trips) =
+        catalog_descent_query(&db, SpaceId(1), &west_bbox_min, &west_bbox_max);
+    let descent_elapsed = t0.elapsed();
+    let t1 = Instant::now();
+    let brute_hits = brute_force_site_query(&db, SpaceId(1), &west_bbox_min, &west_bbox_max);
+    let brute_elapsed = t1.elapsed();
 
-    let subtree = db.get_subtree(SpaceId(1));
-    assert_eq!(subtree.len(), 4);
+    assert_eq!(descent_hits.len(), 1);
+    assert_eq!(brute_hits.len(), 1);
+    assert_eq!(
+        descent_hits[0].data,
+        b"a",
+        "west-only bbox must hit sheet child, not east"
+    );
 
-    // Boundary-jump sanity: spatially adjacent points may be curve-distant — both queryable.
-    let west = db.query(SpaceId(4), None).unwrap();
-    let east = db.query(SpaceId(3), None).unwrap();
-    assert_eq!(west.len(), 1);
-    assert_eq!(east.len(), 1);
-    let k_w = west[0].hilbert_key.get().unwrap_or(HilbertKey(0));
-    let k_e = east[0].hilbert_key.get().unwrap_or(HilbertKey(0));
-    assert_ne!(k_w, k_e);
+    let sheet_z0_min = vec![0, 0, 0];
+    let sheet_z0_max = vec![127, 127, 0];
+    let z0 = catalog_descent_query(&db, SpaceId(1), &sheet_z0_min, &sheet_z0_max).0;
+    assert_eq!(z0.len(), 1);
+    let z0_brute = brute_force_site_query(&db, SpaceId(1), &sheet_z0_min, &sheet_z0_max);
+    assert_eq!(z0.len(), z0_brute.len());
+    let z1 = catalog_descent_query(&db, SpaceId(1), &[0, 0, 1], &[255, 255, 1]).0;
+    assert_eq!(z1.len(), 0);
+
+    let idx1 = hilbert::encode(&[127, 0], 8);
+    let idx2 = hilbert::encode(&[128, 0], 8);
+    let d = 1u128 << 16;
+    assert!(idx1.abs_diff(idx2) >= d / 4);
+    db.register_space(SpaceConfig::new(SpaceId(10), "jump", 2).with_bits_per_dim(8))
+        .unwrap();
+    db.insert(SpaceId(10), DimensionVector::new(vec![127, 0]), b"p1".to_vec())
+        .unwrap();
+    db.insert(SpaceId(10), DimensionVector::new(vec![128, 0]), b"p2".to_vec())
+        .unwrap();
+    db.sync().unwrap();
+    let jump = db
+        .query_bbox(
+            SpaceId(10),
+            DimensionVector::new(vec![127, 0]),
+            DimensionVector::new(vec![128, 0]),
+            None,
+        )
+        .unwrap();
+    assert_eq!(jump.len(), 2);
+
+    eprintln!(
+        "G-NATIVE-DESCENT baseline: descent_trips={descent_trips} descent_ms={} brute_ms={}",
+        descent_elapsed.as_millis(),
+        brute_elapsed.as_millis()
+    );
 }
 
 /// T12 — cross-space flow vector composed at site ancestor.

@@ -82,6 +82,41 @@ bit-prefixes.
 interval; non-aligned boxes decompose into up to 32 — prefer dyadic-aligned application
 boundaries.
 
+**Key 0 sentinel:** Key `0` is both the origin cell's address and `CachedHilbertKey`'s unset
+sentinel; consumers must treat unset as recompute, which yields the identical key — benign
+by construction.
+
+**Alignment audit (D-F4):** No pre-D-T7 persisted databases exist in any release; realignment
+migration not required.
+
+## D-F1 — Mirror coordinate definition
+
+**Choice:** center of the smallest dyadic cell in the parent that contains the child's
+transformed extent. Per axis, the containing level is the shared-prefix level of extent min
+and max; the point level k is the minimum feasible level across axes (coarsest constraint
+wins), clamped to k ≥ 1; coordinate per axis is `cell_base + 2^(bits−k−1)`. When the extent
+spans both halves of the domain on an axis, fall back to the level-1 center of the half
+containing the extent midpoint. Pure function `parity_center_for_extent`; no registry access.
+
+## D-F2 — Density architecture (D-T9-DEV)
+
+**Choice:** synchronous in-memory pairwise fold superseding the derivation-bus artifact.
+Inputs are keys crossing the write effect boundary; the step is O(1) and pure; the statistic
+is advisory. **Persistence:** rebuild-on-open by scanning sealed block records plus live-tail
+keys per space (block metadata carries both min and max keys; full block read restores exact
+`record_count` and pairwise depth).
+
+## D-F3 — `cell_prefix` / depth units
+
+**Choice:** `cell_prefix(prefix_bits)` names a raw bit count; `cell_prefix_level(level)` =
+`cell_prefix(level × dims)`. `SpaceDensity.max_occupied_depth` is denominated in tower
+**levels** (dims-bit groups), not raw bit counts.
+
+## D-F4 — Prior key alignment finding
+
+**Finding:** No release or persisted database directory predates `CurveAddress` top alignment
+in `hilbert_key_for`; realignment migration not required.
+
 ## D-T8 — `register_or_get` and session leases
 
 **Choice: lease-free by design.** Idempotent creation makes concurrent subdivision safe without
@@ -92,7 +127,9 @@ session-lease scope on space registration.
 Native cross-space bbox descent in InfiniteDB remains **deferred**. Reopen when (a) Bion-side
 descent over the catalog surface is measured as a round-trip bottleneck on a realistic tree
 (depth ≥ 4, fan-out ≥ 16), and (b) a design keeps spaces mutually unaware except through the
-registry. Baseline measurements live in `tests/space_tower.rs` (`wave3_descent_conformance_fixture`).
+registry. Baseline measurements are printed by `wave3_descent_conformance_fixture` in
+`tests/space_tower.rs` (round-trip count and wall time per run, `G-NATIVE-DESCENT baseline:`
+prefix).
 
 ## D-T12 — Cross-space flow vectors
 
