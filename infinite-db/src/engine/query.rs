@@ -13,7 +13,7 @@ use crate::infinitedb_core::{
     space::SpaceRegistry,
 };
 use crate::infinitedb_index::composite::KeyConfig;
-use crate::infinitedb_index::key::{hilbert_key_for, hilbert_key_standard};
+use crate::infinitedb_index::key::hilbert_key_for;
 use crate::infinitedb_index::range_decompose::{
     block_overlaps_intervals, decompose_bbox, key_in_intervals, KeyInterval,
 };
@@ -43,7 +43,7 @@ pub fn space_key(spaces: &SpaceRegistry, space: SpaceId, point: &DimensionVector
         Some(config) => hilbert_key_for(point, KeyConfig {
             bits_per_dim: config.bits_per_dim,
         }),
-        None => hilbert_key_standard(point),
+        None => hilbert_key_for(point, KeyConfig::STANDARD),
     }
 }
 

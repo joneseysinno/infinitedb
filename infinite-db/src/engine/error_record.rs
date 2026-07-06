@@ -61,24 +61,14 @@ pub fn prepare_error_write(
 ) -> Result<HypergraphWriteRow, io::Error> {
     let point = error_storage_point(record.revision_range.first);
     let data = encode_error_record(record)?;
-    Ok(HypergraphWriteRow {
-        space: error_space,
-        point,
-        data,
-        tombstone: false,
-    })
+    Ok(HypergraphWriteRow::new_row(error_space, point, data, false))
 }
 
 pub fn prepare_error_tombstone(
     error_space: SpaceId,
     range_start: RevisionId,
 ) -> HypergraphWriteRow {
-    HypergraphWriteRow {
-        space: error_space,
-        point: error_storage_point(range_start),
-        data: vec![],
-        tombstone: true,
-    }
+    HypergraphWriteRow::new_row(error_space, error_storage_point(range_start), vec![], true)
 }
 
 pub fn decode_error_record_payload(data: &[u8]) -> io::Result<OperationErrorRecord> {

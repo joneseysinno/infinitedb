@@ -8,12 +8,18 @@
 
 use crate::infinitedb_core::address::DimensionVector;
 use super::composite::{CompositeKey, Dimension, KeyConfig};
+use super::curve_address::CurveAddress;
 
-/// Compute the Hilbert key for a point at the given precision.
+/// Compute the top-aligned Hilbert key for a point at the given precision.
 ///
 /// An empty point maps to `0` so callers can key block minimums uniformly even
 /// for degenerate records.
 pub fn hilbert_key_for(point: &DimensionVector, config: KeyConfig) -> u128 {
+    CurveAddress::from_point(point, config).raw()
+}
+
+/// Bottom-aligned raw Hilbert index before top-alignment (internal / tests).
+pub fn hilbert_raw_index(point: &DimensionVector, config: KeyConfig) -> u128 {
     if point.coords.is_empty() {
         return 0;
     }
@@ -22,11 +28,4 @@ pub fn hilbert_key_for(point: &DimensionVector, config: KeyConfig) -> u128 {
         key = key.push(Dimension::new("_", c));
     }
     key.encode()
-}
-
-/// Compute the Hilbert key for a point using `KeyConfig::STANDARD` (8-bit) precision.
-///
-/// This is the default used by spaces that do not override their precision.
-pub fn hilbert_key_standard(point: &DimensionVector) -> u128 {
-    hilbert_key_for(point, KeyConfig::STANDARD)
 }

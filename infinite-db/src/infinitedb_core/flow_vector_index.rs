@@ -48,7 +48,10 @@ pub fn hyperedge_id_from_index_coords(coords: &[u32]) -> Option<HyperedgeId> {
     Some(HyperedgeId((hi << 32) | lo))
 }
 
-/// Encode index payload (hyperedge id + optional magnitude bucket).
+/// Payload tag for cross-space flow vectors (composed at common ancestor, T12).
+pub const FLOW_VECTOR_PAYLOAD_V2_TAG: u8 = 0xF2;
+
+/// Encode index payload (hyperedge id + optional magnitude bucket) — same-space V1.
 pub fn encode_flow_vector_index_payload(edge_id: HyperedgeId, magnitude_bucket: Option<u32>) -> Vec<u8> {
     let mut out = edge_id.0.to_le_bytes().to_vec();
     if let Some(m) = magnitude_bucket {
@@ -57,7 +60,46 @@ pub fn encode_flow_vector_index_payload(edge_id: HyperedgeId, magnitude_bucket: 
     out
 }
 
-pub fn decode_flow_vector_index_payload(data: &[u8]) -> Option<(HyperedgeId, Option<u32>)> {
+/// Encode cross-space flow vector payload (V2): tag + edge id + ancestor + magnitude.
+pub fn encode_flow_vector_index_payload_v2(
+    edge_id: HyperedgeId,
+    ancestor: SpaceId,
+    magnitude_bucket: Option<u32>,
+) -> Vec<u8> {
+    let mut out = vec![FLOW_VECTOR_PAYLOAD_V2_TAG];
+    out.extend_from_slice(&edge_id.0.to_le_bytes());
+    out.extend_from_slice(&ancestor.0.to_le_bytes());
+    if let Some(m) = magnitude_bucket {
+        out.extend_from_slice(&m.to_le_bytes());
+    }
+    out
+}
+
+/// Decoded payload: edge id, optional magnitude, optional ancestor (V2 cross-space).
+pub fn decode_flow_vector_index_payload(
+    data: &[u8],
+) -> Option<(HyperedgeId, Option<u32>, Option<SpaceId>)> {
+    if data.is_empty() {
+        return None;
+    }
+    if data[0] == FLOW_VECTOR_PAYLOAD_V2_TAG {
+        if data.len() < 17 {
+            return None;
+        }
+        let mut buf = [0u8; 8];
+        buf.copy_from_slice(&data[1..9]);
+        let id = HyperedgeId(u64::from_le_bytes(buf));
+        buf.copy_from_slice(&data[9..17]);
+        let ancestor = SpaceId(u64::from_le_bytes(buf));
+        let magnitude = if data.len() >= 21 {
+            let mut mb = [0u8; 4];
+            mb.copy_from_slice(&data[17..21]);
+            Some(u32::from_le_bytes(mb))
+        } else {
+            None
+        };
+        return Some((id, magnitude, Some(ancestor)));
+    }
     if data.len() < 8 {
         return None;
     }
@@ -71,7 +113,7 @@ pub fn decode_flow_vector_index_payload(data: &[u8]) -> Option<(HyperedgeId, Opt
     } else {
         None
     };
-    Some((id, magnitude))
+    Some((id, magnitude, None))
 }
 
 /// Magnitude bucket from delta length (optional index metadata).
@@ -104,16 +146,17 @@ pub fn pad_flow_vector_index_bbox(
     min_dir: QuantizedDirection,
     max_dir: QuantizedDirection,
 ) -> (DimensionVector, DimensionVector) {
+    let dim_max = (1u32 << FLOW_VECTOR_INDEX_BITS_PER_DIM) - 1;
     let mut min_coords = min_dir.coords;
     let mut max_coords = max_dir.coords;
     while min_coords.len() < 4 {
         min_coords.push(0);
-        max_coords.push(u32::MAX);
+        max_coords.push(dim_max);
     }
     min_coords.push(0);
     min_coords.push(0);
-    max_coords.push(u32::MAX);
-    max_coords.push(u32::MAX);
+    max_coords.push(dim_max);
+    max_coords.push(dim_max);
     (
         DimensionVector::new(min_coords),
         DimensionVector::new(max_coords),

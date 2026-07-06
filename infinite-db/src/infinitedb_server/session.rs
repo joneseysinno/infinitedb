@@ -103,6 +103,13 @@ impl Session {
         })
     }
 
+    /// Return `true` if the session may register or manage spaces.
+    pub fn can_manage_spaces(&self) -> bool {
+        self.grants
+            .iter()
+            .any(|g| g.level == AccessLevel::Admin)
+    }
+
     /// Return `true` if the session may write to `target_branch`.
     pub fn can_write_branch(&self, target_branch: BranchId) -> bool {
         if self.branch == target_branch {

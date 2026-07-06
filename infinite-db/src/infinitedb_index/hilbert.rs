@@ -30,7 +30,17 @@ pub fn encode(coords: &[u32], bits_per_dim: u32) -> u128 {
     );
     let b = bits_per_dim;
     let mask = (1u64 << b) - 1;
-    let mut x: Vec<u64> = coords.iter().map(|&c| (c as u64) & mask).collect();
+    let max = mask;
+    let mut x: Vec<u64> = coords
+        .iter()
+        .map(|&c| {
+            debug_assert!(
+                (c as u64) <= max,
+                "coordinate {c} exceeds bits_per_dim {bits_per_dim}"
+            );
+            (c as u64) & mask
+        })
+        .collect();
     axes_to_transpose(&mut x, b, n);
     compact(&x, n, b)
 }

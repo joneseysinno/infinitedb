@@ -17,6 +17,7 @@ use crate::infinitedb_core::{
     query::Query,
     signal::SignalSample,
     snapshot::SnapshotId,
+    space::SpaceConfig,
 };
 use crate::engine::error::EngineError;
 use crate::infinitedb_server::session::Session;
@@ -99,6 +100,14 @@ pub enum Request {
     ResolveConflict { id: u64, data: Vec<u8> },
     /// Ping: liveness check.
     Ping,
+    /// Catalog: list direct child spaces (T3).
+    ListChildren { parent: SpaceId },
+    /// Catalog: depth-first subtree configs (T3).
+    GetSubtree { root: SpaceId },
+    /// Idempotent space registration (T8).
+    RegisterOrGetSpace { config: SpaceConfig },
+    /// Per-space occupied-key depth statistic (T9).
+    GetSpaceDensity { space: SpaceId },
 }
 
 /// A response from the database to a client.
@@ -120,6 +129,15 @@ pub enum Response {
     ConflictResolved { id: u64 },
     /// Pong.
     Pong,
+    /// Space tower catalog entries.
+    SpaceConfigs(Vec<SpaceConfig>),
+    /// Space registration result.
+    SpaceRegistered { id: SpaceId },
+    /// Density statistic for a space.
+    SpaceDensity {
+        record_count: u64,
+        max_occupied_depth: u32,
+    },
     /// An error that the client should handle.
     Error(ApiError),
 }
@@ -135,6 +153,11 @@ pub fn project_api_error(err: EngineError) -> ApiError {
             | EngineError::BranchNotFound(_)
             | EngineError::RegistrySpace(crate::infinitedb_core::space::SpaceError::DuplicateId(_))
             | EngineError::RegistrySpace(crate::infinitedb_core::space::SpaceError::DuplicateName(_))
+            | EngineError::RegistrySpace(crate::infinitedb_core::space::SpaceError::ParentNotFound(_))
+            | EngineError::RegistrySpace(crate::infinitedb_core::space::SpaceError::Cycle(_))
+            | EngineError::RegistrySpace(crate::infinitedb_core::space::SpaceError::PlacementError(_))
+            | EngineError::RegistrySpace(crate::infinitedb_core::space::SpaceError::HasChildren(_))
+            | EngineError::RegistrySpace(crate::infinitedb_core::space::SpaceError::ConfigConflict { .. })
             | EngineError::RegistryBranch(
                 crate::infinitedb_core::branch::BranchError::DuplicateName(_),
             )
@@ -375,6 +398,51 @@ pub fn handle_request(db: &InfiniteDb, session: &Session, request: Request) -> R
         }
 
         Request::Ping => Response::Pong,
+
+        Request::ListChildren { parent } => {
+            if session.access(parent).is_none() {
+                return Response::Error(ApiError::Unauthorised);
+            }
+            let configs: Vec<SpaceConfig> = db
+                .list_children(parent)
+                .into_iter()
+                .filter_map(|id| db.spaces.read().get(id).cloned())
+                .collect();
+            Response::SpaceConfigs(configs)
+        }
+
+        Request::GetSubtree { root } => {
+            if session.access(root).is_none() {
+                return Response::Error(ApiError::Unauthorised);
+            }
+            let configs: Vec<SpaceConfig> = db
+                .get_subtree(root)
+                .into_iter()
+                .map(|(_, c)| c)
+                .collect();
+            Response::SpaceConfigs(configs)
+        }
+
+        Request::RegisterOrGetSpace { config } => {
+            if !session.can_manage_spaces() {
+                return Response::Error(ApiError::Unauthorised);
+            }
+            match db.register_or_get_space(config) {
+                Ok(id) => Response::SpaceRegistered { id },
+                Err(e) => Response::Error(project_api_error(e)),
+            }
+        }
+
+        Request::GetSpaceDensity { space } => {
+            if session.access(space).is_none() {
+                return Response::Error(ApiError::Unauthorised);
+            }
+            let d = db.space_density(space);
+            Response::SpaceDensity {
+                record_count: d.record_count,
+                max_occupied_depth: d.max_occupied_depth,
+            }
+        }
     }
 }
 
@@ -509,10 +577,35 @@ where
 
         Request::MergeBranch { .. }
         | Request::GetConflicts
-        | Request::ResolveConflict { .. } => {
+        | Request::ResolveConflict { .. }
+        | Request::RegisterOrGetSpace { .. } => {
             Response::Error(ApiError::Internal(
                 "use handle_request with InfiniteDb".into(),
             ))
+        }
+
+        Request::ListChildren { parent } => {
+            if session.access(parent).is_none() {
+                return Response::Error(ApiError::Unauthorised);
+            }
+            Response::SpaceConfigs(vec![])
+        }
+
+        Request::GetSubtree { root } => {
+            if session.access(root).is_none() {
+                return Response::Error(ApiError::Unauthorised);
+            }
+            Response::SpaceConfigs(vec![])
+        }
+
+        Request::GetSpaceDensity { space } => {
+            if session.access(space).is_none() {
+                return Response::Error(ApiError::Unauthorised);
+            }
+            Response::SpaceDensity {
+                record_count: 0,
+                max_occupied_depth: 0,
+            }
         }
     }
 }

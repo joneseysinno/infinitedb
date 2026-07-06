@@ -12,5 +12,19 @@ pub mod composite;
 pub mod key;
 /// Bounding-box to Hilbert key interval decomposition.
 pub mod range_decompose;
+/// Top-aligned curve address newtype (D-T7).
+pub mod curve_address;
+/// Dyadic cell-center detection.
+pub mod center;
+/// Placement composition utilities (T11).
+pub mod placement;
 
-pub use key::{hilbert_key_for, hilbert_key_standard};
+pub use center::is_dyadic_center;
+pub use composite::{CompositeKey, Dimension, KeyConfig};
+pub use curve_address::CurveAddress;
+pub use hilbert::{decode, encode};
+pub use key::{hilbert_key_for, hilbert_raw_index};
+pub use placement::{
+    compose, nearest_common_ancestor, placement_path_to_ancestor, point_to_ancestor_space,
+    to_ancestor, Placement, PlacementError,
+};

@@ -91,6 +91,11 @@ impl EngineError {
                 | EngineError::InvalidSpaceConfig { .. }
                 | EngineError::RegistrySpace(SpaceError::DuplicateId(_))
                 | EngineError::RegistrySpace(SpaceError::DuplicateName(_))
+                | EngineError::RegistrySpace(SpaceError::ParentNotFound(_))
+                | EngineError::RegistrySpace(SpaceError::Cycle(_))
+                | EngineError::RegistrySpace(SpaceError::PlacementError(_))
+                | EngineError::RegistrySpace(SpaceError::HasChildren(_))
+                | EngineError::RegistrySpace(SpaceError::ConfigConflict { .. })
                 | EngineError::RegistryBranch(
                     crate::infinitedb_core::branch::BranchError::DuplicateName(_)
                 )

@@ -399,7 +399,7 @@ fn endpoint_space_multi_shard_writes_isolated() {
     db.register_space(space(other.0, 2)).unwrap();
 
     for shard in 0..4u32 {
-        let point = DimensionVector::new(vec![shard * 1000, shard]);
+        let point = DimensionVector::new(vec![shard * 64, shard * 16]);
         db.insert(endpoint, point, vec![shard as u8]).unwrap();
     }
     db.insert(other, DimensionVector::new(vec![1, 1]), vec![99]).unwrap();
@@ -683,7 +683,7 @@ fn sync_barrier_publishes_enqueued_writes() {
 #[test]
 fn origin_point_hilbert_key_cached_on_insert() {
     use infinite_db::infinitedb_core::hilbert_key::HilbertKey;
-    use infinite_db::infinitedb_index::key::hilbert_key_standard;
+    use infinite_db::infinitedb_index::{composite::KeyConfig, key::hilbert_key_for};
 
     let dir = TempDir::new().unwrap();
     let db = InfiniteDb::open(dir.path()).unwrap();
@@ -697,6 +697,6 @@ fn origin_point_hilbert_key_cached_on_insert() {
     let results = db.query(space_id, None).unwrap();
     assert_eq!(results.len(), 1);
     assert!(!results[0].hilbert_key.is_unset());
-    let expected = HilbertKey(hilbert_key_standard(&origin));
+    let expected = HilbertKey(hilbert_key_for(&origin, KeyConfig { bits_per_dim: 8 }));
     assert_eq!(results[0].hilbert_key.get(), Some(expected));
 }

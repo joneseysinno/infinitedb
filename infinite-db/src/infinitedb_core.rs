@@ -40,6 +40,8 @@ pub mod kind_catalog;
 pub mod snapshot;
 /// Space registration and configuration.
 pub mod space;
+/// Parent-frame placement for the space tower.
+pub mod placement;
 /// Named database counter persistence.
 pub mod persisted_counters;
 /// Hilbert key newtype and cached-key state.

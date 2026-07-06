@@ -42,27 +42,37 @@ pub struct HypergraphWriteRow {
     pub point: DimensionVector,
     pub data: Vec<u8>,
     pub tombstone: bool,
+    /// Structural marker for center-reserved coordinates (D-T6).
+    #[doc(hidden)]
+    pub structural: bool,
+}
+
+impl HypergraphWriteRow {
+    pub(crate) fn new_row(space: SpaceId, point: DimensionVector, data: Vec<u8>, tombstone: bool) -> Self {
+        Self {
+            space,
+            point,
+            data,
+            tombstone,
+            structural: false,
+        }
+    }
 }
 
 /// Single assertion row for the edge space (sync write path, M4).
 pub fn prepare_assertion_write(space: SpaceId, edge: &Hyperedge) -> io::Result<HypergraphWriteRow> {
     let data = encode_hyperedge(edge)?;
-    Ok(HypergraphWriteRow {
+    Ok(HypergraphWriteRow::new_row(
         space,
-        point: Hyperedge::storage_point(edge.id),
+        Hyperedge::storage_point(edge.id),
         data,
-        tombstone: false,
-    })
+        false,
+    ))
 }
 
 /// Assertion tombstone for the edge space (sync delete path, M4).
 pub fn prepare_assertion_tombstone(space: SpaceId, id: HyperedgeId) -> HypergraphWriteRow {
-    HypergraphWriteRow {
-        space,
-        point: Hyperedge::storage_point(id),
-        data: vec![],
-        tombstone: true,
-    }
+    HypergraphWriteRow::new_row(space, Hyperedge::storage_point(id), vec![], true)
 }
 
 /// Derived endpoint-index rows (async derivation bus, M4).
@@ -77,6 +87,7 @@ pub fn prepare_index_derivation(
             point: endpoint_index_point_for_layout(&ep, edge.id, index_layout),
             data: encode_index_payload(edge.id, index_layout),
             tombstone: false,
+            structural: false,
         })
         .collect()
 }
@@ -93,6 +104,7 @@ pub fn prepare_index_tombstones(
             point: endpoint_index_point_for_layout(&ep, edge.id, index_layout),
             data: vec![],
             tombstone: true,
+            structural: false,
         })
         .collect()
 }
@@ -260,6 +272,7 @@ pub fn plan_v1_to_v2_index_rewrite(
                         point: record.address.point.clone(),
                         data: vec![],
                         tombstone: true,
+                        structural: false,
                     });
                     rows.push(HypergraphWriteRow {
                         space: ENDPOINT_INDEX_SPACE,
@@ -270,6 +283,7 @@ pub fn plan_v1_to_v2_index_rewrite(
                         ),
                         data: encode_index_payload(edge_id, EndpointIndexLayout::V2PolarityDim),
                         tombstone: false,
+                        structural: false,
                     });
                 } else {
                     rows.push(HypergraphWriteRow {
@@ -277,6 +291,7 @@ pub fn plan_v1_to_v2_index_rewrite(
                         point: record.address.point.clone(),
                         data: vec![],
                         tombstone: true,
+                        structural: false,
                     });
                 }
             }
@@ -286,6 +301,7 @@ pub fn plan_v1_to_v2_index_rewrite(
                     point: record.address.point.clone(),
                     data: vec![],
                     tombstone: true,
+                    structural: false,
                 });
             }
         }

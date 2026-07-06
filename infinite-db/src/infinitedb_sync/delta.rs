@@ -66,7 +66,7 @@ impl Delta {
     /// and deleting `removed_block_ids` via GC after the new snapshot is durable.
     pub fn apply(&self, snapshot: &Snapshot) -> Snapshot {
         use crate::infinitedb_core::snapshot::BlockIndexEntry;
-        use crate::infinitedb_index::hilbert_key_standard;
+        use crate::infinitedb_index::{composite::KeyConfig, key::hilbert_key_for};
 
         // Start from a clone of the current snapshot.
         let mut blocks = snapshot.blocks.clone();
@@ -85,14 +85,14 @@ impl Delta {
                 block
                     .records
                     .first()
-                    .map(|r| hilbert_key_standard(&r.address.point))
+                    .map(|r| hilbert_key_for(&r.address.point, KeyConfig::STANDARD))
                     .unwrap_or(0),
             );
             let max_key = HilbertKey(
                 block
                     .records
                     .last()
-                    .map(|r| hilbert_key_standard(&r.address.point))
+                    .map(|r| hilbert_key_for(&r.address.point, KeyConfig::STANDARD))
                     .unwrap_or(min_key.raw()),
             );
             blocks.insert(min_key, BlockIndexEntry { block_id: block.id, max_key });
@@ -184,7 +184,7 @@ mod tests {
             address::{Address, DimensionVector},
             block::Record,
         };
-        use crate::infinitedb_index::hilbert_key_standard;
+        use crate::infinitedb_index::{composite::KeyConfig, key::hilbert_key_for};
 
         // Build a block whose first (sorted) record sits at a known coordinate.
         let first_point = DimensionVector::new(vec![10, 20]);
@@ -213,7 +213,7 @@ mod tests {
         };
 
         let updated = delta.apply(&empty_snapshot(1));
-        let expected_key = hilbert_key_standard(&first_point);
+        let expected_key = hilbert_key_for(&first_point, KeyConfig::STANDARD);
 
         // The map key must be the Hilbert minimum, not the raw block ID.
         let expected = HilbertKey(expected_key);

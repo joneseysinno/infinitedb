@@ -17,7 +17,7 @@ use crate::engine::derivation::{
 };
 use crate::engine::flow_vector::{
     default_flow_vector_quantization, edge_id_from_flow_vector_index_record,
-    prepare_flow_vector_derivation,
+    prepare_flow_vector_derivation, resolve_flow_vector,
 };
 use crate::engine::staleness_closure::{forward_stale_closure, staleness_seed_endpoints};
 use crate::engine::error::EngineError;
@@ -186,6 +186,8 @@ pub struct InfiniteDb {
     arbiter_streams: Arc<RwLock<HashMap<ArbiterId, ArbiterStream>>>,
     frames: Arc<RwLock<HashMap<FrameId, FrameDefinition>>>,
     next_frame_id: Arc<AtomicU64>,
+    density: Arc<crate::engine::density_stat::DensityTracker>,
+    registration: parking_lot::Mutex<()>,
 }
 
 /// Applies derived index rows through the Hilbert write coordinator.
@@ -358,7 +360,7 @@ impl InfiniteDb {
         let subscribers: Vec<Box<dyn crate::engine::derivation::DerivationSubscriber>> = vec![
             Box::new(EndpointIndexSubscriber::new(Arc::clone(&spaces))),
             Box::new(EdgeLocatorSubscriber),
-            Box::new(FlowVectorSubscriber),
+            Box::new(FlowVectorSubscriber::new(Arc::clone(&spaces))),
         ];
         let sink = Arc::new(DbDerivationSink {
             spaces: Arc::clone(&spaces),
@@ -419,6 +421,8 @@ impl InfiniteDb {
             arbiter_streams,
             frames,
             next_frame_id,
+            density: Arc::new(crate::engine::density_stat::DensityTracker::new()),
+            registration: parking_lot::Mutex::new(()),
         };
         db.apply_recovered_session_wal(&recovered_session_wal)?;
         db.apply_recovered_fast_segments()?;
@@ -545,25 +549,14 @@ impl InfiniteDb {
     /// Unless [`SpaceConfig::without_error_space`] is set, auto-registers a companion
     /// `{name}_errors` space for operation-level error records (M5).
     pub fn register_space(&self, mut config: SpaceConfig) -> Result<(), EngineError> {
-        if config.bits_per_dim == 0 {
-            return Err(EngineError::InvalidSpaceConfig {
-                message: "bits_per_dim must be at least 1".into(),
-            });
-        }
-        if config.dims as u32 * config.bits_per_dim > 128 {
-            return Err(EngineError::InvalidSpaceConfig {
-                message: format!(
-                    "dims * bits_per_dim must be <= 128 (got {} * {})",
-                    config.dims, config.bits_per_dim
-                ),
-            });
-        }
+        let _guard = self.registration.lock();
+        self.validate_space_config(&config)?;
         let needs_error_space = !config.skip_error_space
             && config.id != ENDPOINT_INDEX_SPACE
             && config.id != JUDGMENT_INDEX_SPACE
             && config.id != FLOW_VECTOR_INDEX_SPACE
             && config.error_space.is_none();
-        let space_id = config.id.0;
+        let space_id = config.id;
         if needs_error_space {
             let err_id = SpaceRegistry::derive_error_space_id(config.id);
             let mut registry = self.spaces.write();
@@ -575,14 +568,143 @@ impl InfiniteDb {
                 std::fs::create_dir_all(&err_dir)?;
             }
             config.error_space = Some(err_id);
-            registry.register(config)?;
+            registry.register(config.clone())?;
         } else {
-            self.spaces.write().register(config)?;
+            self.spaces.write().register(config.clone())?;
         }
-        let space_dir = self.root.join("spaces").join(space_id.to_string());
+        let space_dir = self.root.join("spaces").join(space_id.0.to_string());
         std::fs::create_dir_all(&space_dir)?;
         self.persist_meta()?;
+        self.sync_placement_mirror(&config)?;
         Ok(())
+    }
+
+    /// Idempotent space registration (INV-REGISTER-IDEMPOTENT / T8).
+    pub fn register_or_get_space(&self, mut config: SpaceConfig) -> Result<SpaceId, EngineError> {
+        let _guard = self.registration.lock();
+        self.validate_space_config(&config)?;
+        let needs_error_space = !config.skip_error_space
+            && config.id != ENDPOINT_INDEX_SPACE
+            && config.id != JUDGMENT_INDEX_SPACE
+            && config.id != FLOW_VECTOR_INDEX_SPACE
+            && config.error_space.is_none();
+        let mut registry = self.spaces.write();
+        if needs_error_space {
+            let err_id = SpaceRegistry::derive_error_space_id(config.id);
+            if registry.get(err_id).is_none() {
+                let err_config = SpaceConfig::new(err_id, format!("{}_errors", config.name), 2)
+                    .without_error_space();
+                registry.register(err_config)?;
+                let err_dir = self.root.join("spaces").join(err_id.0.to_string());
+                std::fs::create_dir_all(&err_dir)?;
+            }
+            config.error_space = Some(err_id);
+        }
+        let id = registry.register_or_get(config.clone())?;
+        drop(registry);
+        let space_dir = self.root.join("spaces").join(id.0.to_string());
+        std::fs::create_dir_all(&space_dir)?;
+        self.persist_meta()?;
+        if let Some(cfg) = self.spaces.read().get(id).cloned() {
+            self.sync_placement_mirror(&cfg)?;
+        }
+        Ok(id)
+    }
+
+    fn validate_space_config(&self, config: &SpaceConfig) -> Result<(), EngineError> {
+        if config.bits_per_dim == 0 {
+            return Err(EngineError::InvalidSpaceConfig {
+                message: "bits_per_dim must be at least 1".into(),
+            });
+        }
+        if config.bits_per_dim > 32 {
+            return Err(EngineError::InvalidSpaceConfig {
+                message: format!(
+                    "bits_per_dim must be <= 32 (got {})",
+                    config.bits_per_dim
+                ),
+            });
+        }
+        if config.dims as u32 * config.bits_per_dim > 128 {
+            return Err(EngineError::InvalidSpaceConfig {
+                message: format!(
+                    "dims * bits_per_dim must be <= 128 (got {} * {})",
+                    config.dims, config.bits_per_dim
+                ),
+            });
+        }
+        Ok(())
+    }
+
+    fn sync_placement_mirror(&self, config: &SpaceConfig) -> Result<(), EngineError> {
+        if let Some(row) = crate::engine::placement_mirror::prepare_placement_mirror_row(config) {
+            let rev = self.default_write_session.stamp()?;
+            self.apply_mirror_rows(vec![row], rev)?;
+        }
+        Ok(())
+    }
+
+    fn apply_mirror_rows(
+        &self,
+        rows: Vec<HypergraphWriteRow>,
+        source_revision: RevisionId,
+    ) -> Result<(), EngineError> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let spaces = self.spaces.read();
+        let mut jobs = Vec::with_capacity(rows.len());
+        for row in rows {
+            let config = spaces
+                .get(row.space)
+                .ok_or(EngineError::SpaceNotFound(row.space))?;
+            if !row.structural {
+                crate::engine::write_validate::validate_point_write(
+                    config,
+                    &row.point,
+                    false,
+                )?;
+            } else {
+                crate::engine::write_validate::validate_point_write(
+                    config,
+                    &row.point,
+                    true,
+                )?;
+            }
+            let hilbert_key = HilbertKey(space_key(&spaces, row.space, &row.point));
+            let address = Address::new(row.space, row.point);
+            let entry = if row.tombstone {
+                WalEntry::Tombstone {
+                    address,
+                    revision: source_revision,
+                }
+            } else {
+                WalEntry::Write {
+                    address,
+                    revision: source_revision,
+                    data: row.data,
+                }
+            };
+            jobs.push(WriteJob::main(source_revision, entry, hilbert_key));
+        }
+        drop(spaces);
+        self.coordinator.enqueue_batch(jobs).map_err(EngineError::from)?;
+        Ok(())
+    }
+
+    /// Direct children in the space tower (T3).
+    pub fn list_children(&self, parent: SpaceId) -> Vec<SpaceId> {
+        self.spaces.read().children_of(parent)
+    }
+
+    /// Depth-first subtree configs (T3).
+    pub fn get_subtree(&self, root: SpaceId) -> Vec<(SpaceId, SpaceConfig)> {
+        self.spaces.read().subtree(root)
+    }
+
+    /// Per-space density statistic (T9).
+    pub fn space_density(&self, space: SpaceId) -> crate::engine::density_stat::SpaceDensity {
+        self.density.get(space)
     }
 
     /// Companion error space for a registered data space (M5).
@@ -1388,9 +1510,46 @@ impl InfiniteDb {
         point: DimensionVector,
         data: Vec<u8>,
     ) -> Result<RevisionId, EngineError> {
+        self.insert_on_branch_inner(branch, space, point, data, false)
+    }
+
+    /// Insert a structural record at a dyadic cell-center (D-T6).
+    pub fn insert_structural(
+        &self,
+        space: SpaceId,
+        point: DimensionVector,
+        data: Vec<u8>,
+    ) -> Result<RevisionId, EngineError> {
+        self.insert_on_branch_inner(BranchId::MAIN, space, point, data, true)
+    }
+
+    fn insert_on_branch_inner(
+        &self,
+        branch: BranchId,
+        space: SpaceId,
+        point: DimensionVector,
+        data: Vec<u8>,
+        structural: bool,
+    ) -> Result<RevisionId, EngineError> {
+        let config = self
+            .spaces
+            .read()
+            .get(space)
+            .cloned()
+            .ok_or(EngineError::SpaceNotFound(space))?;
+        crate::engine::write_validate::validate_point_write(&config, &point, structural)?;
         let rev = self.next_revision();
         let address = Address::new(space, point.clone());
-        let hilbert_key = HilbertKey(space_key(&self.spaces.read(), space, &point));
+        let key = space_key(&self.spaces.read(), space, &point);
+        let hilbert_key = HilbertKey(key);
+        self.density.observe_key(
+            space,
+            key,
+            crate::infinitedb_index::composite::KeyConfig {
+                bits_per_dim: config.bits_per_dim,
+            },
+            config.dims,
+        );
         let entry = WalEntry::Write {
             address,
             revision: rev,
@@ -2242,7 +2401,7 @@ impl InfiniteDb {
                 if !edge.is_active_at(rev_ceiling) {
                     continue;
                 }
-                let Some(vector) = edge.flow_vector() else {
+                let Some(vector) = resolve_flow_vector(&edge, &self.spaces.read()) else {
                     continue;
                 };
                 let quantized = quantize_direction(&vector.delta, &q);
@@ -2273,7 +2432,7 @@ impl InfiniteDb {
         if !edge.is_active_at(rev_ceiling) {
             return Ok(None);
         }
-        let Some(vector) = edge.flow_vector() else {
+        let Some(vector) = resolve_flow_vector(&edge, &self.spaces.read()) else {
             return Ok(None);
         };
         let quantized = quantize_direction(&vector.delta, &default_flow_vector_quantization());
@@ -3474,7 +3633,7 @@ impl InfiniteDb {
                     continue;
                 }
                 if let Ok(edge) = decode_edge_record(&r.data) {
-                    for row in prepare_flow_vector_derivation(&edge, q) {
+                    for row in prepare_flow_vector_derivation(&edge, &self.spaces.read(), q) {
                         synthetic.push(Record {
                             address: Address::new(row.space, row.point),
                             revision: r.revision,

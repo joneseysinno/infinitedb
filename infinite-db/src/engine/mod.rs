@@ -33,4 +33,7 @@ pub mod timed_fast_path;
 pub mod collision;
 pub mod replication_gate;
 pub mod watermark;
+pub mod placement_mirror;
+pub mod density_stat;
+pub mod write_validate;
 pub mod write_queue;

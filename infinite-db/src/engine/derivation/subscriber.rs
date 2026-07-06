@@ -43,18 +43,27 @@ impl DerivationSubscriber for EndpointIndexSubscriber {
     }
 }
 
-/// Flow-vector direction index subscriber (M7).
-pub struct FlowVectorSubscriber;
+/// Flow-vector direction index subscriber (M7 + T12 cross-space).
+pub struct FlowVectorSubscriber {
+    spaces: Arc<RwLock<SpaceRegistry>>,
+}
+
+impl FlowVectorSubscriber {
+    pub fn new(spaces: Arc<RwLock<SpaceRegistry>>) -> Self {
+        Self { spaces }
+    }
+}
 
 impl DerivationSubscriber for FlowVectorSubscriber {
     fn derive(&self, event: &AssertionEvent) -> Vec<HypergraphWriteRow> {
         let q = default_flow_vector_quantization();
+        let registry = self.spaces.read();
         let edge = match &event.op {
             AssertionOp::Upsert(e) | AssertionOp::Delete(e) => e,
         };
         match &event.op {
-            AssertionOp::Upsert(_) => prepare_flow_vector_derivation(edge, q),
-            AssertionOp::Delete(_) => prepare_flow_vector_tombstones(edge, q),
+            AssertionOp::Upsert(_) => prepare_flow_vector_derivation(edge, &registry, q),
+            AssertionOp::Delete(_) => prepare_flow_vector_tombstones(edge, &registry, q),
         }
     }
 }
