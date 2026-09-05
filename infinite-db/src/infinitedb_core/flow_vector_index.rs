@@ -1,7 +1,7 @@
 //! Spatial index for quantized flow-vector directions (M7).
 
 use super::{
-    address::{DimensionVector, SpaceId},
+    address::{DimensionVector, RevisionId, SpaceId},
     flow_vector::{FlowVectorQuantization, QuantizedDirection},
     hyperedge::HyperedgeId,
     space::SpaceConfig,
@@ -11,7 +11,8 @@ use super::{
 pub const FLOW_VECTOR_INDEX_SPACE: SpaceId = SpaceId(u64::MAX - 3);
 
 pub const FLOW_VECTOR_INDEX_DIMS: usize = 6;
-pub const FLOW_VECTOR_INDEX_BITS_PER_DIM: u32 = 7;
+/// Spend the Hilbert budget on the discriminator (`6 * 16 = 96 <= 128`).
+pub const FLOW_VECTOR_INDEX_BITS_PER_DIM: u32 = 16;
 
 /// Space config for the reserved flow-vector index.
 pub fn flow_vector_index_space_config() -> SpaceConfig {
@@ -24,17 +25,33 @@ pub fn flow_vector_index_space_config() -> SpaceConfig {
     .without_error_space()
 }
 
-/// Index point: quantized direction prefix + hyperedge id suffix.
+/// Index point: quantized direction prefix + truncated `valid_from` suffix (id in payload).
 pub fn flow_vector_index_point(
     quantized: &QuantizedDirection,
     edge_id: HyperedgeId,
+) -> DimensionVector {
+    let _ = edge_id;
+    flow_vector_index_point_at(quantized, RevisionId::ZERO)
+}
+
+/// Index point using a truncated revision discriminator instead of a packed edge id.
+pub fn flow_vector_index_point_at(
+    quantized: &QuantizedDirection,
+    valid_from: RevisionId,
 ) -> DimensionVector {
     let mut coords = quantized.coords.clone();
     while coords.len() < 4 {
         coords.push(0);
     }
-    coords.push((edge_id.0 & 0xFFFF_FFFF) as u32);
-    coords.push(((edge_id.0 >> 32) & 0xFFFF_FFFF) as u32);
+    let bits = FLOW_VECTOR_INDEX_BITS_PER_DIM.min(32);
+    let mask = if bits >= 32 {
+        u32::MAX
+    } else {
+        (1u32 << bits) - 1
+    };
+    let seq = valid_from.legacy_sequence();
+    coords.push((seq as u32) & mask);
+    coords.push(((seq >> bits) as u32) & mask);
     DimensionVector::new(coords)
 }
 

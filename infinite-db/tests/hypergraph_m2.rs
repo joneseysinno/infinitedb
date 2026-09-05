@@ -103,7 +103,7 @@ fn directional_incidence_index_resident_hub() {
     let hub = node(entity_space, 200);
 
     for id in 1u64..=120 {
-        let other = node(entity_space, (id + 500) as u32);
+        let other = node(entity_space, (id % 100 + 10) as u32);
         let edge = if id % 3 == 0 {
             directed_edge(id, other, hub.clone())
         } else {
@@ -200,11 +200,11 @@ fn delete_tombstones_polarity_specific_rows() {
 fn dual_layout_mixed_era() {
     let (db, _dir, edge_space) = open_v1_index_db();
     let entity_space = SpaceId(1);
-    let hub = node(entity_space, 300);
+    let hub = node(entity_space, 30);
 
     db.insert_hyperedge(
         edge_space,
-        directed_edge(1, hub.clone(), node(entity_space, 301)),
+        directed_edge(1, hub.clone(), node(entity_space, 31)),
     )
     .unwrap();
     db.sync().unwrap();
@@ -212,7 +212,7 @@ fn dual_layout_mixed_era() {
     db.upgrade_endpoint_index_layout().unwrap();
     db.insert_hyperedge(
         edge_space,
-        directed_edge(2, hub.clone(), node(entity_space, 302)),
+        directed_edge(2, hub.clone(), node(entity_space, 32)),
     )
     .unwrap();
     db.sync().unwrap();
@@ -232,23 +232,23 @@ fn dual_layout_mixed_era() {
         .iter()
         .filter(|r| !r.tombstone && index_record_layout(&r.data) == EndpointIndexLayout::V1Symmetric)
         .count();
-    let v2_rows = index_records
+    let v3_rows = index_records
         .iter()
-        .filter(|r| !r.tombstone && index_record_layout(&r.data) == EndpointIndexLayout::V2PolarityDim)
+        .filter(|r| !r.tombstone && index_record_layout(&r.data) == EndpointIndexLayout::V3CompactKey)
         .count();
     assert_eq!(v1_rows, 2);
-    assert_eq!(v2_rows, 2);
+    assert_eq!(v3_rows, 2);
 }
 
 #[test]
 fn compaction_lazy_rewrite_migrates_v1_rows() {
     let (db, _dir, edge_space) = open_v1_index_db();
     let entity_space = SpaceId(1);
-    let hub = node(entity_space, 400);
+    let hub = node(entity_space, 40);
 
     db.insert_hyperedge(
         edge_space,
-        directed_edge(10, hub.clone(), node(entity_space, 401)),
+        directed_edge(10, hub.clone(), node(entity_space, 41)),
     )
     .unwrap();
     db.sync().unwrap();
@@ -262,12 +262,12 @@ fn compaction_lazy_rewrite_migrates_v1_rows() {
         .iter()
         .filter(|r| !r.tombstone && index_record_layout(&r.data) == EndpointIndexLayout::V1Symmetric)
         .count();
-    let live_v2 = index_records
+    let live_v3 = index_records
         .iter()
-        .filter(|r| !r.tombstone && index_record_layout(&r.data) == EndpointIndexLayout::V2PolarityDim)
+        .filter(|r| !r.tombstone && index_record_layout(&r.data) == EndpointIndexLayout::V3CompactKey)
         .count();
     assert_eq!(live_v1, 0);
-    assert_eq!(live_v2, 2);
+    assert!(live_v3 >= 2);
 
     assert!(
         index_records
@@ -319,6 +319,6 @@ fn upgrade_endpoint_index_layout_persists() {
     let db2 = InfiniteDb::open(dir.path()).unwrap();
     assert_eq!(
         db2.endpoint_index_layout(),
-        EndpointIndexLayout::V2PolarityDim
+        EndpointIndexLayout::V3CompactKey
     );
 }

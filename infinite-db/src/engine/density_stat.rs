@@ -8,7 +8,10 @@ use std::collections::HashMap;
 
 use parking_lot::Mutex;
 
-use crate::infinitedb_core::address::SpaceId;
+use crate::infinitedb_core::{
+    address::SpaceId,
+    void::VoidOr,
+};
 use crate::infinitedb_index::composite::KeyConfig;
 
 #[derive(Debug, Clone, Copy)]
@@ -40,10 +43,11 @@ pub struct DensityTracker {
     inner: Mutex<HashMap<SpaceId, SpaceFold>>,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct SpaceDensity {
+/// Observed density for a space that has seen at least one key (INV-VOID-DIV-UNDEFINED).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ObservedDensity {
     pub record_count: u64,
-    /// Deepest dyadic tower level at which two keys differ (0 = empty or uniform).
+    /// Deepest dyadic tower level at which two keys differ (0 = uniform single key).
     pub max_occupied_depth: u32,
 }
 
@@ -68,27 +72,23 @@ impl DensityTracker {
         entry.count = entry.count.saturating_add(1);
     }
 
-    pub fn get(&self, space: SpaceId) -> SpaceDensity {
+    pub fn get(&self, space: SpaceId) -> VoidOr<ObservedDensity> {
         self.inner
             .lock()
             .get(&space)
             .map(|f| {
-                f.to_density(
-                    KeyConfig {
-                        bits_per_dim: f.bits_per_dim,
-                    },
-                    f.dims,
-                )
+                if !f.initialized {
+                    VoidOr::Void
+                } else {
+                    VoidOr::Known(f.to_density(
+                        KeyConfig {
+                            bits_per_dim: f.bits_per_dim,
+                        },
+                        f.dims,
+                    ))
+                }
             })
-            .unwrap_or_default()
-    }
-
-    pub fn get_with_config(&self, space: SpaceId, config: KeyConfig, dims: usize) -> SpaceDensity {
-        self.inner
-            .lock()
-            .get(&space)
-            .map(|f| f.to_density(config, dims))
-            .unwrap_or_default()
+            .unwrap_or(VoidOr::Void)
     }
 
     /// Rebuild fold state from observed keys (used at open).
@@ -118,8 +118,8 @@ impl DensityTracker {
 }
 
 impl SpaceFold {
-    fn to_density(self, config: KeyConfig, dims: usize) -> SpaceDensity {
-        SpaceDensity {
+    fn to_density(self, config: KeyConfig, dims: usize) -> ObservedDensity {
+        ObservedDensity {
             record_count: self.count,
             max_occupied_depth: pairwise_depth(self.count, self.min_key, self.max_key, config, dims),
         }
@@ -156,14 +156,13 @@ fn pairwise_depth(
 mod tests {
     use super::*;
     use crate::infinitedb_index::{hilbert, CurveAddress};
-    use crate::infinitedb_core::address::DimensionVector;
 
     fn depth_for_keys(keys: &[u128], config: KeyConfig, dims: usize) -> u32 {
         let tracker = DensityTracker::new();
         for &k in keys {
             tracker.observe_key(SpaceId(1), k, config, dims);
         }
-        tracker.get_with_config(SpaceId(1), config, dims).max_occupied_depth
+        tracker.get(SpaceId(1)).known().unwrap().max_occupied_depth
     }
 
     #[test]
@@ -191,12 +190,11 @@ mod tests {
         let tracker = DensityTracker::new();
         tracker.observe_key(SpaceId(1), k, config, 2);
         assert_eq!(
-            tracker.get_with_config(SpaceId(1), config, 2).max_occupied_depth,
+            tracker.get(SpaceId(1)).known().unwrap().max_occupied_depth,
             0
         );
-        assert_eq!(
-            tracker.get_with_config(SpaceId(2), config, 2),
-            SpaceDensity::default()
+        assert!(
+            tracker.get(SpaceId(2)).is_void()
         );
     }
 
@@ -207,7 +205,7 @@ mod tests {
         let tracker = DensityTracker::new();
         tracker.observe_key(SpaceId(1), k, config, 2);
         tracker.observe_key(SpaceId(1), k, config, 2);
-        let d = tracker.get_with_config(SpaceId(1), config, 2);
+        let d = tracker.get(SpaceId(1)).known().unwrap();
         assert_eq!(d.record_count, 2);
         assert_eq!(d.max_occupied_depth, 0);
     }
@@ -227,14 +225,30 @@ mod tests {
             reverse.observe_key(SpaceId(1), k, config, 2);
         }
         assert_eq!(
-            forward.get_with_config(SpaceId(1), config, 2),
-            reverse.get_with_config(SpaceId(1), config, 2)
+            forward.get(SpaceId(1)),
+            reverse.get(SpaceId(1))
         );
     }
 
     #[test]
-    fn decode_golden_indices() {
+    fn unobserved_space_is_void_not_zero_observed() {
+        let tracker = DensityTracker::new();
+        assert!(tracker.get(SpaceId(99)).is_void());
+    }
+
+    #[test]
+    fn single_key_is_observed_depth_zero() {
         let config = KeyConfig { bits_per_dim: 8 };
+        let k = CurveAddress::from_raw_index(42, config, 2).raw();
+        let tracker = DensityTracker::new();
+        tracker.observe_key(SpaceId(1), k, config, 2);
+        let d = tracker.get(SpaceId(1)).known().expect("one key is observed");
+        assert_eq!(d.record_count, 1);
+        assert_eq!(d.max_occupied_depth, 0);
+    }
+
+    #[test]
+    fn decode_golden_indices() {
         let idx1 = hilbert::encode(&[127, 0], 8);
         let idx2 = hilbert::encode(&[128, 0], 8);
         let d = 1u128 << 16;

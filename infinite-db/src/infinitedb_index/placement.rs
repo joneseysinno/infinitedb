@@ -96,10 +96,6 @@ mod tests {
         to_ancestor(pt, std::slice::from_ref(p)).unwrap()
     }
 
-    fn transform_child(p: &Placement, pt: &[u32]) -> Result<Vec<u32>, PlacementError> {
-        to_ancestor(pt, std::slice::from_ref(p))
-    }
-
     fn inverse_point(p: &Placement, parent: &[u32]) -> Result<Vec<u32>, PlacementError> {
         if p.scale_num[0] != p.scale_den[0] {
             return Err(PlacementError::Overflow);

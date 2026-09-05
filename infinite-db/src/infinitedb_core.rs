@@ -75,3 +75,12 @@ pub mod flow_vector_index;
 pub mod computation;
 /// Structural staleness via input pins (M7).
 pub mod staleness_closure;
+/// Void algebra — typed absence at addresses and in derived computations (D-V1–V3).
+pub mod void;
+/// Container-granularity Nexus edges (D-U4).
+pub mod nexus;
+pub mod nexus_codec;
+/// Wanderer / Ephemeris testimony conventions (D-E1–E3).
+pub mod ephemeris;
+/// Universe graph view and analytics (D-U1–U3).
+pub mod universe;

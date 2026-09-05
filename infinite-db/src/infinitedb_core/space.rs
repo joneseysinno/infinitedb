@@ -1,5 +1,10 @@
 use std::collections::HashMap;
-use bincode::{Decode, Encode};
+use bincode::{
+    de::{BorrowDecoder, Decoder},
+    enc::Encoder,
+    error::{DecodeError, EncodeError},
+    BorrowDecode, Decode, Encode,
+};
 use serde::{Deserialize, Serialize};
 use super::address::{RevisionId, SpaceId};
 use super::placement::{validate_placement, Placement, PlacementError};
@@ -51,6 +56,9 @@ pub enum EndpointIndexLayout {
     V1Symmetric,
     /// M2 layout: polarity dimension between endpoint coords and edge-id dimensions.
     V2PolarityDim,
+    /// Compact key: interned space ordinal + geometry + polarity + truncated `valid_from`.
+    /// Identity fields (`SpaceId`, `HyperedgeId`) live in the payload, not the curve key.
+    V3CompactKey,
 }
 
 /// Dyadic cell-center reservation policy (D-T5).
@@ -172,6 +180,14 @@ impl SpaceConfig {
         self
     }
 
+    /// Companion `{name}_errors` space: 2D × 32-bit so [`super::error_record::error_storage_point`]
+    /// can store a packed revision without overflowing Hilbert precision.
+    pub fn new_error_companion(id: SpaceId, name: impl Into<String>) -> Self {
+        Self::new(id, name, 2)
+            .with_bits_per_dim(32)
+            .without_error_space()
+    }
+
     /// Set parent space (tower hierarchy).
     pub fn with_parent(mut self, parent: SpaceId) -> Self {
         self.parent = Some(parent);
@@ -213,10 +229,49 @@ impl SpaceConfig {
 
 /// Registry of all known spaces in the database.
 /// Persisted as part of the database metadata block.
-#[derive(Debug, Default, Serialize, Deserialize, Encode, Decode)]
+///
+/// `ordinals` / `next_ordinal` are assigned at register time and persisted in a
+/// sidecar (`space_ordinals.bin`) so `spaces.bin` stays backward-compatible.
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct SpaceRegistry {
     spaces: HashMap<SpaceId, SpaceConfig>,
     names: HashMap<String, SpaceId>,
+    #[serde(skip)]
+    ordinals: HashMap<SpaceId, u32>,
+    #[serde(skip)]
+    next_ordinal: u32,
+}
+
+impl Encode for SpaceRegistry {
+    fn encode<E: Encoder>(&self, encoder: &mut E) -> Result<(), EncodeError> {
+        self.spaces.encode(encoder)?;
+        self.names.encode(encoder)?;
+        Ok(())
+    }
+}
+
+impl<Context> Decode<Context> for SpaceRegistry {
+    fn decode<D: Decoder<Context = Context>>(decoder: &mut D) -> Result<Self, DecodeError> {
+        Ok(Self {
+            spaces: HashMap::decode(decoder)?,
+            names: HashMap::decode(decoder)?,
+            ordinals: HashMap::new(),
+            next_ordinal: 0,
+        })
+    }
+}
+
+impl<'de, Context> BorrowDecode<'de, Context> for SpaceRegistry {
+    fn borrow_decode<D: BorrowDecoder<'de, Context = Context>>(
+        decoder: &mut D,
+    ) -> Result<Self, DecodeError> {
+        Ok(Self {
+            spaces: HashMap::borrow_decode(decoder)?,
+            names: HashMap::borrow_decode(decoder)?,
+            ordinals: HashMap::new(),
+            next_ordinal: 0,
+        })
+    }
 }
 
 impl SpaceRegistry {
@@ -228,15 +283,110 @@ impl SpaceRegistry {
     /// Register a new space. Returns an error if the name or ID is already taken.
     pub fn register(&mut self, config: SpaceConfig) -> Result<(), SpaceError> {
         self.validate_tree(&config)?;
+        self.validate_index_precision(&config)?;
         if self.spaces.contains_key(&config.id) {
             return Err(SpaceError::DuplicateId(config.id));
         }
         if self.names.contains_key(&config.name) {
             return Err(SpaceError::DuplicateName(config.name));
         }
-        self.names.insert(config.name.clone(), config.id);
-        self.spaces.insert(config.id, config);
+        let id = config.id;
+        self.names.insert(config.name.clone(), id);
+        self.spaces.insert(id, config);
+        self.assign_ordinal(id)?;
         Ok(())
+    }
+
+    /// Dense interned ordinal for index-key packing (stable across restarts once persisted).
+    pub fn space_ordinal(&self, id: SpaceId) -> Option<u32> {
+        self.ordinals.get(&id).copied()
+    }
+
+    /// Snapshot of interned ordinals for sidecar persistence.
+    pub fn ordinal_snapshot(&self) -> (HashMap<SpaceId, u32>, u32) {
+        (self.ordinals.clone(), self.next_ordinal)
+    }
+
+    /// Restore interned ordinals from sidecar persistence.
+    pub fn load_ordinals(&mut self, ordinals: HashMap<SpaceId, u32>, next_ordinal: u32) {
+        self.ordinals = ordinals;
+        self.next_ordinal = next_ordinal;
+        let missing: Vec<SpaceId> = self
+            .spaces
+            .keys()
+            .copied()
+            .filter(|id| !self.ordinals.contains_key(id))
+            .collect();
+        for id in missing {
+            if let Ok(ord) = self.alloc_ordinal() {
+                self.ordinals.insert(id, ord);
+            }
+        }
+    }
+
+    /// Assign ordinals by sorted `SpaceId` (used when no sidecar exists yet).
+    pub fn rebuild_ordinals(&mut self) {
+        let mut ids: Vec<SpaceId> = self.spaces.keys().copied().collect();
+        ids.sort_by_key(|id| id.0);
+        self.ordinals.clear();
+        for (i, id) in ids.into_iter().enumerate() {
+            self.ordinals.insert(id, i as u32);
+        }
+        self.next_ordinal = self.ordinals.len() as u32;
+    }
+
+    fn alloc_ordinal(&mut self) -> Result<u32, SpaceError> {
+        let ord = self.next_ordinal;
+        self.next_ordinal = self
+            .next_ordinal
+            .checked_add(1)
+            .ok_or(SpaceError::SpaceOrdinalExhausted)?;
+        Ok(ord)
+    }
+
+    fn assign_ordinal(&mut self, id: SpaceId) -> Result<(), SpaceError> {
+        if self.ordinals.contains_key(&id) {
+            return Ok(());
+        }
+        let ord = self.alloc_ordinal()?;
+        self.ordinals.insert(id, ord);
+        Ok(())
+    }
+
+    /// INV-INDEX-PRECISION-DOMINATES: an index space must be at least as precise as
+    /// any geometry space it indexes.
+    fn validate_index_precision(&self, config: &SpaceConfig) -> Result<(), SpaceError> {
+        if config.id == ENDPOINT_INDEX_SPACE_ID {
+            let max_indexed = self.max_indexed_bits_per_dim();
+            if config.bits_per_dim < max_indexed {
+                return Err(SpaceError::IndexPrecisionDominates {
+                    index_bits: config.bits_per_dim,
+                    required_bits: max_indexed,
+                });
+            }
+            return Ok(());
+        }
+        if !is_geometry_indexed_space(config.id, config) {
+            return Ok(());
+        }
+        if let Some(index) = self.get(ENDPOINT_INDEX_SPACE_ID) {
+            if index.bits_per_dim < config.bits_per_dim {
+                return Err(SpaceError::IndexPrecisionDominates {
+                    index_bits: index.bits_per_dim,
+                    required_bits: config.bits_per_dim,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    fn max_indexed_bits_per_dim(&self) -> u32 {
+        self.spaces
+            .values()
+            .filter(|c| is_geometry_indexed_space(c.id, c))
+            .map(|c| c.bits_per_dim)
+            .max()
+            .unwrap_or(0)
     }
 
     /// Idempotent register-or-get (INV-REGISTER-IDEMPOTENT).
@@ -269,9 +419,11 @@ impl SpaceRegistry {
         self.names.get(name).and_then(|id| self.spaces.get(id))
     }
 
-    /// Return all registered space IDs.
+    /// Return all registered space IDs in ascending id order (D-DET).
     pub fn space_ids(&self) -> Vec<SpaceId> {
-        self.spaces.keys().copied().collect()
+        let mut ids: Vec<SpaceId> = self.spaces.keys().copied().collect();
+        ids.sort_by_key(|id| id.0);
+        ids
     }
 
     /// Direct children of a space (catalog query T3).
@@ -326,6 +478,7 @@ impl SpaceRegistry {
         }
         if let Some(config) = self.spaces.remove(&id) {
             self.names.remove(&config.name);
+            self.ordinals.remove(&id);
             Ok(Some(config))
         } else {
             Ok(None)
@@ -398,11 +551,46 @@ pub enum SpaceError {
     PlacementError(PlacementError),
     /// Cannot remove a space with registered children.
     HasChildren(SpaceId),
+    /// Active Nexus endpoint or pin membership references this space (INV-NEX-ENDPOINT-EXISTS).
+    NexusReferenced(SpaceId),
     /// Same name, conflicting configuration (INV-REGISTER-IDEMPOTENT).
     ConfigConflict {
         name: String,
         existing_id: SpaceId,
     },
+    /// INV-INDEX-PRECISION-DOMINATES: index `bits_per_dim` below an indexed space.
+    IndexPrecisionDominates {
+        index_bits: u32,
+        required_bits: u32,
+    },
+    /// Interned space ordinal would exceed the index coordinate ceiling.
+    SpaceOrdinalExhausted,
+}
+
+/// Reserved endpoint-index id (duplicated to avoid a module cycle with `endpoint_index`).
+const ENDPOINT_INDEX_SPACE_ID: SpaceId = SpaceId(u64::MAX - 1);
+
+fn is_geometry_indexed_space(id: SpaceId, config: &SpaceConfig) -> bool {
+    if config.name.ends_with("_errors") {
+        return false;
+    }
+    match id.0 {
+        x if x == u64::MAX - 1
+            || x == u64::MAX - 2
+            || x == u64::MAX - 3
+            || x == u64::MAX - 4
+            || x == u64::MAX - 5
+            || x == 0x9000_0000_0000_0001 =>
+        {
+            return false;
+        }
+        _ => {}
+    }
+    // Packed-id assertion spaces (2D × 32-bit) key rows by identity, not geometry.
+    if config.dims == 2 && config.bits_per_dim >= 32 {
+        return false;
+    }
+    true
 }
 
 impl From<PlacementError> for SpaceError {
@@ -421,8 +609,21 @@ impl std::fmt::Display for SpaceError {
             SpaceError::Cycle(id) => write!(f, "cycle detected at space {:?}", id),
             SpaceError::PlacementError(e) => write!(f, "placement error: {e:?}"),
             SpaceError::HasChildren(id) => write!(f, "space {:?} has children", id),
+            SpaceError::NexusReferenced(id) => {
+                write!(f, "space {:?} is referenced by an active Nexus edge or pin", id)
+            }
             SpaceError::ConfigConflict { name, existing_id } => {
                 write!(f, "config conflict for name {name}, existing {:?}", existing_id)
+            }
+            SpaceError::IndexPrecisionDominates {
+                index_bits,
+                required_bits,
+            } => write!(
+                f,
+                "index bits_per_dim {index_bits} is below indexed space precision {required_bits}"
+            ),
+            SpaceError::SpaceOrdinalExhausted => {
+                write!(f, "space ordinal space exhausted")
             }
         }
     }
@@ -442,6 +643,39 @@ mod tests {
         assert!(decoded.parent.is_none());
         assert!(decoded.placement.is_none());
         assert_eq!(decoded.center_reservation, CenterReservation::Off);
+    }
+
+    #[test]
+    fn space_ids_are_sorted() {
+        let mut reg = SpaceRegistry::new();
+        reg.register(SpaceConfig::new(SpaceId(30), "c", 2)).unwrap();
+        reg.register(SpaceConfig::new(SpaceId(2), "a", 2)).unwrap();
+        reg.register(SpaceConfig::new(SpaceId(10), "b", 2)).unwrap();
+        assert_eq!(
+            reg.space_ids(),
+            vec![SpaceId(2), SpaceId(10), SpaceId(30)]
+        );
+    }
+
+    #[test]
+    fn index_precision_dominates_rejects_coarse_index() {
+        let mut reg = SpaceRegistry::new();
+        reg.register(SpaceConfig::new(SpaceId(1), "data", 2).with_bits_per_dim(8))
+            .unwrap();
+        let err = reg
+            .register(
+                SpaceConfig::new(SpaceId(u64::MAX - 1), "__endpoint_index__", 16)
+                    .with_bits_per_dim(7)
+                    .without_error_space(),
+            )
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            SpaceError::IndexPrecisionDominates {
+                index_bits: 7,
+                required_bits: 8
+            }
+        ));
     }
 
     #[test]

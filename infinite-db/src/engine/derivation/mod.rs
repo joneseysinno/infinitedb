@@ -11,7 +11,7 @@ pub use delta::record_in_derivation_delta;
 pub use event::AssertionEvent;
 pub use subscriber::{
     derive_all, DerivationSubscriber, EdgeLocatorSubscriber, EndpointIndexSubscriber,
-    FlowVectorSubscriber,
+    EphemerisGrazeSubscriber, FlowVectorSubscriber,
 };
 pub use watermark::{FailedDerivation, WatermarkRegistry};
 

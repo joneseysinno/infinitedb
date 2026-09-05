@@ -139,3 +139,184 @@ composes each centroid to the nearest common ancestor via the placement path (T1
 use the legacy V1 index payload; cross-space rows carry a V2 tag (`0xF2`) plus the ancestor
 `SpaceId`. Edges in disjoint space forests produce no flow-vector index row (queryable absence,
 not an error).
+
+## D-V1 — Void naming
+
+**Choice:** name the absence-of-data primitive `Void` (not `Vacuum`, `Nil`, `Empty`).
+
+## D-V2 — Three tiers stay distinct
+
+**Choice:** keep `Void` (never written) / `Tombstone` (written, then logically deleted;
+revision history retained; visible to as-of queries) / `Null` (application axis, out of
+scope) as three distinct tiers; never collapse.
+
+## D-V3 — Void algebra is polymorphic over containers
+
+**Choice:** implement the void algebra once via [`VoidState`](crate::infinitedb_core::void::VoidState)
+(`Space` now; `Universe` and beyond later against the same trait).
+
+## D-V4 — Presence representation
+
+**Choice:** core three-state enum [`Presence`](crate::infinitedb_core::void::Presence):
+`Void` | `Tombstoned { last: RevisionId }` | `Present(Record)`. `Tombstoned` carries the
+deleting revision because that is what distinguishes it observably from `Void`.
+
+## D-V5 — Where `IS_VOID` evaluates
+
+**Choice:** engine point-read path, snapshot-pinned, honoring `as_of`. Compose the existing
+point lookup with tombstones included: no record → `Void`; newest tombstone → `Tombstoned`;
+else `Present`. `index_only` staleness bounds apply to presence exactly as for record reads.
+
+## D-V6 — Void-propagating comparison type
+
+**Choice:** [`VoidOr<T>`](crate::infinitedb_core::void::VoidOr) in the core module with
+`map` / `and_then` / `zip_with` where `zip_with` propagates `Void` if either side is `Void`.
+Distinct from `Presence`: `Presence` is storage absence; `VoidOr` is derived-computation
+absence.
+
+## D-V7 — Undefined-over-void error placement
+
+**Choice:** typed [`EngineError::UndefinedOverVoid`](crate::engine::error::EngineError::UndefinedOverVoid)
+`{ operation, container }`. `is_caller_correctable()` → true; `is_retryable()` → false.
+Ratio-shaped derived statistics return `VoidOr` or this error — never a defaulted zero.
+
+## D-U1 — Universe generalizes the tower
+
+**Choice:** every `Placement` is a `Nexus`; not every `Nexus` is a `Placement`.
+
+## D-U2 — Naming: Constellation
+
+**Choice:** name the emergent inter-space cluster `Constellation` (not `quadrant`).
+
+## D-U3 — Nested zoom without hierarchy
+
+**Choice:** a dense subgraph viewed from outside is a `Constellation`; contracting and
+re-detecting uses the same container-generic graph — no `Universe` entity variant.
+
+## D-U4 — Nexus shape
+
+**Choice:** `NexusEdge` is a sibling of `Hyperedge` at container granularity, with
+`weight_milli` and `valid_to` for transfer volume and transient edges.
+
+## D-U5 — Wanderer and Ephemeris naming
+
+**Choice:** `Wanderer` for the unhomed object; `Ephemeris` for its trajectory log.
+
+## D-U6 — Graph storage
+
+**Choice:** explicit Nexus rows in `NEXUS_SPACE`; placement edges projected from the
+registry only (`INV-UNI-PROJECTED`). Membership via [`is_universe_member`](crate::infinitedb_core::universe::is_universe_member).
+
+## D-U7 — ContainerRef
+
+**Choice:** `ContainerRef::Space | Constellation` — no `Universe` variant (D-U10).
+
+## D-U9 — Pinned constellations
+
+**Choice:** detection is ephemeral; durable pins are `"constellation.pin"` assertions in
+`NEXUS_SPACE`. Constellation detection uses **weighted label propagation**: each node adopts
+the label of a highest-`weight_milli` neighbor (projected placement edges default to
+`DEFAULT_PLACEMENT_WEIGHT_MILLI`), with id-sorted tie-breaks on labels.
+
+## D-U10 — Nesting is zoom + port
+
+**Choice:** one ambient universe graph per database; porting imports members and pins as a
+constellation — no nested-universe registry.
+
+## D-U13 — Universe voidness
+
+**Choice:** `VoidState` on [`UniverseGraphView`](crate::infinitedb_core::universe::UniverseGraphView)
+(member-void); separate `is_relation_void(as_of)` for populated-but-disconnected graphs.
+[`UndefinedOverVoid`](crate::engine::error::EngineError::UndefinedOverVoid).`container` is
+`Option<SpaceId>` (`None` = ambient universe).
+
+## D-E1 — Ephemeris queryable by default
+
+**Choice:** ephemeris entries are frame-queryable hyperedge testimony in `EPHEMERIS_SPACE`.
+
+## D-E2 — Ephemeris as hyperedge testimony
+
+**Choice:** kinds `ephemeris.observed` / `ephemeris.projected` carry the D-E1 discriminant.
+
+## D-E3 — Wanderer identity
+
+**Choice:** caller-allocated `WandererId`; identity node in `WANDERER_REGISTRY_SPACE`.
+
+## D-E4 — Graze traces
+
+**Choice:** default no trace; opt-in `"graze"` Nexus edges via derivation subscriber.
+Graze `NexusId` is `blake3` of the canonical `(wanderer, space, stamp, region)` tuple
+truncated to u64 — a pure function of the entry so replay is idempotent, without XOR
+collisions. Trace weight is `GRAZE_WEIGHT_MILLI = 0` so detection leaves the wanderer
+unclustered (`INV-EPH-UNCLUSTERED`).
+
+## D-U8 — NexusEdge sibling type
+
+**Choice:** `NexusEdge` mirrors hyperedge field shapes as a sibling type (not a variant).
+
+## D-U11 — Nexus bulk transfer
+
+**Choice:** durable `IntentOperationKind::NexusTransfer` with phases
+`Prepared → Copying → TargetSynced → SourceTombstoning → Complete`; target fsync
+before source tombstoning (`INV-NEX-TRANSFER-ORDER`); idempotent target writes.
+
+## D-U12 — Port bundle format
+
+**Choice:** self-contained `UniversePortBundle` (space configs, nexus edges, optional
+records by name); provenance encoded in ported space names; idempotent re-port via bundle hash.
+
+## D-U13 — ratio statistics
+
+**Choice:** [`mean_eccentricity`](crate::infinitedb_core::universe::mean_eccentricity),
+[`edge_set_density`](crate::infinitedb_core::universe::edge_set_density), and
+[`modularity`](crate::infinitedb_core::universe::modularity) return
+`UniverseRatioError` on member-void or singleton input; callers map to
+[`UndefinedOverVoid`](crate::engine::error::EngineError::UndefinedOverVoid), never silent zero.
+
+## INV-INDEX-PRECISION-DOMINATES
+
+An index space's `bits_per_dim` must be ≥ the max `bits_per_dim` of geometry spaces it
+indexes. Packed-id 2D×32 assertion spaces (nexus, ephemeris, error companions, hyperedge
+storage) are exempt: their coordinates are identity, not geometry. New databases use
+`EndpointIndexLayout::V3CompactKey`: interned `space_ordinal`, endpoint geometry, polarity,
+and a truncated `valid_from` discriminator. `HyperedgeId` lives in the payload only.
+The discriminator is little-endian packed into remaining Hilbert dimensions (24 bits in
+the 11-coordinate worst case). This is the cheap fix of the Universe punch list — not the
+append-multiset or space-tower redesigns, which remain future options if 24-bit same-revision
+collisions on one endpoint become load-bearing.
+
+## D-DET — Deterministic iteration order
+
+**Choice:** hash-ordered containers (`HashMap`, `HashSet`, `dashmap`) are permitted for
+lookup and accumulation ONLY. Any value whose iteration order can reach an **observable
+boundary** MUST have a total order established before it crosses that boundary. The
+observable boundaries are:
+
+1. a wire response (`Response` / `ApiError` payloads),
+2. a codec or on-disk encoding,
+3. a checksum, Merkle leaf, or bundle hash,
+4. a WAL or intent-checkpoint record,
+5. a test assertion or diagnostic that compares whole values.
+
+Establishing order means either building in a `BTreeMap`/`BTreeSet`, or collecting from a
+hash container and sorting on a key that is **total** — a sort key on which two distinct
+elements can tie is not a total order, and `sort_by` is stable, so ties silently inherit
+hash order. Where a sort key may tie, extend it until it cannot (for graph edges: include
+the endpoint list, not just `(projected, kind, nexus_id)`).
+
+Rationale: `std`'s `RandomState` is seeded per map instance, so hash iteration order differs
+between two maps built identically in the same process, and between runs. A test that calls
+the same function twice on the same structure will NOT catch a violation — the structure
+must be rebuilt. `INV-DET-STABLE` is the general form: for any read-side request, N
+independently constructed instances of identical state produce byte-identical responses.
+`INV-UNI-DETERMINISTIC` is this invariant applied to the universe analytics.
+
+Non-goals: this record does not require replacing `HashMap` on hot paths. `SpaceRegistry`,
+the query engine, and the storage layer keep hash lookup; they owe the ordering step at
+their output boundary. `infinitedb_sync::replicate::latest_per_address` (collect, then sort,
+then Merkle) is the reference implementation of this contract.
+
+Rejected: switching to a fixed-seed hasher (`FxHashMap`, `ahash`) to obtain reproducible
+iteration. It yields an order that is arbitrary rather than canonical, changes silently with
+a toolchain or dependency bump, and forfeits SipHash's HashDoS resistance on a server whose
+keys (space ids, addresses, container refs) are chosen by the client.

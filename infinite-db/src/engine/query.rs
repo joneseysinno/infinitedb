@@ -11,6 +11,7 @@ use crate::infinitedb_core::{
     record_identity::{AddressKey, RecordIdentityKey},
     snapshot::BlockIndexEntry,
     space::SpaceRegistry,
+    void::{classify_presence, Presence},
 };
 use crate::infinitedb_index::composite::KeyConfig;
 use crate::infinitedb_index::key::hilbert_key_for;
@@ -18,7 +19,7 @@ use crate::infinitedb_index::range_decompose::{
     block_overlaps_intervals, decompose_bbox, key_in_intervals, KeyInterval,
 };
 
-use super::hilbert_shard::{hilbert_shard_id, ShardRef};
+use super::hilbert_shard::ShardRef;
 use crate::infinitedb_storage::nvme::BlockStore;
 
 use crate::infinitedb_core::branch::BranchId;
@@ -537,22 +538,11 @@ pub fn query_bbox(
         .get(space)
         .map(|c| c.bits_per_dim)
         .unwrap_or(8);
-    let shard_bits = Some(ShardRef::shard_bits_for_space(spaces, space));
     let intervals = decompose_bbox(&min, &max, bits);
-    let _ = intervals;
     record_interval_scan(1);
     let rev_ceiling = pinned_vector
         .map(|v| v.fetch_ceiling())
         .unwrap_or_else(|| as_of.unwrap_or_else(|| watermark.allocated()));
-
-    let shard_filter = shard_bits.map(|sb| {
-        let mut shard_ids = std::collections::BTreeSet::new();
-        for interval in &intervals {
-            shard_ids.insert(hilbert_shard_id(interval.lo.raw(), sb));
-            shard_ids.insert(hilbert_shard_id(interval.hi.raw(), sb));
-        }
-        shard_ids
-    });
 
     let on_branch = branch_id.is_some_and(|b| b != BranchId::MAIN);
     let key_filter = KeyFilter::Intervals(&intervals);
@@ -593,13 +583,7 @@ pub fn query_bbox(
                 key_filter,
                 live_tail,
                 hilbert_live_tails,
-                shard_bits.map(|sb| {
-                    let first = intervals
-                        .first()
-                        .map(|i| hilbert_shard_id(i.lo.raw(), sb))
-                        .unwrap_or(0);
-                    ShardRef::new(first, sb)
-                }),
+                None,
             )
         }
     } else {
@@ -610,13 +594,7 @@ pub fn query_bbox(
             key_filter,
             live_tail,
             hilbert_live_tails,
-            shard_bits.map(|sb| {
-                let first = intervals
-                    .first()
-                    .map(|i| hilbert_shard_id(i.lo.raw(), sb))
-                    .unwrap_or(0);
-                ShardRef::new(first, sb)
-            }),
+            None,
         )
     };
     for (_, entry) in block_entries {
@@ -635,13 +613,6 @@ pub fn query_bbox(
         if record.address.space != space || record.revision > rev_ceiling {
             continue;
         }
-        if let Some(ref shards) = shard_filter {
-            let sb = ShardRef::shard_bits_for_space(spaces, space);
-            let sid = hilbert_shard_id(record_hilbert_key(spaces, &record).raw(), sb);
-            if !shards.contains(&sid) {
-                continue;
-            }
-        }
         if !record_matches_filter(spaces, &record, KeyFilter::Intervals(&intervals)) {
             continue;
         }
@@ -655,6 +626,44 @@ pub fn query_bbox(
     };
     results.retain(|r| r.address.point.within(&min, &max));
     Ok(results)
+}
+
+/// Point presence at `point`, tombstone-inclusive, pinned at `as_of` (D-V5).
+pub fn presence_at_inner(
+    store: &BlockStore,
+    snapshots: &SnapshotStore,
+    live_tail: Option<&LiveTailView>,
+    spaces: &SpaceRegistry,
+    watermark: &SessionWatermarks,
+    space: SpaceId,
+    point: &DimensionVector,
+    as_of: Option<RevisionId>,
+    pinned_vector: Option<&VersionVector>,
+    hilbert_live_tails: Option<&HilbertLiveTails>,
+    branch_overlays: Option<&BranchOverlayStore>,
+    branch_id: Option<BranchId>,
+) -> std::io::Result<Presence> {
+    let key = space_key(spaces, space, point);
+    let records = query_inner(
+        store,
+        snapshots,
+        live_tail,
+        spaces,
+        watermark,
+        space,
+        Some((key, key)),
+        as_of,
+        pinned_vector,
+        true,
+        hilbert_live_tails,
+        branch_overlays,
+        branch_id,
+    )?;
+    let at_point: Vec<Record> = records
+        .into_iter()
+        .filter(|r| r.address.point == *point)
+        .collect();
+    Ok(classify_presence(&at_point))
 }
 
 pub fn snapshots_map_for_persist(snapshots: &SnapshotStore) -> BTreeMap<u64, crate::infinitedb_core::snapshot::Snapshot> {

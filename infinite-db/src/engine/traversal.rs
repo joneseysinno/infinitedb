@@ -151,7 +151,11 @@ fn run_b_connectivity_traversal(
         }
     }
 
-    let edges: Vec<Hyperedge> = edge_map.into_values().collect();
+    let edges: Vec<Hyperedge> = {
+        let mut e: Vec<Hyperedge> = edge_map.into_values().collect();
+        e.sort_by_key(|edge| edge.id.0);
+        e
+    };
     Ok(run_b_connectivity(
         &spec.start,
         &edges,

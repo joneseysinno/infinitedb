@@ -543,6 +543,8 @@ fn as_of_survives_auto_compaction_with_keep_all() {
 
 #[test]
 fn latest_only_compaction_drops_history() {
+    let _inject_guard = SYNC_INJECT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    reset_sync_fail_inject();
     let dir = TempDir::new().unwrap();
     let mut opts = OpenOptions::default();
     opts.io_thread.hot_segment_seal_bytes = 64;
@@ -573,6 +575,8 @@ fn latest_only_compaction_drops_history() {
 
 #[test]
 fn branch_base_blocks_survive_main_compaction() {
+    let _inject_guard = SYNC_INJECT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    reset_sync_fail_inject();
     let dir = TempDir::new().unwrap();
     let mut opts = OpenOptions::default();
     opts.format_version = Some(FORMAT_VERSION_V4);
@@ -620,6 +624,8 @@ fn branch_base_blocks_survive_main_compaction() {
 
 #[test]
 fn compaction_removes_superseded_blocks_without_branches() {
+    let _inject_guard = SYNC_INJECT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    reset_sync_fail_inject();
     let dir = TempDir::new().unwrap();
     let mut opts = OpenOptions::default();
     opts.format_version = Some(FORMAT_VERSION_V4);

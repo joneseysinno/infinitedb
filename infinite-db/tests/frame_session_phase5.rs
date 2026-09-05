@@ -94,9 +94,9 @@ fn session_scope_admits_only_listed_sessions() {
     let entity = SpaceId(1);
     let s1 = db.open_session();
     let s2 = db.open_session();
-    let edge = directed_edge(700, node(entity, 1, 0), node(entity, 2, 0));
+    let edge = directed_edge(70, node(entity, 1, 0), node(entity, 2, 0));
     commit_hyperedge(&db, &s1, edge_space, edge);
-    let edge2 = directed_edge(701, node(entity, 3, 0), node(entity, 4, 0));
+    let edge2 = directed_edge(71, node(entity, 3, 0), node(entity, 4, 0));
     commit_hyperedge(&db, &s2, edge_space, edge2);
     db.sync_derivation();
 
@@ -111,7 +111,7 @@ fn session_scope_admits_only_listed_sessions() {
         .unwrap();
     let (min, max) = (
         DimensionVector::new(vec![0, 0]),
-        DimensionVector::new(vec![u32::MAX, u32::MAX]),
+        DimensionVector::new(vec![255, 255]),
     );
     let results = db
         .query_hyperedges_in_frame(FrameQuery {
@@ -125,7 +125,7 @@ fn session_scope_admits_only_listed_sessions() {
         })
         .unwrap();
     assert_eq!(results.len(), 1);
-    assert_eq!(results[0].edge.id, HyperedgeId(700));
+    assert_eq!(results[0].edge.id, HyperedgeId(70));
     assert_eq!(
         results[0].edge.valid_from.session(),
         s1.id().0,
@@ -140,14 +140,14 @@ fn cross_session_supersession_by_authorship_not_arrival() {
     let s_a = db.open_session();
     let s_b = db.open_session();
 
-    let edge_a = directed_edge(800, node(entity, 10, 0), node(entity, 11, 0));
+    let edge_a = directed_edge(80, node(entity, 10, 0), node(entity, 11, 0));
     let rev_a = db
         .insert_hyperedge_with_session(&s_a, edge_space, edge_a)
         .unwrap();
 
     thread::sleep(Duration::from_millis(5));
 
-    let edge_b = directed_edge(800, node(entity, 20, 0), node(entity, 21, 0));
+    let edge_b = directed_edge(80, node(entity, 20, 0), node(entity, 21, 0));
     let rev_b = commit_hyperedge(&db, &s_b, edge_space, edge_b);
     commit_session(&db, &s_a);
 
@@ -165,7 +165,7 @@ fn cross_session_supersession_by_authorship_not_arrival() {
             default_as_of: None,
         })
         .unwrap();
-    let (min, max) = edge_bbox(800);
+    let (min, max) = edge_bbox(80);
     let results = db
         .query_hyperedges_in_frame(FrameQuery {
             frame_id: frame.id,
@@ -194,12 +194,12 @@ fn select_contested_surfaces_conflict_under_session_scope() {
         &db,
         &session,
         edge_space,
-        directed_edge(810, node(entity, 1, 0), node(entity, 2, 0)),
+        directed_edge(81, node(entity, 1, 0), node(entity, 2, 0)),
     );
     db.sync().unwrap();
     db.sync_derivation();
     assert!(
-        db.fetch_hyperedge_by_id(edge_space, HyperedgeId(810), None)
+        db.fetch_hyperedge_by_id(edge_space, HyperedgeId(81), None)
             .unwrap()
             .is_some()
     );
@@ -216,7 +216,7 @@ fn select_contested_surfaces_conflict_under_session_scope() {
 
     let (min, max) = (
         DimensionVector::new(vec![0, 0]),
-        DimensionVector::new(vec![u32::MAX, u32::MAX]),
+        DimensionVector::new(vec![255, 255]),
     );
     let results = db
         .query_hyperedges_in_frame(FrameQuery {
@@ -244,19 +244,19 @@ fn version_vector_pin_excludes_later_fast_session_writes() {
         &db,
         &slow,
         edge_space,
-        directed_edge(900, node(entity, 1, 0), node(entity, 2, 0)),
+        directed_edge(90, node(entity, 1, 0), node(entity, 2, 0)),
     );
     let rev_fast1 = commit_hyperedge(
         &db,
         &fast,
         edge_space,
-        directed_edge(901, node(entity, 3, 0), node(entity, 4, 0)),
+        directed_edge(91, node(entity, 3, 0), node(entity, 4, 0)),
     );
     let _rev_fast2 = commit_hyperedge(
         &db,
         &fast,
         edge_space,
-        directed_edge(902, node(entity, 5, 0), node(entity, 6, 0)),
+        directed_edge(92, node(entity, 5, 0), node(entity, 6, 0)),
     );
 
     let mut pin: FrameVersionPin = BTreeMap::new();
@@ -278,18 +278,18 @@ fn version_vector_pin_excludes_later_fast_session_writes() {
             frame_id: frame.id,
             testimony_space: edge_space,
             min: DimensionVector::new(vec![0, 0]),
-            max: DimensionVector::new(vec![u32::MAX, u32::MAX]),
+            max: DimensionVector::new(vec![255, 255]),
             as_of: None,
             version_vector: Some(pin),
             options: FrameQueryOptions::default(),
         })
         .unwrap();
     let ids_pinned: Vec<_> = results_pinned.iter().map(|e| e.edge.id.0).collect();
-    assert!(ids_pinned.contains(&900));
-    assert!(ids_pinned.contains(&901));
+    assert!(ids_pinned.contains(&90));
+    assert!(ids_pinned.contains(&91));
     assert!(
-        !ids_pinned.contains(&902),
-        "vector pin at rev_fast1 must hide edge 902 authored later on fast session"
+        !ids_pinned.contains(&92),
+        "vector pin at rev_fast1 must hide edge 92 authored later on fast session"
     );
 
     let results_head = db
@@ -297,14 +297,14 @@ fn version_vector_pin_excludes_later_fast_session_writes() {
             frame_id: frame.id,
             testimony_space: edge_space,
             min: DimensionVector::new(vec![0, 0]),
-            max: DimensionVector::new(vec![u32::MAX, u32::MAX]),
+            max: DimensionVector::new(vec![255, 255]),
             as_of: None,
             version_vector: None,
             options: FrameQueryOptions::default(),
         })
         .unwrap();
     let ids_head: Vec<_> = results_head.iter().map(|e| e.edge.id.0).collect();
-    assert!(ids_head.contains(&902));
+    assert!(ids_head.contains(&92));
 }
 
 #[test]
@@ -316,14 +316,14 @@ fn retrospective_session_trajectory_by_as_of() {
         &db,
         &session,
         edge_space,
-        directed_edge(950, node(entity, 1, 0), node(entity, 2, 0)),
+        directed_edge(95, node(entity, 1, 0), node(entity, 2, 0)),
     );
     thread::sleep(Duration::from_millis(5));
     let rev2 = commit_hyperedge(
         &db,
         &session,
         edge_space,
-        directed_edge(950, node(entity, 9, 0), node(entity, 10, 0)),
+        directed_edge(95, node(entity, 9, 0), node(entity, 10, 0)),
     );
     db.sync_derivation();
 
@@ -338,7 +338,7 @@ fn retrospective_session_trajectory_by_as_of() {
         .unwrap();
     let (min, max) = (
         DimensionVector::new(vec![0, 0]),
-        DimensionVector::new(vec![u32::MAX, u32::MAX]),
+        DimensionVector::new(vec![255, 255]),
     );
     let at_first = db
         .query_hyperedges_in_frame(FrameQuery {
@@ -394,7 +394,7 @@ fn session_scope_persists_after_reopen() {
             &db,
             &session,
             edge_space,
-            directed_edge(960, node(entity, 1, 0), node(entity, 2, 0)),
+            directed_edge(96, node(entity, 1, 0), node(entity, 2, 0)),
         );
         db.register_frame(FrameRegisterRequest {
             id: None,
@@ -419,7 +419,7 @@ fn session_scope_persists_after_reopen() {
             frames[0].assertion_scope,
             AssertionScope::Session(_)
         ));
-        let (min, max) = edge_bbox(960);
+        let (min, max) = edge_bbox(96);
         let results = db
             .query_hyperedges_in_frame(FrameQuery {
                 frame_id: frames[0].id,
@@ -467,14 +467,14 @@ fn cross_session_staleness_when_upstream_superseded() {
         &db,
         &s_upstream,
         edge_space,
-        directed_edge(970, node(entity, 0, 0), node(entity, 1, 0)),
+        directed_edge(97, node(entity, 0, 0), node(entity, 1, 0)),
     );
-    let mut derived = directed_edge(971, node(entity, 2, 0), node(entity, 3, 0));
+    let mut derived = directed_edge(98, node(entity, 2, 0), node(entity, 3, 0));
     derived.computation = Some(infinite_db::infinitedb_core::computation::ComputationProvenance {
         inputs: vec![SubjectPin {
             kind: SubjectKind::Hyperedge,
             space: edge_space,
-            identity: SubjectIdentity::Hyperedge(HyperedgeId(970)),
+            identity: SubjectIdentity::Hyperedge(HyperedgeId(97)),
             subject_revision: rev_u,
         }],
     });
@@ -482,7 +482,7 @@ fn cross_session_staleness_when_upstream_superseded() {
     db.sync_derivation();
 
     let fresh = db
-        .check_hyperedge_freshness(edge_space, HyperedgeId(971), None)
+        .check_hyperedge_freshness(edge_space, HyperedgeId(98), None)
         .unwrap();
     assert!(
         fresh.is_fresh,
@@ -495,12 +495,12 @@ fn cross_session_staleness_when_upstream_superseded() {
         &db,
         &s_upstream,
         edge_space,
-        directed_edge(970, node(entity, 9, 0), node(entity, 1, 0)),
+        directed_edge(97, node(entity, 9, 0), node(entity, 1, 0)),
     );
     db.sync_derivation();
 
     let stale = db
-        .check_hyperedge_freshness(edge_space, HyperedgeId(971), None)
+        .check_hyperedge_freshness(edge_space, HyperedgeId(98), None)
         .unwrap();
     assert!(!stale.is_fresh);
     assert_eq!(stale.inputs[0].status, FreshnessStatus::Stale);

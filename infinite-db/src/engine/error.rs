@@ -26,6 +26,7 @@ pub enum EngineError {
     RegistrySpace(SpaceError),
     RegistryBranch(crate::infinitedb_core::branch::BranchError),
     InvalidHyperedge(HyperedgeValidationError),
+    InvalidNexus(crate::infinitedb_core::nexus::NexusValidationError),
     DerivationBackpressure {
         pending_tasks: usize,
         derivation_lag: u64,
@@ -51,6 +52,11 @@ pub enum EngineError {
     FrameNotFound(FrameId),
     InvalidFrame(FrameValidationError),
     InvalidComputation(ComputationValidationError),
+    /// Ratio/mean/density over a void set — caller error, not retryable (D-V7).
+    UndefinedOverVoid {
+        operation: &'static str,
+        container: Option<SpaceId>,
+    },
     Other {
         message: String,
     },
@@ -88,6 +94,7 @@ impl EngineError {
         matches!(
             self,
             EngineError::InvalidHyperedge(_)
+                | EngineError::InvalidNexus(_)
                 | EngineError::InvalidSpaceConfig { .. }
                 | EngineError::RegistrySpace(SpaceError::DuplicateId(_))
                 | EngineError::RegistrySpace(SpaceError::DuplicateName(_))
@@ -95,6 +102,7 @@ impl EngineError {
                 | EngineError::RegistrySpace(SpaceError::Cycle(_))
                 | EngineError::RegistrySpace(SpaceError::PlacementError(_))
                 | EngineError::RegistrySpace(SpaceError::HasChildren(_))
+                | EngineError::RegistrySpace(SpaceError::NexusReferenced(_))
                 | EngineError::RegistrySpace(SpaceError::ConfigConflict { .. })
                 | EngineError::RegistryBranch(
                     crate::infinitedb_core::branch::BranchError::DuplicateName(_)
@@ -111,6 +119,7 @@ impl EngineError {
                 | EngineError::FrameNotFound(_)
                 | EngineError::InvalidFrame(_)
                 | EngineError::InvalidComputation(_)
+                | EngineError::UndefinedOverVoid { .. }
         )
     }
 
@@ -133,6 +142,7 @@ impl std::fmt::Display for EngineError {
             EngineError::RegistrySpace(e) => write!(f, "{e:?}"),
             EngineError::RegistryBranch(e) => write!(f, "{e:?}"),
             EngineError::InvalidHyperedge(e) => write!(f, "{e:?}"),
+            EngineError::InvalidNexus(e) => write!(f, "{e}"),
             EngineError::DerivationBackpressure {
                 pending_tasks,
                 derivation_lag,
@@ -158,6 +168,13 @@ impl std::fmt::Display for EngineError {
             EngineError::FrameNotFound(id) => write!(f, "frame {:?} not found", id),
             EngineError::InvalidFrame(e) => write!(f, "{e}"),
             EngineError::InvalidComputation(e) => write!(f, "{e}"),
+            EngineError::UndefinedOverVoid { operation, container } => {
+                if let Some(id) = container {
+                    write!(f, "undefined over void: {operation} on space {:?}", id)
+                } else {
+                    write!(f, "undefined over void: {operation} on universe")
+                }
+            }
             EngineError::Other { message } => write!(f, "{message}"),
         }
     }
@@ -186,6 +203,12 @@ impl From<SpaceError> for EngineError {
 impl From<crate::infinitedb_core::branch::BranchError> for EngineError {
     fn from(err: crate::infinitedb_core::branch::BranchError) -> Self {
         EngineError::RegistryBranch(err)
+    }
+}
+
+impl From<crate::infinitedb_core::nexus::NexusValidationError> for EngineError {
+    fn from(err: crate::infinitedb_core::nexus::NexusValidationError) -> Self {
+        EngineError::InvalidNexus(err)
     }
 }
 
@@ -228,6 +251,24 @@ impl From<ComputationValidationError> for EngineError {
 impl From<crate::engine::hlc_clock::ClockSkewError> for EngineError {
     fn from(err: crate::engine::hlc_clock::ClockSkewError) -> Self {
         clock_skew_to_engine(err)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::infinitedb_core::address::SpaceId;
+
+    #[test]
+    fn undefined_over_void_is_caller_correctable_not_retryable() {
+        let err = EngineError::UndefinedOverVoid {
+            operation: "mean",
+            container: Some(SpaceId(1)),
+        };
+        assert!(err.is_caller_correctable());
+        assert!(!err.is_retryable());
+        assert!(!err.is_fatal());
+        assert!(err.to_string().contains("mean"));
     }
 }
 

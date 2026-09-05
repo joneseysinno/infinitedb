@@ -8,7 +8,9 @@ static FAST_PATH_TEST_LOCK: Mutex<()> = Mutex::new(());
 
 fn fast_path_test_lock() -> MutexGuard<'static, ()> {
     reset_fast_sync_test_hooks();
-    FAST_PATH_TEST_LOCK.lock().unwrap()
+    FAST_PATH_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
 }
 
 use infinite_db::infinitedb_core::{

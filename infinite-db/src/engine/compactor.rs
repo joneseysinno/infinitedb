@@ -8,6 +8,7 @@ use parking_lot::{Mutex, RwLock};
 
 use crate::infinitedb_core::{
     address::SpaceId,
+    block::BlockId,
     endpoint_index::ENDPOINT_INDEX_SPACE,
     hilbert_key::HilbertKey,
     snapshot::{BlockIndexEntry, SnapshotId},
@@ -27,6 +28,9 @@ use super::hilbert_shard::ShardRef;
 use super::live_tail::LiveTailView;
 use super::query::prepare_records_for_seal;
 use super::snapshot_store::SnapshotStore;
+
+/// Sentinel id for folding live-tail records into compaction input (never a real block file).
+const EPHEMERAL_TAIL_BLOCK: BlockId = BlockId(u64::MAX);
 
 /// Per-space compaction policy overrides for manual `compact_with` invocations.
 pub type CompactionPolicyOverrides = Arc<Mutex<std::collections::HashMap<SpaceId, CompactionPolicy>>>;
@@ -96,6 +100,7 @@ pub fn compact_space_now(
     min_blocks: usize,
 ) -> io::Result<()> {
     let view = live_tail.load_view();
+    let tail_records: Vec<_> = view.tail_vec();
     let candidates: Vec<(HilbertKey, BlockIndexEntry)> = view
         .blocks
         .iter()
@@ -106,13 +111,35 @@ pub fn compact_space_now(
         .map(|(k, e)| (*k, *e))
         .collect();
 
-    if candidates.len() < min_blocks {
+    let source_count = candidates.len() + usize::from(!tail_records.is_empty());
+    if source_count < min_blocks {
         return Ok(());
     }
 
     let mut input_blocks = Vec::new();
     for (_, entry) in &candidates {
         input_blocks.push(store.read_block(entry.block_id)?);
+    }
+
+    if !tail_records.is_empty() {
+        let min_rev = tail_records
+            .iter()
+            .map(|r| r.revision)
+            .min()
+            .unwrap_or(crate::infinitedb_core::address::RevisionId::ZERO);
+        let max_rev = tail_records
+            .iter()
+            .map(|r| r.revision)
+            .max()
+            .unwrap_or(min_rev);
+        input_blocks.push(crate::infinitedb_core::block::Block {
+            id: EPHEMERAL_TAIL_BLOCK,
+            space,
+            records: tail_records.clone(),
+            min_revision: min_rev,
+            max_revision: max_rev,
+            checksum: crate::infinitedb_core::checksum::Checksum::ZERO,
+        });
     }
 
     if space == ENDPOINT_INDEX_SPACE {
@@ -151,8 +178,12 @@ pub fn compact_space_now(
         return Ok(());
     }
 
-    let superseded: std::collections::HashSet<_> =
-        result.superseded.iter().map(|b| b.0).collect();
+    let superseded: std::collections::HashSet<_> = result
+        .superseded
+        .iter()
+        .filter(|b| b.0 != EPHEMERAL_TAIL_BLOCK.0)
+        .map(|b| b.0)
+        .collect();
 
     let space_registry = spaces.read();
     for mut block in result.new_blocks {
@@ -188,13 +219,26 @@ pub fn compact_space_now(
         live_tail.init_blocks(blocks);
     }
 
+    let deletable: Vec<BlockId> = result
+        .superseded
+        .iter()
+        .filter(|b| b.0 != EPHEMERAL_TAIL_BLOCK.0)
+        .copied()
+        .collect();
     let live = live_snapshots_for_gc(snapshots, branch_overlays);
-    let _ = gc_superseded_blocks(store, &result.superseded, &live)?;
+    let _ = gc_superseded_blocks(store, &deletable, &live)?;
+
+    if !tail_records.is_empty() {
+        live_tail.publish(Vec::new());
+    }
 
     Ok(())
 }
 
-/// Compact small blocks in a shard after seal when block count exceeds threshold.
+/// Compact small blocks in a shard after seal when this shard exceeds the threshold.
+///
+/// Space-wide compaction (so LatestOnly can rewrite a 1-block shard that still
+/// holds superseded revisions) is driven from [`HilbertCoordinator::flush_space`].
 pub fn maybe_compact_after_seal(
     store: &BlockStore,
     snapshots: &SnapshotStore,

@@ -189,11 +189,56 @@ impl HilbertCoordinator {
 
     /// Run compaction immediately on every shard (honours per-space policy overrides).
     pub fn force_compact_space(&self, space: SpaceId) -> io::Result<()> {
-        self.flush_space(space)?;
+        self.flush_shards_only(space)?;
+        self.compact_all_shards(space, 1)
+    }
+
+    pub fn flush_space(&self, space: SpaceId) -> io::Result<()> {
+        self.flush_shards_only(space)?;
+        self.maybe_compact_all_shards(space, 1)
+    }
+
+    fn flush_shards_only(&self, space: SpaceId) -> io::Result<()> {
         let shard_bits = self.shard_bits_for_space(space);
-        let count = shard_count(shard_bits);
-        for shard_id in 0..count {
+        for shard_id in 0..shard_count(shard_bits) {
+            let key = ShardKey::new(space, shard_id);
+            if let Some(shard) = self.shards.get(&key) {
+                shard.queue.request_flush(space)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn compact_all_shards(&self, space: SpaceId, min_blocks: usize) -> io::Result<()> {
+        let shard_bits = self.shard_bits_for_space(space);
+        let mut shard_ids: std::collections::HashSet<u32> = self
+            .shards
+            .iter()
+            .filter(|entry| entry.key().space_id == space)
+            .map(|entry| entry.key().shard_id)
+            .collect();
+        if let Some(snap) = self.snapshots.get(space) {
+            for min_key in snap.blocks.keys() {
+                shard_ids.insert(hilbert_shard_id(min_key.raw(), shard_bits));
+            }
+        }
+
+        for shard_id in shard_ids {
             let live_tail = self.live_tails.get_or_create(space, shard_id);
+            let shard_ref = ShardRef::new(shard_id, shard_bits);
+            if live_tail.load_view().blocks.is_empty() {
+                bootstrap_live_tail_blocks(
+                    &live_tail,
+                    &self.snapshots,
+                    space.0,
+                    Some(shard_ref),
+                );
+            }
+            let view = live_tail.load_view();
+            let source_count = view.blocks.len() + usize::from(view.tail_len() > 0);
+            if source_count < min_blocks {
+                continue;
+            }
             super::compactor::compact_space_now(
                 &self.store,
                 &self.snapshots,
@@ -201,25 +246,38 @@ impl HilbertCoordinator {
                 &self.spaces,
                 &self.next_block_id,
                 space,
-                Some(ShardRef::new(shard_id, shard_bits)),
+                Some(shard_ref),
                 Some(&self.compaction_overrides),
                 Some(&self.branch_overlays),
-                1,
+                min_blocks,
             )?;
         }
         Ok(())
     }
 
-    pub fn flush_space(&self, space: SpaceId) -> io::Result<()> {
-        let shard_bits = self.shard_bits_for_space(space);
-        let count = shard_count(shard_bits);
-        for shard_id in 0..count {
-            let key = ShardKey::new(space, shard_id);
-            if let Some(shard) = self.shards.get(&key) {
-                shard.queue.request_flush(space)?;
-            }
+    /// Compact every shard that holds sealed blocks when the space is fragmented.
+    fn maybe_compact_all_shards(&self, space: SpaceId, min_blocks: usize) -> io::Result<()> {
+        const TIER_THRESHOLD: usize = 8;
+        if self
+            .snapshots
+            .get(space)
+            .map(|s| s.blocks.len())
+            .unwrap_or(0)
+            < TIER_THRESHOLD
+        {
+            return Ok(());
         }
-        Ok(())
+        let policy = self
+            .spaces
+            .read()
+            .get(space)
+            .map(|c| c.compaction_policy.clone())
+            .or_else(|| self.compaction_overrides.lock().get(&space).cloned())
+            .unwrap_or_default();
+        if matches!(policy, crate::infinitedb_core::space::CompactionPolicy::KeepAll) {
+            return Ok(());
+        }
+        self.compact_all_shards(space, min_blocks)
     }
 
     pub fn sync_all(&self) -> io::Result<()> {

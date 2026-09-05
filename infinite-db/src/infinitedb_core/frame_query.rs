@@ -22,6 +22,17 @@ pub struct FrameQueryOptions {
     pub include_suppressed: bool,
 }
 
+/// Point presence query under a frame version pin (V8).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FramePointPresenceQuery {
+    pub frame_id: FrameId,
+    pub testimony_space: SpaceId,
+    pub point: DimensionVector,
+    pub as_of: Option<RevisionId>,
+    pub version_vector: Option<FrameVersionPin>,
+    pub options: FrameQueryOptions,
+}
+
 /// Spatial frame query over hyperedge testimony.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FrameQuery {

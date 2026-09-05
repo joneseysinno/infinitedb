@@ -20,6 +20,27 @@ pub fn expand_endpoint_index_records_for_compaction(
     spaces: &SpaceRegistry,
     resolve: &dyn Fn(HyperedgeId) -> Option<Hyperedge>,
 ) -> Vec<Record> {
+    if registry_index_layout(spaces) == EndpointIndexLayout::V3CompactKey {
+        let rewrite_rows = crate::engine::hypergraph::plan_legacy_to_v3_index_rewrite(
+            &records,
+            spaces,
+            resolve,
+        );
+        if rewrite_rows.is_empty() {
+            return records;
+        }
+        let mut expanded = records;
+        for row in rewrite_rows {
+            expanded.push(Record {
+                address: crate::infinitedb_core::address::Address::new(row.space, row.point),
+                revision: crate::infinitedb_core::address::RevisionId::legacy(u64::MAX),
+                data: row.data,
+                tombstone: row.tombstone,
+                hilbert_key: crate::infinitedb_core::hilbert_key::CachedHilbertKey::UNSET,
+            });
+        }
+        return expanded;
+    }
     if registry_index_layout(spaces) != EndpointIndexLayout::V2PolarityDim {
         return records;
     }

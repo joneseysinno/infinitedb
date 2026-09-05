@@ -25,6 +25,12 @@
 //! - `Revision`: monotonic logical write clock (`RevisionId`).
 //! - `Snapshot`: immutable view assembled from sealed blocks.
 //! - `Tombstone`: logical delete marker for an address/revision.
+//! - `Void`: algebraic zero of the address space — never-written absence, distinct from tombstone.
+//! - `Universe`: ambient graph of Nexus-connected member spaces (generalizes the tower).
+//! - `Nexus`: container-granularity relationship edge between spaces or constellations.
+//! - `Constellation`: emergent or pinned cluster of densely connected members.
+//! - `Wanderer`: object with no home space, tracked by trajectory only.
+//! - `Ephemeris`: append-only wanderer position log (Observed / Projected testimony).
 //! - `Adapter`: optional trait-based upstream layer for typed labels and spaces.
 
 /// Core spatial and branching types.
@@ -74,6 +80,10 @@ pub use engine::import::{
     ImportErrorEntry, ImportErrorLog,
 };
 #[cfg(feature = "embedded")]
+pub use engine::port::{PortUniverseOptions, UniversePortBundle};
+#[cfg(feature = "embedded")]
+pub use engine::transfer::{NexusTransferIntent, NexusTransferPhase};
+#[cfg(feature = "embedded")]
 pub use engine::frame::{AttachedJudgment, FrameResolvedHyperedge, FrameTraversalResult};
 #[cfg(feature = "embedded")]
 pub use infinitedb_core::{
@@ -82,7 +92,7 @@ pub use infinitedb_core::{
         merge_admission_specs, AssertionScope, FrameDefinition, FrameRegisterRequest,
         JudgmentOverlayLayer, OverlayPolicy, TestimonySource, VerdictFilter,
     },
-    frame_query::{FrameQuery, FrameQueryOptions, FrameVersionPin},
+    frame_query::{FrameQuery, FrameQueryOptions, FramePointPresenceQuery, FrameVersionPin},
     judgment::{
         ArbiterId, ArbiterStream, JudgmentId, JudgmentRecord, JudgmentVerdict,
         RESERVED_ARBITER_ID_THRESHOLD, SubjectPin,
@@ -138,6 +148,14 @@ pub use infinitedb_sync::replicate::{
 };
 
 pub use infinitedb_core::merge::{MergeConflict, MergeResult, MergeStrategy};
+pub use infinitedb_core::void::{
+    classify_presence, Presence, SpaceHistoryView, VoidOr, VoidState,
+};
+pub use infinitedb_core::universe::{
+    ContainerRef, ConstellationId, UniverseGraphView, NEXUS_SPACE,
+};
+pub use infinitedb_core::nexus::{NexusEdge, NexusId};
+pub use infinitedb_core::ephemeris::{EphemerisEntry, WandererId, EPHEMERIS_SPACE};
 
 #[cfg(feature = "embedded")]
 pub use engine::hilbert_coordinator::HilbertCoordinator;

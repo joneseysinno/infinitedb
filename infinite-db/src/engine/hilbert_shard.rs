@@ -24,10 +24,6 @@ impl ShardRef {
     pub fn contains_key(self, key: HilbertKey) -> bool {
         hilbert_shard_id(key.raw(), self.shard_bits) == self.shard_id
     }
-
-    pub fn shard_bits_for_space(spaces: &SpaceRegistry, space: SpaceId) -> u32 {
-        spaces.get(space).map(|c| c.shard_bits).unwrap_or(DEFAULT_SHARD_BITS)
-    }
 }
 
 /// Default Hilbert shard bits when a space config omits an explicit value.

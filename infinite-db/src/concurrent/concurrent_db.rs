@@ -1,6 +1,6 @@
 //! [`InfiniteDb`] — fire-and-forget writes with Hilbert-shard I/O (format v4/v5).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -13,7 +13,7 @@ use crate::engine::compactor::CompactionPolicyOverrides;
 use crate::engine::derivation::{
     record_in_derivation_delta, AssertionEvent, DerivationBackpressurePolicy, DerivationBus,
     DerivationSink, DerivationStats, EdgeLocatorSubscriber, EndpointIndexSubscriber,
-    FlowVectorSubscriber, WatermarkRegistry,
+    EphemerisGrazeSubscriber, FlowVectorSubscriber, WatermarkRegistry,
 };
 use crate::engine::flow_vector::{
     default_flow_vector_quantization, edge_id_from_flow_vector_index_record,
@@ -41,8 +41,8 @@ use crate::engine::hilbert_live_tails::HilbertLiveTails;
 use crate::engine::io_thread::{IoStats, IoThreadConfig};
 use crate::engine::merge::merge_branches;
 use crate::engine::query::{
-    query_bbox, query_inner, query_plan_stats, reset_query_plan_stats, snapshots_map_for_persist,
-    space_key, QueryPlanStats,
+    presence_at_inner, query_bbox, query_inner, query_plan_stats, reset_query_plan_stats,
+    snapshots_map_for_persist, space_key, QueryPlanStats,
 };
 use crate::engine::snapshot_store::SnapshotStore;
 use crate::engine::session::{DurableIntent, SessionWatermarks, VersionVector, WriteSession};
@@ -63,6 +63,12 @@ use crate::engine::hypergraph::{
     partition_incident_ids_by_layout, plan_v1_to_v2_index_rewrite, prepare_assertion_tombstone,
     prepare_assertion_write, prepare_deletes, prepare_index_derivation, prepare_writes,
     registry_index_layout, rows_to_records, HypergraphWriteRow,
+};
+use crate::engine::port::{
+    bundle_hash, pin_for_import, remap_nexus_edges, PortUniverseOptions, UniversePortBundle,
+};
+use crate::engine::transfer::{
+    next_transfer_id, NexusTransferIntent, NexusTransferPhase, NexusTransferRegistry,
 };
 use crate::engine::traversal::run_traversal;
 use crate::infinitedb_core::{
@@ -95,7 +101,7 @@ use crate::infinitedb_core::{
         FrameRegisterRequest, FrameValidationError, JudgmentOverlayLayer, TestimonySource,
         record_admitted_by_source,
     },
-    frame_query::{FrameQuery, FrameQueryOptions, FrameVersionPin},
+    frame_query::{FramePointPresenceQuery, FrameQuery, FrameQueryOptions, FrameVersionPin},
     intent_checkpoint::IntentOperationKind,
     provenance::FrameId,
     staleness::{validate_authoring_provenance, ConsultedFrame},
@@ -112,6 +118,13 @@ use crate::infinitedb_core::{
     traversal::{
         hypergraph_acyclic_for_kinds, FrameTraversalSpec, TraversalResult, TraversalSpec,
     },
+    void::{Presence, SpaceHistoryView, VoidOr, VoidState},
+    universe::{
+        center_and_periphery, contract, detect_constellations, is_universe_member, ContainerRef,
+        ConstellationId, UniverseGraphView, NEXUS_SPACE,
+    },
+    nexus::{NexusEdge, NexusId},
+    ephemeris::{EphemerisEntry, WandererId, EPHEMERIS_SPACE},
 };
 use crate::infinitedb_storage::{
     format::{FormatVersion, FORMAT_VERSION_V4},
@@ -188,6 +201,7 @@ pub struct InfiniteDb {
     next_frame_id: Arc<AtomicU64>,
     density: Arc<crate::engine::density_stat::DensityTracker>,
     registration: parking_lot::Mutex<()>,
+    nexus_transfers: NexusTransferRegistry,
 }
 
 /// Applies derived index rows through the Hilbert write coordinator.
@@ -309,6 +323,20 @@ impl InfiniteDb {
             load_meta(&store).unwrap_or_else(default_meta);
 
         let spaces = Arc::new(RwLock::new(spaces));
+        {
+            let mut reg = spaces.write();
+            if let Ok(bytes) = store.read_meta("space_ordinals.bin") {
+                if let Ok(((ordinals, next), _)) =
+                    decode_from_slice::<(HashMap<SpaceId, u32>, u32), _>(&bytes, standard())
+                {
+                    reg.load_ordinals(ordinals, next);
+                } else {
+                    reg.rebuild_ordinals();
+                }
+            } else {
+                reg.rebuild_ordinals();
+            }
+        }
         let branches = Arc::new(RwLock::new(branches));
         let snapshots = Arc::new(SnapshotStore::new(snapshots));
         let session_wal_meta = load_session_wal_meta(&root.join("meta"));
@@ -357,10 +385,12 @@ impl InfiniteDb {
         derivation_watermarks.register("endpoint_index", RevisionId::ZERO);
         derivation_watermarks.register("edge_locator", RevisionId::ZERO);
         derivation_watermarks.register("flow_vector_index", RevisionId::ZERO);
+        derivation_watermarks.register("graze_nexus", RevisionId::ZERO);
         let subscribers: Vec<Box<dyn crate::engine::derivation::DerivationSubscriber>> = vec![
             Box::new(EndpointIndexSubscriber::new(Arc::clone(&spaces))),
             Box::new(EdgeLocatorSubscriber),
             Box::new(FlowVectorSubscriber::new(Arc::clone(&spaces))),
+            Box::new(EphemerisGrazeSubscriber::new(Arc::clone(&spaces))),
         ];
         let sink = Arc::new(DbDerivationSink {
             spaces: Arc::clone(&spaces),
@@ -396,6 +426,21 @@ impl InfiniteDb {
         }
         let next_frame_id = Arc::new(AtomicU64::new(next_frame));
 
+        let nexus_transfers = NexusTransferRegistry::default();
+        if let Ok(bytes) = store.read_meta("nexus_transfers.bin") {
+            if let Ok((loaded, _)) = decode_from_slice::<
+                std::collections::BTreeMap<u64, NexusTransferIntent>,
+                _,
+            >(&bytes, standard())
+            {
+                nexus_transfers.load_btree(loaded);
+            } else if let Ok((loaded, _)) =
+                decode_from_slice::<HashMap<u64, NexusTransferIntent>, _>(&bytes, standard())
+            {
+                nexus_transfers.load(loaded);
+            }
+        }
+
         let db = Self {
             root,
             format_version,
@@ -423,10 +468,12 @@ impl InfiniteDb {
             next_frame_id,
             density: Arc::new(crate::engine::density_stat::DensityTracker::new()),
             registration: parking_lot::Mutex::new(()),
+            nexus_transfers,
         };
         db.apply_recovered_session_wal(&recovered_session_wal)?;
         db.apply_recovered_fast_segments()?;
         db.recover_derivation_on_open()?;
+        db.resume_pending_nexus_transfers()?;
         db.rebuild_density_on_open()?;
         Ok(db)
     }
@@ -601,8 +648,10 @@ impl InfiniteDb {
             let err_id = SpaceRegistry::derive_error_space_id(config.id);
             let mut registry = self.spaces.write();
             if registry.get(err_id).is_none() {
-                let err_config = SpaceConfig::new(err_id, format!("{}_errors", config.name), 2)
-                    .without_error_space();
+                let err_config = SpaceConfig::new_error_companion(
+                    err_id,
+                    format!("{}_errors", config.name),
+                );
                 registry.register(err_config)?;
                 let err_dir = self.root.join("spaces").join(err_id.0.to_string());
                 std::fs::create_dir_all(&err_dir)?;
@@ -632,8 +681,10 @@ impl InfiniteDb {
         if needs_error_space {
             let err_id = SpaceRegistry::derive_error_space_id(config.id);
             if registry.get(err_id).is_none() {
-                let err_config = SpaceConfig::new(err_id, format!("{}_errors", config.name), 2)
-                    .without_error_space();
+                let err_config = SpaceConfig::new_error_companion(
+                    err_id,
+                    format!("{}_errors", config.name),
+                );
                 registry.register(err_config)?;
                 let err_dir = self.root.join("spaces").join(err_id.0.to_string());
                 std::fs::create_dir_all(&err_dir)?;
@@ -765,6 +816,12 @@ impl InfiniteDb {
     /// Remove a leaf space and tombstone its placement mirror in the parent.
     pub fn remove_space(&self, id: SpaceId) -> Result<(), EngineError> {
         let _guard = self.registration.lock();
+        let at = self.revision();
+        if self.space_referenced_by_nexus(id, at)? {
+            return Err(EngineError::RegistrySpace(
+                crate::infinitedb_core::space::SpaceError::NexusReferenced(id),
+            ));
+        }
         let old = self
             .spaces
             .write()
@@ -837,9 +894,658 @@ impl InfiniteDb {
         self.spaces.read().subtree(root)
     }
 
-    /// Per-space density statistic (T9).
-    pub fn space_density(&self, space: SpaceId) -> crate::engine::density_stat::SpaceDensity {
+    /// Per-space density statistic (T9); void when no key was ever observed (D-V7).
+    pub fn space_density(&self, space: SpaceId) -> VoidOr<crate::engine::density_stat::ObservedDensity> {
         self.density.get(space)
+    }
+
+    /// Three-state point presence pinned at `as_of` (D-V5).
+    pub fn presence_at(
+        &self,
+        space: SpaceId,
+        point: DimensionVector,
+        as_of: Option<RevisionId>,
+    ) -> Result<Presence, EngineError> {
+        self.presence_at_on_branch(BranchId::MAIN, space, point, as_of)
+    }
+
+    /// Point presence through a branch overlay (D-V5).
+    pub fn presence_at_on_branch(
+        &self,
+        branch: BranchId,
+        space: SpaceId,
+        point: DimensionVector,
+        as_of: Option<RevisionId>,
+    ) -> Result<Presence, EngineError> {
+        let ctx = self.query_ctx();
+        let branch_id = if branch == BranchId::MAIN {
+            None
+        } else {
+            Some(branch)
+        };
+        presence_at_inner(
+            &self.store,
+            &self.snapshots,
+            None,
+            &self.spaces.read(),
+            &self.session_watermarks,
+            space,
+            &point,
+            as_of,
+            None,
+            Some(ctx.hilbert_tails),
+            Some(&self.branch_overlays),
+            branch_id,
+        )
+        .map_err(EngineError::from)
+    }
+
+    /// Container-level void predicate (D-V3, INV-VOID-POLYMORPHIC).
+    pub fn space_is_void_on_branch(
+        &self,
+        branch: BranchId,
+        space: SpaceId,
+    ) -> Result<bool, EngineError> {
+        let history = self.query_history_on_branch(branch, space)?;
+        Ok(SpaceHistoryView { history: &history }.is_void())
+    }
+
+    /// Point presence under a frame version pin (D-V5, V8).
+    pub fn presence_at_in_frame(
+        &self,
+        frame_id: FrameId,
+        testimony_space: SpaceId,
+        point: DimensionVector,
+        as_of: Option<RevisionId>,
+        version_vector: Option<FrameVersionPin>,
+        options: FrameQueryOptions,
+    ) -> Result<Presence, EngineError> {
+        if !options.index_only {
+            self.sync_derivation();
+        }
+        let def = self
+            .get_frame(frame_id)
+            .ok_or(EngineError::FrameNotFound(frame_id))?;
+        let sources = merge_admission_specs(&def.assertion_scope, testimony_space);
+        if sources.is_empty() {
+            return Ok(Presence::Void);
+        }
+        let pin = self.resolve_frame_pin(as_of, version_vector, def.default_as_of);
+        let pinned_vector = match &pin {
+            FrameTimePin::Vector(v) => Some(v),
+            _ => None,
+        };
+        let scalar_as_of = match &pin {
+            FrameTimePin::Scalar(r) => Some(*r),
+            FrameTimePin::Vector(_) => None,
+        };
+        let ctx = self.query_ctx();
+        presence_at_inner(
+            &self.store,
+            &self.snapshots,
+            None,
+            &self.spaces.read(),
+            &self.session_watermarks,
+            testimony_space,
+            &point,
+            scalar_as_of,
+            pinned_vector,
+            Some(ctx.hilbert_tails),
+            Some(&self.branch_overlays),
+            None,
+        )
+        .map_err(EngineError::from)
+    }
+
+    /// Frame-scoped point presence via [`FramePointPresenceQuery`] (V8).
+    pub fn presence_at_frame_query(
+        &self,
+        query: FramePointPresenceQuery,
+    ) -> Result<Presence, EngineError> {
+        self.presence_at_in_frame(
+            query.frame_id,
+            query.testimony_space,
+            query.point,
+            query.as_of,
+            query.version_vector,
+            query.options,
+        )
+    }
+
+    /// Ambient universe graph at `as_of` (U3).
+    pub fn universe_graph_view(
+        &self,
+        as_of: Option<RevisionId>,
+    ) -> Result<UniverseGraphView, EngineError> {
+        self.ensure_nexus_space()?;
+        let at = as_of.unwrap_or_else(|| self.revision());
+        let history = self.nexus_space_history(at)?;
+        Ok(crate::engine::universe_graph::assemble_universe_graph(
+            &self.spaces.read(),
+            &history,
+            at,
+        ))
+    }
+
+    /// Graph view with an optional pinned constellation contracted (INV-UNI-ZOOM wire).
+    pub fn universe_graph_view_contracted(
+        &self,
+        as_of: Option<RevisionId>,
+        constellation: ConstellationId,
+    ) -> Result<UniverseGraphView, EngineError> {
+        let view = self.universe_graph_view(as_of)?;
+        let pins = self.pinned_constellations(as_of)?;
+        let pin = pins
+            .iter()
+            .find(|p| p.id == constellation)
+            .ok_or(EngineError::InvalidSpaceConfig {
+                message: format!("pinned constellation {:?} not found", constellation),
+            })?;
+        Ok(contract(
+            &view,
+            &pin.members,
+            ContainerRef::Constellation(constellation),
+        ))
+    }
+
+    /// Active pinned constellation payloads at `as_of` (U10).
+    pub fn pinned_constellations(
+        &self,
+        as_of: Option<RevisionId>,
+    ) -> Result<Vec<crate::infinitedb_core::nexus::ConstellationPin>, EngineError> {
+        self.ensure_nexus_space()?;
+        let at = as_of.unwrap_or_else(|| self.revision());
+        let history = self.nexus_space_history(at)?;
+        let mut pins: BTreeMap<ConstellationId, crate::infinitedb_core::nexus::ConstellationPin> =
+            BTreeMap::new();
+        for (rev, data, tombstone) in history {
+            if tombstone || rev > at {
+                continue;
+            }
+            if let Ok(edge) = crate::infinitedb_core::nexus_codec::decode_nexus(&data) {
+                if edge.kind.as_str() != crate::infinitedb_core::nexus::NEXUS_KIND_CONSTELLATION_PIN {
+                    continue;
+                }
+                if let Some(pin) = crate::engine::nexus::pin_from_edge(&edge) {
+                    pins.insert(pin.id, pin);
+                }
+            }
+        }
+        Ok(pins.into_values().collect())
+    }
+
+    fn resume_pending_nexus_transfers(&self) -> Result<(), EngineError> {
+        let pending: Vec<u64> = {
+            let mut ids: Vec<u64> = self
+                .nexus_transfers
+                .snapshot()
+                .values()
+                .filter(|i| i.phase != NexusTransferPhase::Complete)
+                .map(|i| i.id)
+                .collect();
+            ids.sort();
+            ids
+        };
+        for id in pending {
+            if let Some(mut intent) = self.nexus_transfers.get(id) {
+                self.advance_nexus_transfer(&mut intent)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Per-component center and periphery (U8).
+    pub fn universe_center(
+        &self,
+        as_of: Option<RevisionId>,
+    ) -> Result<VoidOr<Vec<crate::infinitedb_core::universe::ComponentCenters>>, EngineError> {
+        let view = self.universe_graph_view(as_of)?;
+        let at = as_of.unwrap_or_else(|| self.revision());
+        Ok(center_and_periphery(&view, at))
+    }
+
+    /// Deterministic constellation detection (U9).
+    pub fn universe_constellations(
+        &self,
+        as_of: Option<RevisionId>,
+    ) -> Result<VoidOr<Vec<Vec<ContainerRef>>>, EngineError> {
+        let view = self.universe_graph_view(as_of)?;
+        let at = as_of.unwrap_or_else(|| self.revision());
+        Ok(detect_constellations(&view, at))
+    }
+
+    /// Mean eccentricity (D-U13). Void/singleton → `UndefinedOverVoid`.
+    pub fn universe_mean_eccentricity(&self, as_of: Option<RevisionId>) -> Result<f64, EngineError> {
+        let view = self.universe_graph_view(as_of)?;
+        let at = as_of.unwrap_or_else(|| self.revision());
+        crate::infinitedb_core::universe::mean_eccentricity(&view, at).map_err(|e| {
+            EngineError::UndefinedOverVoid {
+                operation: match e {
+                    crate::infinitedb_core::universe::UniverseRatioError::MemberVoid => "mean_eccentricity",
+                    crate::infinitedb_core::universe::UniverseRatioError::UndefinedSingleton => {
+                        "mean_eccentricity"
+                    }
+                },
+                container: None,
+            }
+        })
+    }
+
+    /// Edge-set density (D-U13).
+    pub fn universe_edge_set_density(&self, as_of: Option<RevisionId>) -> Result<f64, EngineError> {
+        let view = self.universe_graph_view(as_of)?;
+        let at = as_of.unwrap_or_else(|| self.revision());
+        crate::infinitedb_core::universe::edge_set_density(&view, at).map_err(|_| {
+            EngineError::UndefinedOverVoid {
+                operation: "edge_set_density",
+                container: None,
+            }
+        })
+    }
+
+    /// Newman modularity of detected constellations (D-U13).
+    pub fn universe_modularity(&self, as_of: Option<RevisionId>) -> Result<f64, EngineError> {
+        let view = self.universe_graph_view(as_of)?;
+        let at = as_of.unwrap_or_else(|| self.revision());
+        crate::infinitedb_core::universe::modularity(&view, at).map_err(|_| {
+            EngineError::UndefinedOverVoid {
+                operation: "modularity",
+                container: None,
+            }
+        })
+    }
+
+    /// Append a Nexus assertion (U6).
+    pub fn write_nexus(&self, mut edge: NexusEdge) -> Result<RevisionId, EngineError> {
+        self.ensure_nexus_space()?;
+        let pinned = self.pinned_constellation_ids(None)?;
+        let spaces = self.spaces.read();
+        crate::engine::nexus::validate_nexus_endpoints(&edge, |cref| {
+            container_registered(cref, &spaces, &pinned)
+        })?;
+        let rev = self.default_write_session.stamp()?;
+        edge.valid_from = rev;
+        let row = crate::engine::nexus::prepare_nexus_write(&edge)?;
+        let records = rows_to_records(&[row], rev);
+        self.apply_records_on_branch(BranchId::MAIN, records)?;
+        Ok(rev)
+    }
+
+    /// Tombstone a Nexus assertion (U6).
+    pub fn delete_nexus(&self, id: NexusId) -> Result<RevisionId, EngineError> {
+        self.ensure_nexus_space()?;
+        let rev = self.default_write_session.stamp()?;
+        let row = crate::engine::nexus::prepare_nexus_tombstone(id);
+        let records = rows_to_records(&[row], rev);
+        self.apply_records_on_branch(BranchId::MAIN, records)?;
+        Ok(rev)
+    }
+
+    /// Pin a constellation for durable Nexus endpoints (U10).
+    pub fn pin_constellation(
+        &self,
+        pin: crate::infinitedb_core::nexus::ConstellationPin,
+        id: NexusId,
+    ) -> Result<RevisionId, EngineError> {
+        let edge = crate::engine::nexus::nexus_edge_from_pin(pin, id, RevisionId::ZERO);
+        self.write_nexus(edge)
+    }
+
+    /// Tombstone a pinned constellation when no Nexus references it (U10).
+    pub fn unpin_constellation(&self, nexus_id: NexusId) -> Result<RevisionId, EngineError> {
+        self.ensure_nexus_space()?;
+        let at = self.revision();
+        let history = self.nexus_space_history(at)?;
+        for (rev, data, tombstone) in &history {
+            if *tombstone || *rev > at {
+                continue;
+            }
+            if let Ok(edge) = crate::engine::nexus::decode_nexus_record(data) {
+                if edge.id != nexus_id {
+                    continue;
+                }
+                if let Some(pin) = crate::engine::nexus::pin_from_edge(&edge) {
+                    if crate::engine::nexus::constellation_referenced_in_nexus(
+                        pin.id,
+                        &history,
+                        at,
+                    ) {
+                        return Err(EngineError::InvalidSpaceConfig {
+                            message: format!(
+                                "constellation {:?} is referenced by an active Nexus edge",
+                                pin.id
+                            ),
+                        });
+                    }
+                }
+            }
+        }
+        self.delete_nexus(nexus_id)
+    }
+
+    /// Append an ephemeris testimony entry (U13).
+    pub fn append_ephemeris(
+        &self,
+        entry: EphemerisEntry,
+        edge_id: crate::infinitedb_core::hyperedge::HyperedgeId,
+    ) -> Result<RevisionId, EngineError> {
+        self.ensure_ephemeris_spaces()?;
+        if entry.graze_trace {
+            let edge = crate::infinitedb_core::ephemeris::ephemeris_entry_to_hyperedge(
+                &entry,
+                edge_id,
+            );
+            return self.insert_hyperedge_on_branch(BranchId::MAIN, EPHEMERIS_SPACE, edge);
+        }
+        let rev = self.default_write_session.stamp()?;
+        let mut entry = entry;
+        entry.stamp = rev;
+        let row = crate::engine::ephemeris::prepare_ephemeris_write(&entry, edge_id)?;
+        let records = rows_to_records(&[row], rev);
+        self.apply_records_on_branch(BranchId::MAIN, records)?;
+        Ok(rev)
+    }
+
+    /// Trajectory for a wanderer (U13).
+    pub fn ephemeris_of(
+        &self,
+        wanderer: WandererId,
+        as_of: Option<RevisionId>,
+    ) -> Result<Vec<EphemerisEntry>, EngineError> {
+        self.ensure_ephemeris_spaces()?;
+        let at = as_of.unwrap_or_else(|| self.revision());
+        let records = self.query_history_on_branch(BranchId::MAIN, EPHEMERIS_SPACE)?;
+        let edges: Vec<_> = records
+            .iter()
+            .filter(|r| !r.tombstone && r.revision <= at)
+            .filter_map(|r| crate::infinitedb_core::hyperedge_codec::decode_hyperedge(&r.data).ok())
+            .collect();
+        let entries = crate::engine::ephemeris::decode_ephemeris_entries(&edges);
+        Ok(entries
+            .into_iter()
+            .filter(|e| e.wanderer == wanderer)
+            .collect())
+    }
+
+    /// Latest ephemeris entry for a wanderer at `as_of` (U13).
+    pub fn wanderer_presence_at(
+        &self,
+        wanderer: WandererId,
+        as_of: Option<RevisionId>,
+    ) -> Result<VoidOr<EphemerisEntry>, EngineError> {
+        let entries = self.ephemeris_of(wanderer, as_of)?;
+        let at = as_of.unwrap_or_else(|| self.revision());
+        Ok(crate::engine::ephemeris::wanderer_presence(&entries, wanderer, at))
+    }
+
+    fn space_referenced_by_nexus(&self, space: SpaceId, as_of: RevisionId) -> Result<bool, EngineError> {
+        self.ensure_nexus_space()?;
+        let history = self.nexus_space_history(as_of)?;
+        Ok(crate::engine::nexus::space_referenced_in_nexus(space, &history, as_of))
+    }
+
+    /// Start a Nexus bulk transfer (D-U11). Runs to completion synchronously.
+    pub fn start_nexus_transfer(
+        &self,
+        source: SpaceId,
+        target: SpaceId,
+    ) -> Result<u64, EngineError> {
+        let source_cfg = self
+            .spaces
+            .read()
+            .get(source)
+            .cloned()
+            .ok_or(EngineError::SpaceNotFound(source))?;
+        let target_cfg = self
+            .spaces
+            .read()
+            .get(target)
+            .cloned()
+            .ok_or(EngineError::SpaceNotFound(target))?;
+        if source_cfg.dims != target_cfg.dims {
+            return Err(EngineError::InvalidSpaceConfig {
+                message: "transfer requires matching space dimensions".into(),
+            });
+        }
+        let id = next_transfer_id();
+        let mut intent = NexusTransferIntent::new(id, source, target);
+        self.nexus_transfers.insert(intent.clone());
+        self.persist_nexus_transfers()?;
+        self.advance_nexus_transfer(&mut intent)?;
+        Ok(id)
+    }
+
+    /// Transfer phase and progress (U17).
+    pub fn nexus_transfer_status(&self, id: u64) -> Option<NexusTransferIntent> {
+        self.nexus_transfers.get(id)
+    }
+
+    fn advance_nexus_transfer(&self, intent: &mut NexusTransferIntent) -> Result<(), EngineError> {
+        loop {
+            match intent.phase {
+                NexusTransferPhase::Prepared => {
+                    let records = self.query_on_branch(BranchId::MAIN, intent.source, None)?;
+                    let mut steady = crate::engine::transfer::steady_source_rows(&records);
+                    crate::engine::transfer::sort_transfer_records(&mut steady);
+                    intent.captured_addresses = steady.into_iter().map(|r| r.address).collect();
+                    intent.phase = NexusTransferPhase::Copying;
+                    self.nexus_transfers.update(intent.clone());
+                    self.persist_nexus_transfers()?;
+                }
+                NexusTransferPhase::Copying => {
+                    while intent.copy_cursor < intent.captured_addresses.len() {
+                        let addr = &intent.captured_addresses[intent.copy_cursor];
+                        let records =
+                            self.query_on_branch(BranchId::MAIN, intent.source, None)?;
+                        let rec = records
+                            .into_iter()
+                            .filter(|r| r.address.point.coords == addr.point.coords && !r.tombstone)
+                            .max_by_key(|r| r.revision);
+                        if let Some(rec) = rec {
+                            self.insert_on_branch(
+                                BranchId::MAIN,
+                                intent.target,
+                                rec.address.point.clone(),
+                                rec.data.clone(),
+                            )?;
+                            intent.rows_copied += 1;
+                        }
+                        intent.copy_cursor += 1;
+                        self.nexus_transfers.update(intent.clone());
+                        self.persist_nexus_transfers()?;
+                    }
+                    intent.phase = NexusTransferPhase::TargetSynced;
+                    self.nexus_transfers.update(intent.clone());
+                    self.persist_nexus_transfers()?;
+                }
+                NexusTransferPhase::TargetSynced => {
+                    self.coordinator.sync_all().map_err(EngineError::from)?;
+                    intent.phase = NexusTransferPhase::SourceTombstoning;
+                    self.nexus_transfers.update(intent.clone());
+                    self.persist_nexus_transfers()?;
+                }
+                NexusTransferPhase::SourceTombstoning => {
+                    while intent.tombstone_cursor < intent.captured_addresses.len() {
+                        let addr = &intent.captured_addresses[intent.tombstone_cursor];
+                        self.delete_on_branch(
+                            BranchId::MAIN,
+                            intent.source,
+                            addr.point.clone(),
+                        )?;
+                        intent.tombstone_cursor += 1;
+                        intent.rows_tombstoned += 1;
+                        self.nexus_transfers.update(intent.clone());
+                        self.persist_nexus_transfers()?;
+                    }
+                    intent.phase = NexusTransferPhase::Complete;
+                    self.nexus_transfers.update(intent.clone());
+                    self.persist_nexus_transfers()?;
+                }
+                NexusTransferPhase::Complete => {
+                    self.nexus_transfers.update(intent.clone());
+                    self.persist_nexus_transfers()?;
+                    return Ok(());
+                }
+            }
+        }
+    }
+
+    fn persist_nexus_transfers(&self) -> Result<(), EngineError> {
+        let bytes = encode_to_vec(&self.nexus_transfers.snapshot(), standard())
+            .map_err(|e| EngineError::Other {
+                message: e.to_string(),
+            })?;
+        self.store
+            .write_meta("nexus_transfers.bin", &bytes)
+            .map_err(EngineError::from)?;
+        Ok(())
+    }
+
+    /// Import a universe bundle as a pinned constellation (U18).
+    pub fn port_universe(
+        &self,
+        bundle: UniversePortBundle,
+        options: PortUniverseOptions,
+    ) -> Result<ConstellationId, EngineError> {
+        let hash = bundle_hash(&bundle);
+        if hash != bundle.bundle_hash {
+            return Err(EngineError::InvalidSpaceConfig {
+                message: "bundle hash mismatch".into(),
+            });
+        }
+        let _guard = self.registration.lock();
+        let mut name_to_id = std::collections::BTreeMap::new();
+        let mut id_to_name = std::collections::BTreeMap::new();
+        for orig in &bundle.spaces {
+            id_to_name.insert(orig.id, orig.name.clone());
+            let mut cfg = orig.clone();
+            cfg.name = format!("{}@port_{hash}", orig.name);
+            cfg.parent = None;
+            cfg.placement = None;
+            let new_id = self.register_or_get_space(cfg)?;
+            name_to_id.insert(orig.name.clone(), new_id);
+        }
+        for orig in &bundle.spaces {
+            if let Some(parent_id) = orig.parent {
+                let new_id = name_to_id
+                    .get(&orig.name)
+                    .copied()
+                    .ok_or(EngineError::InvalidSpaceConfig {
+                        message: "port space map incomplete".into(),
+                    })?;
+                let parent_name = id_to_name
+                    .get(&parent_id)
+                    .ok_or(EngineError::InvalidSpaceConfig {
+                        message: "port parent name missing".into(),
+                    })?;
+                let new_parent = name_to_id
+                    .get(parent_name)
+                    .copied()
+                    .ok_or(EngineError::InvalidSpaceConfig {
+                        message: "port parent id missing".into(),
+                    })?;
+                let mut updated = self
+                    .spaces
+                    .read()
+                    .get(new_id)
+                    .cloned()
+                    .ok_or(EngineError::SpaceNotFound(new_id))?;
+                updated.parent = Some(new_parent);
+                updated.placement = orig.placement.clone();
+                self.update_space(updated)?;
+            }
+        }
+        let remapped = remap_nexus_edges(&bundle.nexus_edges, &name_to_id, &id_to_name);
+        for edge in remapped {
+            self.write_nexus(edge)?;
+        }
+        for (name, records) in &bundle.records_by_name {
+            let space = name_to_id
+                .get(name)
+                .copied()
+                .ok_or(EngineError::InvalidSpaceConfig {
+                    message: format!("port record space name {name} missing"),
+                })?;
+            for (point, data) in records {
+                self.insert_on_branch(BranchId::MAIN, space, point.clone(), data.clone())?;
+            }
+        }
+        let members: Vec<ContainerRef> = name_to_id
+            .values()
+            .map(|id| ContainerRef::Space(*id))
+            .collect();
+        let pin = pin_for_import(members, &options);
+        self.pin_constellation(pin, NexusId(options.pin_nexus_id))?;
+        self.sync()?;
+        Ok(options.constellation_id)
+    }
+
+    fn nexus_space_history(&self, as_of: RevisionId) -> Result<Vec<(RevisionId, Vec<u8>, bool)>, EngineError> {
+        let records = self.query_history_on_branch(BranchId::MAIN, NEXUS_SPACE)?;
+        let mut latest: std::collections::HashMap<u64, &Record> = std::collections::HashMap::new();
+        for rec in &records {
+            if rec.revision > as_of {
+                continue;
+            }
+            if let Some(id) =
+                crate::infinitedb_core::nexus::NexusEdge::id_from_storage_point(&rec.address.point)
+            {
+                match latest.get(&id.0) {
+                    None => {
+                        latest.insert(id.0, rec);
+                    }
+                    Some(prev) if rec.revision > prev.revision => {
+                        latest.insert(id.0, rec);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        Ok(latest
+            .values()
+            .map(|r| (r.revision, r.data.clone(), r.tombstone))
+            .collect())
+    }
+
+    fn pinned_constellation_ids(
+        &self,
+        as_of: Option<RevisionId>,
+    ) -> Result<Vec<ConstellationId>, EngineError> {
+        let at = as_of.unwrap_or_else(|| self.revision());
+        let history = self.nexus_space_history(at)?;
+        let mut ids = Vec::new();
+        for (rev, data, tombstone) in history {
+            if tombstone || rev > at {
+                continue;
+            }
+            if let Ok(edge) = crate::infinitedb_core::nexus_codec::decode_nexus(&data) {
+                if edge.kind.as_str() == crate::infinitedb_core::nexus::NEXUS_KIND_CONSTELLATION_PIN {
+                    if let Some(hex) = edge.metadata.get("pin_payload") {
+                        if let Some(pin) = crate::engine::nexus::decode_pin_payload(hex) {
+                            ids.push(pin.id);
+                        }
+                    }
+                }
+            }
+        }
+        Ok(ids)
+    }
+
+    fn ensure_nexus_space(&self) -> Result<(), EngineError> {
+        if self.spaces.read().get(NEXUS_SPACE).is_some() {
+            return Ok(());
+        }
+        self.register_space(crate::engine::nexus::nexus_space_config())
+    }
+
+    fn ensure_ephemeris_spaces(&self) -> Result<(), EngineError> {
+        if self.spaces.read().get(EPHEMERIS_SPACE).is_none() {
+            self.register_space(crate::infinitedb_core::ephemeris::ephemeris_space_config())?;
+        }
+        if self.spaces.read().get(crate::infinitedb_core::universe::WANDERER_REGISTRY_SPACE).is_none() {
+            self.register_space(crate::infinitedb_core::ephemeris::wanderer_registry_space_config())?;
+        }
+        Ok(())
     }
 
     /// Companion error space for a registered data space (M5).
@@ -888,7 +1594,7 @@ impl InfiniteDb {
             .get(ENDPOINT_INDEX_SPACE)
             .cloned()
             .ok_or(EngineError::EndpointIndexMissing)?;
-        let updated = config.with_endpoint_index_layout(EndpointIndexLayout::V2PolarityDim);
+        let updated = config.with_endpoint_index_layout(EndpointIndexLayout::V3CompactKey);
         registry.update(updated)?;
         drop(registry);
         self.persist_meta()?;
@@ -1499,9 +2205,10 @@ impl InfiniteDb {
     pub fn compact_endpoint_index(&self, edge_spaces: &[SpaceId]) -> Result<(), EngineError> {
         self.sync_derivation();
         self.ensure_endpoint_index_space()?;
-        if self.endpoint_index_layout() != EndpointIndexLayout::V2PolarityDim {
+        let layout = self.endpoint_index_layout();
+        if layout == EndpointIndexLayout::V1Symmetric {
             return Err(EngineError::InvalidSpaceConfig {
-                message: "endpoint index layout must be upgraded to V2 before compaction rewrite"
+                message: "endpoint index layout must be upgraded before compaction rewrite"
                     .into(),
             });
         }
@@ -1513,14 +2220,34 @@ impl InfiniteDb {
         } else {
             edge_spaces.to_vec()
         };
-        let rewrite_rows = plan_v1_to_v2_index_rewrite(&index_records, |id| {
-            for &space in &spaces {
-                if let Ok(Some(edge)) = self.fetch_hyperedge_by_id(space, id, None) {
-                    return Some(edge);
-                }
+        let rewrite_rows = match layout {
+            EndpointIndexLayout::V2PolarityDim => {
+                plan_v1_to_v2_index_rewrite(&index_records, |id| {
+                    for &space in &spaces {
+                        if let Ok(Some(edge)) = self.fetch_hyperedge_by_id(space, id, None) {
+                            return Some(edge);
+                        }
+                    }
+                    None
+                })
             }
-            None
-        });
+            EndpointIndexLayout::V3CompactKey => {
+                let registry = self.spaces.read().clone();
+                crate::engine::hypergraph::plan_legacy_to_v3_index_rewrite(
+                    &index_records,
+                    &registry,
+                    |id| {
+                        for &space in &spaces {
+                            if let Ok(Some(edge)) = self.fetch_hyperedge_by_id(space, id, None) {
+                                return Some(edge);
+                            }
+                        }
+                        None
+                    },
+                )
+            }
+            EndpointIndexLayout::V1Symmetric => Vec::new(),
+        };
         if !rewrite_rows.is_empty() {
             let range = self.default_write_session.stamp_n(rewrite_rows.len() as u64)?;
             let records = rows_to_records(&rewrite_rows, range.first());
@@ -1540,6 +2267,20 @@ impl InfiniteDb {
     ) -> Result<Vec<HyperedgeId>, EngineError> {
         let prefix = hypergraph::endpoint_prefix(endpoint);
         match registry_layout {
+            EndpointIndexLayout::V3CompactKey => {
+                let ordinal = self
+                    .spaces
+                    .read()
+                    .space_ordinal(endpoint.space)
+                    .unwrap_or(0);
+                Ok(crate::engine::hypergraph::incident_edge_ids_directed_for_ordinal(
+                    index_records,
+                    endpoint,
+                    direction,
+                    registry_layout,
+                    ordinal,
+                ))
+            }
             EndpointIndexLayout::V2PolarityDim => Ok(incident_edge_ids_directed(
                 index_records,
                 endpoint,
@@ -3711,7 +4452,9 @@ impl InfiniteDb {
             }
         }
         let _ = index_layout;
-        Ok(set.into_iter().collect())
+        let mut ids: Vec<HyperedgeId> = set.into_iter().collect();
+        ids.sort_by_key(|id| id.0);
+        Ok(ids)
     }
 
     fn fetch_hyperedge_for_flow_merge(
@@ -3801,7 +4544,7 @@ impl InfiniteDb {
                 continue;
             }
             if let Ok(edge) = decode_edge_record(&r.data) {
-                for row in prepare_index_derivation(&edge, index_layout) {
+                for row in prepare_index_derivation(&edge, index_layout, &self.spaces.read()) {
                     synthetic.push(Record {
                         address: crate::infinitedb_core::address::Address::new(
                             row.space,
@@ -3886,6 +4629,16 @@ impl InfiniteDb {
 
         persist_session_wal_meta(&self.root.join("meta"), &self.session_wal_store.meta())
             .map_err(EngineError::from)?;
+
+        let (ordinals, next_ordinal) = self.spaces.read().ordinal_snapshot();
+        let ordinal_bytes = encode_to_vec(&(ordinals, next_ordinal), standard()).map_err(|e| {
+            EngineError::Other {
+                message: e.to_string(),
+            }
+        })?;
+        self.store
+            .write_meta("space_ordinals.bin", &ordinal_bytes)
+            .map_err(EngineError::from)?;
         Ok(())
     }
 }
@@ -3956,6 +4709,20 @@ fn load_meta(store: &BlockStore) -> Option<MetaTuple> {
 
 pub(crate) struct QueryCtx<'a> {
     pub hilbert_tails: &'a HilbertLiveTails,
+}
+
+fn container_registered(
+    cref: &ContainerRef,
+    spaces: &SpaceRegistry,
+    pinned: &[ConstellationId],
+) -> bool {
+    match cref {
+        ContainerRef::Space(id) => spaces
+            .get(*id)
+            .map(|c| is_universe_member(*id, c))
+            .unwrap_or(false),
+        ContainerRef::Constellation(id) => pinned.contains(id),
+    }
 }
 
 fn default_meta() -> MetaTuple {

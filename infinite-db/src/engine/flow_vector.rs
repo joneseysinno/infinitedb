@@ -5,7 +5,7 @@ use crate::infinitedb_core::{
     flow_vector::{quantize_direction, FlowVector, FlowVectorQuantization},
     flow_vector_index::{
         decode_flow_vector_index_payload, encode_flow_vector_index_payload,
-        encode_flow_vector_index_payload_v2, flow_vector_index_point, magnitude_bucket,
+        encode_flow_vector_index_payload_v2, flow_vector_index_point_at, magnitude_bucket,
         FLOW_VECTOR_INDEX_SPACE,
     },
     hyperedge::Hyperedge,
@@ -22,6 +22,9 @@ pub fn default_flow_vector_quantization() -> FlowVectorQuantization {
 }
 
 /// Resolve flow vector: same-space (M7) or composed at nearest common ancestor (T12).
+///
+/// INV-VOID-ANNIHILATOR — disjoint forests yield `None` (queryable absence, not error); see
+/// SEMANTICS.md D-V3 and D-T12.
 pub fn resolve_flow_vector(edge: &Hyperedge, registry: &SpaceRegistry) -> Option<FlowVector> {
     if let Some(v) = edge.flow_vector() {
         return Some(v);
@@ -71,7 +74,7 @@ pub fn prepare_flow_vector_derivation(
     };
     vec![HypergraphWriteRow {
         space: FLOW_VECTOR_INDEX_SPACE,
-        point: flow_vector_index_point(&quantized, edge.id),
+        point: flow_vector_index_point_at(&quantized, edge.valid_from),
         data,
         tombstone: false,
         structural: false,
@@ -89,7 +92,7 @@ pub fn prepare_flow_vector_tombstones(
     let quantized = quantize_direction(&vector.delta, &quantization);
     vec![HypergraphWriteRow {
         space: FLOW_VECTOR_INDEX_SPACE,
-        point: flow_vector_index_point(&quantized, edge.id),
+        point: flow_vector_index_point_at(&quantized, edge.valid_from),
         data: Vec::new(),
         tombstone: true,
         structural: false,
@@ -167,7 +170,7 @@ mod tests {
     }
 
     #[test]
-    fn no_common_ancestor_yields_none() {
+    fn no_common_ancestor_yields_none_inv_void_annihilator() {
         let mut reg = SpaceRegistry::new();
         reg.register(SpaceConfig::new(SpaceId(1), "a", 2)).unwrap();
         reg.register(SpaceConfig::new(SpaceId(2), "b", 2)).unwrap();

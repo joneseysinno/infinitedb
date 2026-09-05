@@ -11,6 +11,8 @@ pub enum IntentOperationKind {
     General,
     Insert,
     HypergraphWrite,
+    /// Durable Nexus bulk-transfer obligation (D-U11).
+    NexusTransfer,
     Custom(u32),
 }
 

@@ -124,7 +124,7 @@ fn wave3_density_tracks_writes() {
         vec![2],
     )
     .unwrap();
-    let d = db.space_density(SpaceId(1));
+    let d = db.space_density(SpaceId(1)).known().expect("observed");
     assert_eq!(d.record_count, 2);
     assert_eq!(d.max_occupied_depth, 1);
 }

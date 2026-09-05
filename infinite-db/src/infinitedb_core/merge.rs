@@ -21,6 +21,9 @@ pub enum MergeStrategy {
 }
 
 /// One address where source and target diverged from the merge base.
+///
+/// `base` / `target` / `source` use `Option<Record>` where `None` conflates never-written
+/// (Void) with tombstoned absence at merge time — documented in `docs/void_audit.md`.
 #[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode)]
 pub struct MergeConflict {
     pub address: Address,

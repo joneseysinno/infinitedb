@@ -8,7 +8,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-infinite-db = "0.3"
+infinite-db = "0.4"
 ```
 
 ```rust
@@ -28,7 +28,7 @@ fn main() -> std::io::Result<()> {
 }
 ```
 
-Writes are fire-and-forget: call [`sync`](https://docs.rs/infinite-db/0.3.0/infinite_db/struct.InfiniteDb.html#method.sync) to flush the write queue and make data durable and visible to queries.
+Writes are fire-and-forget: call [`sync`](https://docs.rs/infinite-db/0.4.1/infinite_db/struct.InfiniteDb.html#method.sync) to flush the write queue and make data durable and visible to queries.
 
 See also the [`quickstart`](examples/quickstart.rs) example.
 
@@ -36,14 +36,14 @@ See also the [`quickstart`](examples/quickstart.rs) example.
 
 | Feature | Default | Description |
 |---------|---------|-------------|
-| `embedded` | yes | CRCW embedded database ([`InfiniteDb`](https://docs.rs/infinite-db/0.3.0/infinite_db/struct.InfiniteDb.html)) |
+| `embedded` | yes | CRCW embedded database ([`InfiniteDb`](https://docs.rs/infinite-db/0.4.1/infinite_db/struct.InfiniteDb.html)) |
 | `server` | no | TCP API (`embedded` + tokio) |
 | `sync` | no | Replication, conflict queue, branch merge (`server`) |
 
 Enable server/sync in your manifest:
 
 ```toml
-infinite-db = { version = "0.3", features = ["sync"] }
+infinite-db = { version = "0.4", features = ["sync"] }
 ```
 
 ## Key concepts
@@ -85,7 +85,7 @@ Upstream crates can add typed labels and domain spaces via adapter traits withou
 
 ## On-disk formats
 
-New databases default to **format v4** (Hilbert shards + branch overlays). Formats v2 and v3 are supported for existing directories. Tune via [`OpenOptions::format_version`](https://docs.rs/infinite-db/0.3.0/infinite_db/struct.OpenOptions.html#structfield.format_version).
+New databases default to **format v4** (Hilbert shards + branch overlays). Formats v2 and v3 are supported for existing directories. Tune via [`OpenOptions::format_version`](https://docs.rs/infinite-db/0.4.1/infinite_db/struct.OpenOptions.html#structfield.format_version).
 
 ## Migrating from 0.2.0
 
@@ -96,7 +96,7 @@ New databases default to **format v4** (Hilbert shards + branch overlays). Forma
 - `insert_records_bulk`, `delete_records_bulk`
 - Hyperedge/signal bulk import sessions (`begin_hyperedge_import`, etc.)
 
-**Restored / added (Milestone 1, unreleased):**
+**Restored / added (Milestone 1, 0.4.x):**
 
 - `insert_hyperedge`, `delete_hyperedge`, `insert_hyperedge_typed` on `InfiniteDb`
 - Directed incidence queries with transitional post-filter (`DirectionFilter`)
@@ -113,6 +113,6 @@ If you depend on 0.2.0 bulk session APIs, stay on **0.2.0** or batch via `insert
 
 ## Links
 
-- [Documentation (docs.rs)](https://docs.rs/infinite-db/0.3.0)
+- [Documentation (docs.rs)](https://docs.rs/infinite-db/0.4.1)
 - [Repository](https://github.com/joneseysinno/infinitedb)
 - [Changelog](CHANGELOG.md)

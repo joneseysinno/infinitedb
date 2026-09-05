@@ -70,7 +70,7 @@ pub fn validate_placement(
         (None, None) => return Ok(()),
         (None, Some(_)) => return Err(PlacementError::ParentRequired),
         (Some(_), None) => return Err(PlacementError::PlacementRequired),
-        (Some(_), Some(p)) => {}
+        (Some(_), Some(_)) => {}
     }
     let p = placement.unwrap();
     if child_dims > parent_dims {

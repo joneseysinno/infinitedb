@@ -123,13 +123,13 @@ fn pipeline_lag_one_session_only() {
         &db,
         &s1,
         edge_space,
-        directed_edge(200, hub_s1.clone(), node(entity, 52)),
+        directed_edge(20, hub_s1.clone(), node(entity, 52)),
     );
     commit_hyperedge(
         &db,
         &s2,
         edge_space,
-        directed_edge(201, hub_s2.clone(), node(entity, 53)),
+        directed_edge(21, hub_s2.clone(), node(entity, 53)),
     );
     db.sync_derivation();
     let wm = db.endpoint_index_watermark_vector();
@@ -152,20 +152,20 @@ fn backpressure_isolates_flooding_session() {
     db.insert_hyperedge_with_session(
         &s1,
         edge_space,
-        directed_edge(300, node(entity, 300), node(entity, 400)),
+        directed_edge(30, node(entity, 30), node(entity, 40)),
     )
     .unwrap();
     db.insert_hyperedge_with_session(
         &s1,
         edge_space,
-        directed_edge(301, node(entity, 301), node(entity, 401)),
+        directed_edge(31, node(entity, 31), node(entity, 41)),
     )
     .unwrap();
     let err = db
         .insert_hyperedge_with_session(
             &s1,
             edge_space,
-            directed_edge(303, node(entity, 303), node(entity, 403)),
+            directed_edge(32, node(entity, 32), node(entity, 42)),
         )
         .unwrap_err();
     assert!(
@@ -176,7 +176,7 @@ fn backpressure_isolates_flooding_session() {
         .insert_hyperedge_with_session(
             &s2,
             edge_space,
-            directed_edge(400, node(entity, 400), node(entity, 500)),
+            directed_edge(40, node(entity, 40), node(entity, 50)),
         )
         .is_ok();
     assert!(s2_ok, "non-flooded session should still accept writes");
@@ -205,13 +205,13 @@ fn crash_recovery_per_session_gap() {
             &db,
             &s1,
             edge_space,
-            directed_edge(500, hub_s1.clone(), node(entity, 62)),
+            directed_edge(50, hub_s1.clone(), node(entity, 62)),
         );
         commit_hyperedge(
             &db,
             &s2,
             edge_space,
-            directed_edge(501, hub_s2.clone(), node(entity, 63)),
+            directed_edge(51, hub_s2.clone(), node(entity, 63)),
         );
     }
     {
@@ -246,25 +246,25 @@ fn delete_tombstone_ordering_cross_session() {
     let hub_s2 = node(entity, 71);
     db.insert_hyperedge(
         edge_space,
-        directed_edge(600, hub_s0.clone(), node(entity, 72)),
+        directed_edge(60, hub_s0.clone(), node(entity, 72)),
     )
     .unwrap();
     commit_hyperedge(
         &db,
         &s2,
         edge_space,
-        directed_edge(601, hub_s2.clone(), node(entity, 73)),
+        directed_edge(61, hub_s2.clone(), node(entity, 73)),
     );
     db.sync_derivation();
-    db.delete_hyperedge(edge_space, HyperedgeId(600)).unwrap();
+    db.delete_hyperedge(edge_space, HyperedgeId(60)).unwrap();
     db.sync().unwrap();
     assert!(
-        db.fetch_hyperedge_by_id(edge_space, HyperedgeId(600), None)
+        db.fetch_hyperedge_by_id(edge_space, HyperedgeId(60), None)
             .unwrap()
             .is_none()
     );
     assert!(
-        db.fetch_hyperedge_by_id(edge_space, HyperedgeId(601), None)
+        db.fetch_hyperedge_by_id(edge_space, HyperedgeId(61), None)
             .unwrap()
             .is_some()
     );
@@ -280,7 +280,7 @@ fn hash_partition_preserves_per_edge_order() {
     let entity = SpaceId(1);
     let session = db.open_session();
     let hub = node(entity, 80);
-    let edge_id = HyperedgeId(700);
+    let edge_id = HyperedgeId(70);
     for i in 0..8 {
         let edge = directed_edge(edge_id.0, hub.clone(), node(entity, 90 + i));
         db.insert_hyperedge_with_session(&session, edge_space, edge)

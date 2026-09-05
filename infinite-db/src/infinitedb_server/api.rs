@@ -18,6 +18,10 @@ use crate::infinitedb_core::{
     signal::SignalSample,
     snapshot::SnapshotId,
     space::SpaceConfig,
+    void::{Presence, VoidOr},
+    universe::UniverseGraphView,
+    nexus::{ConstellationPin, NexusEdge, NexusId},
+    ephemeris::{EphemerisEntry, WandererId},
 };
 use crate::engine::error::EngineError;
 use crate::infinitedb_server::session::Session;
@@ -108,6 +112,47 @@ pub enum Request {
     RegisterOrGetSpace { config: SpaceConfig },
     /// Per-space occupied-key depth statistic (T9).
     GetSpaceDensity { space: SpaceId },
+    /// Three-state point presence (`IS_VOID` ≡ `Presence::Void`) (D-V5).
+    GetPresence {
+        space: SpaceId,
+        point: DimensionVector,
+        as_of: Option<RevisionId>,
+    },
+    WriteNexus { edge: NexusEdge },
+    DeleteNexus { id: NexusId },
+    GetUniverseGraph {
+        as_of: Option<RevisionId>,
+        contract_constellation: Option<crate::infinitedb_core::universe::ConstellationId>,
+    },
+    GetUniverseCenter { as_of: Option<RevisionId> },
+    GetConstellations { as_of: Option<RevisionId> },
+    PinConstellation {
+        pin: ConstellationPin,
+        nexus_id: NexusId,
+    },
+    UnpinConstellation { nexus_id: NexusId },
+    GetPinnedConstellations { as_of: Option<RevisionId> },
+    AppendEphemeris {
+        entry: EphemerisEntry,
+        edge_id: HyperedgeId,
+    },
+    GetEphemeris {
+        wanderer: WandererId,
+        as_of: Option<RevisionId>,
+    },
+    GetWandererPresence {
+        wanderer: WandererId,
+        as_of: Option<RevisionId>,
+    },
+    StartNexusTransfer {
+        source: SpaceId,
+        target: SpaceId,
+    },
+    GetTransferStatus { id: u64 },
+    PortUniverse {
+        bundle: crate::engine::port::UniversePortBundle,
+        options: crate::engine::port::PortUniverseOptions,
+    },
 }
 
 /// A response from the database to a client.
@@ -133,11 +178,33 @@ pub enum Response {
     SpaceConfigs(Vec<SpaceConfig>),
     /// Space registration result.
     SpaceRegistered { id: SpaceId },
-    /// Density statistic for a space.
+    /// Density statistic for a space (void when never observed).
     SpaceDensity {
-        record_count: u64,
-        max_occupied_depth: u32,
+        record_count: Option<u64>,
+        max_occupied_depth: Option<u32>,
     },
+    /// Three-state presence at a point.
+    Presence(Presence),
+    /// Universe graph view.
+    UniverseGraph(UniverseGraphView),
+    /// Per-component centers (void when member-void).
+    UniverseCenters(Option<Vec<crate::infinitedb_core::universe::ComponentCenters>>),
+    /// Constellation clusters (void when member-void).
+    Constellations(Option<Vec<Vec<crate::infinitedb_core::universe::ContainerRef>>>),
+    /// Ephemeris trajectory entries.
+    Ephemeris(Vec<EphemerisEntry>),
+    /// Wanderer presence (void when no entries).
+    WandererPresence(Option<EphemerisEntry>),
+    /// Nexus transfer intent id.
+    TransferStarted { id: u64 },
+    /// Nexus transfer progress.
+    TransferStatus(crate::engine::transfer::NexusTransferIntent),
+    /// Ported constellation id.
+    PortComplete {
+        constellation_id: crate::infinitedb_core::universe::ConstellationId,
+    },
+    /// Pinned constellation payloads.
+    PinnedConstellations(Vec<ConstellationPin>),
     /// An error that the client should handle.
     Error(ApiError),
 }
@@ -147,6 +214,7 @@ pub fn project_api_error(err: EngineError) -> ApiError {
     match err {
         EngineError::SpaceNotFound(id) => ApiError::SpaceNotFound(id),
         EngineError::InvalidHyperedge(e) => ApiError::InvalidRequest(format!("{e:?}")),
+        EngineError::InvalidNexus(e) => ApiError::InvalidRequest(e.to_string()),
         e @ (
             EngineError::InvalidSpaceConfig { .. }
             | EngineError::BranchExists(_)
@@ -157,7 +225,10 @@ pub fn project_api_error(err: EngineError) -> ApiError {
             | EngineError::RegistrySpace(crate::infinitedb_core::space::SpaceError::Cycle(_))
             | EngineError::RegistrySpace(crate::infinitedb_core::space::SpaceError::PlacementError(_))
             | EngineError::RegistrySpace(crate::infinitedb_core::space::SpaceError::HasChildren(_))
+            | EngineError::RegistrySpace(crate::infinitedb_core::space::SpaceError::NexusReferenced(_))
             | EngineError::RegistrySpace(crate::infinitedb_core::space::SpaceError::ConfigConflict { .. })
+            | EngineError::RegistrySpace(crate::infinitedb_core::space::SpaceError::IndexPrecisionDominates { .. })
+            | EngineError::RegistrySpace(crate::infinitedb_core::space::SpaceError::SpaceOrdinalExhausted)
             | EngineError::RegistryBranch(
                 crate::infinitedb_core::branch::BranchError::DuplicateName(_),
             )
@@ -173,6 +244,7 @@ pub fn project_api_error(err: EngineError) -> ApiError {
             | EngineError::FrameNotFound(_)
             | EngineError::InvalidFrame(_)
             | EngineError::InvalidComputation(_)
+            | EngineError::UndefinedOverVoid { .. }
         ) => ApiError::InvalidRequest(e.to_string()),
         EngineError::DerivationBackpressure {
             pending_tasks,
@@ -183,7 +255,6 @@ pub fn project_api_error(err: EngineError) -> ApiError {
         EngineError::ErrorKindCatalog(_) => ApiError::InvalidRequest(err.to_string()),
         EngineError::Storage(_)
         | EngineError::RegistrySpace(_)
-        | EngineError::RegistryBranch(_)
         | EngineError::WatermarkViolation { .. }
         | EngineError::ErrorRecordEncode { .. }
         | EngineError::ErrorRecordDecode { .. }
@@ -328,8 +399,8 @@ pub fn handle_request(db: &InfiniteDb, session: &Session, request: Request) -> R
                 return Response::Error(ApiError::Unauthorised);
             }
             match db.merge_branch(target, source, strategy, None) {
+                #[cfg(feature = "sync")]
                 Ok(mut result) => {
-                    #[cfg(feature = "sync")]
                     if strategy == MergeStrategy::Interactive && !result.conflicts.is_empty() {
                         if let Err(e) = db.conflicts().push_all(
                             target,
@@ -341,6 +412,8 @@ pub fn handle_request(db: &InfiniteDb, session: &Session, request: Request) -> R
                     }
                     Response::MergeComplete(result)
                 }
+                #[cfg(not(feature = "sync"))]
+                Ok(result) => Response::MergeComplete(result),
                 Err(e) => Response::Error(ApiError::Internal(e.to_string())),
             }
         }
@@ -394,7 +467,10 @@ pub fn handle_request(db: &InfiniteDb, session: &Session, request: Request) -> R
                 }
             }
             #[cfg(not(feature = "sync"))]
-            Response::Error(ApiError::Internal("sync disabled".into()))
+            {
+                let _ = (id, data);
+                Response::Error(ApiError::Internal("sync disabled".into()))
+            }
         }
 
         Request::Ping => Response::Pong,
@@ -437,10 +513,144 @@ pub fn handle_request(db: &InfiniteDb, session: &Session, request: Request) -> R
             if session.access(space).is_none() {
                 return Response::Error(ApiError::Unauthorised);
             }
-            let d = db.space_density(space);
-            Response::SpaceDensity {
-                record_count: d.record_count,
-                max_occupied_depth: d.max_occupied_depth,
+            match db.space_density(space) {
+                VoidOr::Void => Response::SpaceDensity {
+                    record_count: None,
+                    max_occupied_depth: None,
+                },
+                VoidOr::Known(d) => Response::SpaceDensity {
+                    record_count: Some(d.record_count),
+                    max_occupied_depth: Some(d.max_occupied_depth),
+                },
+            }
+        }
+
+        Request::GetPresence { space, point, as_of } => {
+            if session.access(space).is_none() {
+                return Response::Error(ApiError::Unauthorised);
+            }
+            match db.presence_at_on_branch(session.branch, space, point, as_of) {
+                Ok(p) => Response::Presence(p),
+                Err(e) => Response::Error(project_api_error(e)),
+            }
+        }
+
+        Request::WriteNexus { edge } => {
+            if !session.can_manage_spaces() {
+                return Response::Error(ApiError::Unauthorised);
+            }
+            match db.write_nexus(edge) {
+                Ok(rev) => Response::WriteAck { revision: rev },
+                Err(e) => Response::Error(project_api_error(e)),
+            }
+        }
+
+        Request::DeleteNexus { id } => {
+            if !session.can_manage_spaces() {
+                return Response::Error(ApiError::Unauthorised);
+            }
+            match db.delete_nexus(id) {
+                Ok(rev) => Response::WriteAck { revision: rev },
+                Err(e) => Response::Error(project_api_error(e)),
+            }
+        }
+
+        Request::GetUniverseGraph {
+            as_of,
+            contract_constellation,
+        } => {
+            let result = if let Some(cid) = contract_constellation {
+                db.universe_graph_view_contracted(as_of, cid)
+            } else {
+                db.universe_graph_view(as_of)
+            };
+            match result {
+                Ok(view) => Response::UniverseGraph(view),
+                Err(e) => Response::Error(project_api_error(e)),
+            }
+        }
+
+        Request::PinConstellation { pin, nexus_id } => {
+            if !session.can_manage_spaces() {
+                return Response::Error(ApiError::Unauthorised);
+            }
+            match db.pin_constellation(pin, nexus_id) {
+                Ok(rev) => Response::WriteAck { revision: rev },
+                Err(e) => Response::Error(project_api_error(e)),
+            }
+        }
+
+        Request::UnpinConstellation { nexus_id } => {
+            if !session.can_manage_spaces() {
+                return Response::Error(ApiError::Unauthorised);
+            }
+            match db.unpin_constellation(nexus_id) {
+                Ok(rev) => Response::WriteAck { revision: rev },
+                Err(e) => Response::Error(project_api_error(e)),
+            }
+        }
+
+        Request::GetPinnedConstellations { as_of } => {
+            match db.pinned_constellations(as_of) {
+                Ok(pins) => Response::PinnedConstellations(pins),
+                Err(e) => Response::Error(project_api_error(e)),
+            }
+        }
+
+        Request::GetUniverseCenter { as_of } => match db.universe_center(as_of) {
+            Ok(v) => Response::UniverseCenters(v.known()),
+            Err(e) => Response::Error(project_api_error(e)),
+        },
+
+        Request::GetConstellations { as_of } => match db.universe_constellations(as_of) {
+            Ok(v) => Response::Constellations(v.known()),
+            Err(e) => Response::Error(project_api_error(e)),
+        },
+
+        Request::AppendEphemeris { entry, edge_id } => {
+            if !session.can_manage_spaces() {
+                return Response::Error(ApiError::Unauthorised);
+            }
+            match db.append_ephemeris(entry, edge_id) {
+                Ok(rev) => Response::WriteAck { revision: rev },
+                Err(e) => Response::Error(project_api_error(e)),
+            }
+        }
+
+        Request::GetEphemeris { wanderer, as_of } => match db.ephemeris_of(wanderer, as_of) {
+            Ok(entries) => Response::Ephemeris(entries),
+            Err(e) => Response::Error(project_api_error(e)),
+        },
+
+        Request::GetWandererPresence { wanderer, as_of } => {
+            match db.wanderer_presence_at(wanderer, as_of) {
+                Ok(v) => Response::WandererPresence(v.known()),
+                Err(e) => Response::Error(project_api_error(e)),
+            }
+        }
+
+        Request::StartNexusTransfer { source, target } => {
+            if !session.can_manage_spaces() {
+                return Response::Error(ApiError::Unauthorised);
+            }
+            match db.start_nexus_transfer(source, target) {
+                Ok(id) => Response::TransferStarted { id },
+                Err(e) => Response::Error(project_api_error(e)),
+            }
+        }
+
+        Request::GetTransferStatus { id } => match db.nexus_transfer_status(id) {
+            Some(intent) => Response::TransferStatus(intent),
+            None => Response::Error(ApiError::InvalidRequest(format!("transfer {id} not found"))),
+        },
+
+        Request::PortUniverse { bundle, options } => {
+            if !session.can_manage_spaces() {
+                return Response::Error(ApiError::Unauthorised);
+            }
+            match db.port_universe(bundle, options) {
+                Ok(id) => Response::PortComplete { constellation_id: id },
+                Err(e) => Response::Error(project_api_error(e)),
             }
         }
     }
@@ -603,9 +813,35 @@ where
                 return Response::Error(ApiError::Unauthorised);
             }
             Response::SpaceDensity {
-                record_count: 0,
-                max_occupied_depth: 0,
+                record_count: None,
+                max_occupied_depth: None,
             }
+        }
+
+        Request::GetPresence { space, point: _, as_of: _ } => {
+            if session.access(space).is_none() {
+                return Response::Error(ApiError::Unauthorised);
+            }
+            Response::Presence(Presence::Void)
+        }
+
+        Request::WriteNexus { .. }
+        | Request::DeleteNexus { .. }
+        | Request::GetUniverseGraph { .. }
+        | Request::PinConstellation { .. }
+        | Request::UnpinConstellation { .. }
+        | Request::GetPinnedConstellations { .. }
+        | Request::GetUniverseCenter { .. }
+        | Request::GetConstellations { .. }
+        | Request::AppendEphemeris { .. }
+        | Request::GetEphemeris { .. }
+        | Request::GetWandererPresence { .. }
+        | Request::StartNexusTransfer { .. }
+        | Request::GetTransferStatus { .. }
+        | Request::PortUniverse { .. } => {
+            Response::Error(ApiError::Internal(
+                "use handle_request with InfiniteDb".into(),
+            ))
         }
     }
 }
@@ -699,5 +935,17 @@ mod tests {
             ApiError::Busy { retry_hint_ms } => assert!(retry_hint_ms >= 50),
             other => panic!("expected Busy, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn project_undefined_over_void_to_invalid_request() {
+        let err = EngineError::UndefinedOverVoid {
+            operation: "density_mean",
+            container: Some(SpaceId(3)),
+        };
+        assert!(matches!(
+            project_api_error(err),
+            ApiError::InvalidRequest(_)
+        ));
     }
 }

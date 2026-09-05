@@ -9,12 +9,12 @@ use crate::infinitedb_core::{
     address::{DimensionVector, RevisionId, SpaceId},
     block::Record,
     endpoint_index::{
-        collect_incident_edge_ids, count_incident_edges, decode_hyperedge_id_from_index,
-        edge_endpoints, encode_index_payload, endpoint_for_v1_index_record,
         endpoint_index_layout_from_registry, endpoint_index_point_for_layout,
-        endpoint_index_query_bounds, endpoint_lookup_prefix, index_record_layout,
-        record_matches_endpoint_prefix, ENDPOINT_INDEX_BITS_PER_DIM, ENDPOINT_INDEX_DIMS,
-        ENDPOINT_INDEX_SPACE,
+        endpoint_index_point_v3_for_registry, endpoint_index_query_bounds, endpoint_lookup_prefix,
+        index_record_layout, record_matches_endpoint_prefix, collect_incident_edge_ids,
+        collect_incident_edge_ids_for_ordinal, count_incident_edges, decode_hyperedge_id_from_index,
+        edge_endpoints, encode_index_payload, endpoint_for_v1_index_record,
+        ENDPOINT_INDEX_BITS_PER_DIM, ENDPOINT_INDEX_DIMS, ENDPOINT_INDEX_SPACE,
     },
     hilbert_key::CachedHilbertKey,
     hyperedge::{EndpointRef, Hyperedge, HyperedgeId},
@@ -23,7 +23,7 @@ use crate::infinitedb_core::{
     space::{EndpointIndexLayout, SpaceConfig, SpaceRegistry},
 };
 
-/// Space config for the reserved endpoint reverse index (M2 layout for new registrations).
+/// Space config for the reserved endpoint reverse index (V3 compact key for new registrations).
 pub fn endpoint_index_space_config() -> SpaceConfig {
     SpaceConfig::new(
         ENDPOINT_INDEX_SPACE,
@@ -31,7 +31,7 @@ pub fn endpoint_index_space_config() -> SpaceConfig {
         ENDPOINT_INDEX_DIMS,
     )
     .with_bits_per_dim(ENDPOINT_INDEX_BITS_PER_DIM)
-    .with_endpoint_index_layout(EndpointIndexLayout::V2PolarityDim)
+    .with_endpoint_index_layout(EndpointIndexLayout::V3CompactKey)
     .without_error_space()
 }
 
@@ -79,12 +79,19 @@ pub fn prepare_assertion_tombstone(space: SpaceId, id: HyperedgeId) -> Hypergrap
 pub fn prepare_index_derivation(
     edge: &Hyperedge,
     index_layout: EndpointIndexLayout,
+    registry: &SpaceRegistry,
 ) -> Vec<HypergraphWriteRow> {
     edge_endpoints(edge)
         .into_iter()
         .map(|ep| HypergraphWriteRow {
             space: ENDPOINT_INDEX_SPACE,
-            point: endpoint_index_point_for_layout(&ep, edge.id, index_layout),
+            point: endpoint_index_point_v3_for_registry(
+                ep,
+                edge.id,
+                index_layout,
+                registry,
+                edge.valid_from,
+            ),
             data: encode_index_payload(edge.id, index_layout),
             tombstone: false,
             structural: false,
@@ -96,12 +103,19 @@ pub fn prepare_index_derivation(
 pub fn prepare_index_tombstones(
     edge: &Hyperedge,
     index_layout: EndpointIndexLayout,
+    registry: &SpaceRegistry,
 ) -> Vec<HypergraphWriteRow> {
     edge_endpoints(edge)
         .into_iter()
         .map(|ep| HypergraphWriteRow {
             space: ENDPOINT_INDEX_SPACE,
-            point: endpoint_index_point_for_layout(&ep, edge.id, index_layout),
+            point: endpoint_index_point_v3_for_registry(
+                ep,
+                edge.id,
+                index_layout,
+                registry,
+                edge.valid_from,
+            ),
             data: vec![],
             tombstone: true,
             structural: false,
@@ -117,8 +131,17 @@ pub fn prepare_writes(
     edge: &Hyperedge,
     index_layout: EndpointIndexLayout,
 ) -> io::Result<Vec<HypergraphWriteRow>> {
+    prepare_writes_with_registry(space, edge, index_layout, &SpaceRegistry::new())
+}
+
+pub fn prepare_writes_with_registry(
+    space: SpaceId,
+    edge: &Hyperedge,
+    index_layout: EndpointIndexLayout,
+    registry: &SpaceRegistry,
+) -> io::Result<Vec<HypergraphWriteRow>> {
     let mut rows = vec![prepare_assertion_write(space, edge)?];
-    rows.extend(prepare_index_derivation(edge, index_layout));
+    rows.extend(prepare_index_derivation(edge, index_layout, registry));
     Ok(rows)
 }
 
@@ -128,8 +151,17 @@ pub fn prepare_deletes(
     edge: &Hyperedge,
     index_layout: EndpointIndexLayout,
 ) -> Vec<HypergraphWriteRow> {
+    prepare_deletes_with_registry(space, edge, index_layout, &SpaceRegistry::new())
+}
+
+pub fn prepare_deletes_with_registry(
+    space: SpaceId,
+    edge: &Hyperedge,
+    index_layout: EndpointIndexLayout,
+    registry: &SpaceRegistry,
+) -> Vec<HypergraphWriteRow> {
     let mut rows = vec![prepare_assertion_tombstone(space, edge.id)];
-    rows.extend(prepare_index_tombstones(edge, index_layout));
+    rows.extend(prepare_index_tombstones(edge, index_layout, registry));
     rows
 }
 
@@ -189,6 +221,22 @@ pub fn incident_edge_ids_directed(
     registry_layout: EndpointIndexLayout,
 ) -> Vec<HyperedgeId> {
     collect_incident_edge_ids(records, endpoint, direction, registry_layout)
+}
+
+pub fn incident_edge_ids_directed_for_ordinal(
+    records: &[Record],
+    endpoint: &EndpointRef,
+    direction: DirectionFilter,
+    registry_layout: EndpointIndexLayout,
+    space_ordinal: u32,
+) -> Vec<HyperedgeId> {
+    collect_incident_edge_ids_for_ordinal(
+        records,
+        endpoint,
+        direction,
+        registry_layout,
+        space_ordinal,
+    )
 }
 
 /// Index-resident degree count.
@@ -291,6 +339,63 @@ pub fn plan_v1_to_v2_index_rewrite(
                         point: record.address.point.clone(),
                         data: vec![],
                         tombstone: true,
+                        structural: false,
+                    });
+                }
+            }
+            None => {
+                rows.push(HypergraphWriteRow {
+                    space: ENDPOINT_INDEX_SPACE,
+                    point: record.address.point.clone(),
+                    data: vec![],
+                    tombstone: true,
+                    structural: false,
+                });
+            }
+        }
+    }
+    rows
+}
+
+/// Plan V1/V2 → V3 compact-key rewrites for compaction migration.
+pub fn plan_legacy_to_v3_index_rewrite(
+    records: &[Record],
+    registry: &SpaceRegistry,
+    resolve: impl Fn(HyperedgeId) -> Option<Hyperedge>,
+) -> Vec<HypergraphWriteRow> {
+    let mut rows = Vec::new();
+    for record in records {
+        if record.tombstone {
+            continue;
+        }
+        let layout = index_record_layout(&record.data);
+        if layout == EndpointIndexLayout::V3CompactKey {
+            continue;
+        }
+        let Some((_, edge_id)) = decode_hyperedge_id_from_index(&record.data) else {
+            continue;
+        };
+        match resolve(edge_id) {
+            Some(edge) => {
+                rows.push(HypergraphWriteRow {
+                    space: ENDPOINT_INDEX_SPACE,
+                    point: record.address.point.clone(),
+                    data: vec![],
+                    tombstone: true,
+                    structural: false,
+                });
+                for ep in edge.endpoints.iter() {
+                    rows.push(HypergraphWriteRow {
+                        space: ENDPOINT_INDEX_SPACE,
+                        point: endpoint_index_point_v3_for_registry(
+                            ep,
+                            edge_id,
+                            EndpointIndexLayout::V3CompactKey,
+                            registry,
+                            edge.valid_from,
+                        ),
+                        data: encode_index_payload(edge_id, EndpointIndexLayout::V3CompactKey),
+                        tombstone: false,
                         structural: false,
                     });
                 }

@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.4.1
 
 ### Added
 
@@ -73,6 +73,7 @@
 
 ### Fixed
 
+- **Space tower audit (F1–F4):** unified `dyadic_center_level` predicate for `StructuralOnly`; parity-snapped placement mirrors; pairwise key-divergence density with rebuild-on-open; real compose/descent fixture substance; `HilbertKey::from_raw` crate-private with `From<CurveAddress>` bridge; `cell_prefix` / `cell_prefix_level` unit disambiguation; D-F1–D-F4 decision records.
 - Hot-segment replay now honors the `committed_len` durability boundary; failed group commits roll back uncommitted frames instead of resurrecting on reopen.
 - Hilbert shard pruning in live-tail queries uses each space's configured `bits_per_dim` instead of a fixed 8-bit fallback.
 - Address identity grouping uses cached Hilbert keys (with space-aware recomputation when unset) instead of cloning coordinate vectors on every query.
