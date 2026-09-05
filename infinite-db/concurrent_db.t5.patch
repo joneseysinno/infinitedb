@@ -1,0 +1,70 @@
+--- a/src/concurrent/concurrent_db.rs
++++ b/src/concurrent/concurrent_db.rs
+@@ -1793,10 +1793,11 @@
+         branch: BranchId,
+         space: SpaceId,
+         mut edge: Hyperedge,
+     ) -> Result<RevisionId, EngineError> {
+         edge.validate().map_err(EngineError::from)?;
++        self.validate_edge_storage_point(space, edge.id)?;
+         self.ensure_endpoint_index_space()?;
+         self.ensure_flow_vector_index_space()?;
+         if branch == BranchId::MAIN {
+             self.check_derivation_backpressure()?;
+             let rev = self.default_write_session.stamp()?;
+@@ -1869,10 +1870,11 @@
+             directionality,
+             authoring_frame: None,
+             computation: None,
+         };
+         edge.validate().map_err(EngineError::from)?;
++        self.validate_edge_storage_point(space, edge.id)?;
+         self.insert_hyperedge(space, edge)
+     }
+ 
+     /// Logically delete a hyperedge by id (payload + endpoint index rows).
+     pub fn delete_hyperedge(
+@@ -3897,10 +3899,11 @@
+             return Err(EngineError::InvalidSpaceConfig {
+                 message: "insert_hyperedge_with_session requires an explicit session WAL".into(),
+             });
+         }
+         edge.validate().map_err(EngineError::from)?;
++        self.validate_edge_storage_point(space, edge.id)?;
+         self.ensure_endpoint_index_space()?;
+         self.ensure_flow_vector_index_space()?;
+         self.check_derivation_backpressure_for(
+             session.id(),
+             self.session_watermarks.watermark_for(session.id()).allocated(),
+@@ -4324,10 +4327,31 @@
+         self.default_write_session
+             .stamp()
+             .expect("global session stamp")
+     }
+ 
++    /// T5 effect boundary for hyperedge writes.
++    ///
++    /// Must run *before* a revision is stamped: validating afterwards leaves a
++    /// stamped-but-never-enqueued revision, and `sync()` then waits forever for a
++    /// watermark that cannot advance. `Hyperedge::storage_point` packs a u64 id
++    /// into two u32 coordinates, so a space with `bits_per_dim < 32` cannot hold
++    /// arbitrary edge ids; without this check that reached `hilbert::encode` and
++    /// panicked inside a pure function.
++    fn validate_edge_storage_point(
++        &self,
++        space: SpaceId,
++        id: crate::infinitedb_core::hyperedge::HyperedgeId,
++    ) -> Result<(), EngineError> {
++        let spaces = self.spaces.read();
++        let config = spaces.get(space).ok_or(EngineError::SpaceNotFound(space))?;
++        crate::engine::write_validate::validate_point_bounds(
++            config,
++            &crate::infinitedb_core::hyperedge::Hyperedge::storage_point(id),
++        )
++    }
++
+     /// Apply many records on a branch through one allocation and batch enqueue.
+     pub(crate) fn apply_records_on_branch(
+         &self,
+         branch: BranchId,
+         records: Vec<Record>,
